@@ -7,7 +7,6 @@ import (
 	"bufio"
 	"bytes"
 	"crypto/tls"
-	_ "embed"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -19,16 +18,20 @@ import (
 	"os"
 	"strings"
 	"time"
+
+	"github.com/DouDOU-start/airgate-openai/internal/openai"
 )
 
-//go:embed instructions.md
+// codexInstructions 从根目录 instructions.md 加载
 var codexInstructions string
 
-// message 对话消息
-type message struct {
-	Role    string `json:"role"`
-	Type    string `json:"type"`
-	Content any    `json:"content"`
+func init() {
+	data, err := os.ReadFile("instructions.md")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "警告: 无法读取 instructions.md: %v\n", err)
+		return
+	}
+	codexInstructions = string(data)
 }
 
 // chatSession 对话会话状态
@@ -76,10 +79,12 @@ func main() {
 	if *useWS {
 		proto = "WebSocket"
 		ws := &wsSession{
-			token:     *token,
-			accountID: *accountID,
-			model:     *model,
-			proxy:     *proxy,
+			cfg: openai.WSConfig{
+				Token:     *token,
+				AccountID: *accountID,
+				ProxyURL:  *proxy,
+			},
+			model: *model,
 		}
 		defer ws.close()
 		session = ws
@@ -155,7 +160,7 @@ func (s *chatSession) chat(input string) error {
 
 	body, _ := json.Marshal(reqBody)
 
-	req, err := http.NewRequest(http.MethodPost, "https://chatgpt.com/backend-api/codex/responses", bytes.NewReader(body))
+	req, err := http.NewRequest(http.MethodPost, openai.ChatGPTSSEURL, bytes.NewReader(body))
 	if err != nil {
 		return err
 	}
@@ -164,7 +169,7 @@ func (s *chatSession) chat(input string) error {
 	req.Header.Set("Authorization", "Bearer "+s.token)
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "text/event-stream")
-	req.Header.Set("OpenAI-Beta", "responses=experimental")
+	req.Header.Set("OpenAI-Beta", openai.SSEBetaHeader)
 	req.Header.Set("originator", "codex_cli_rs")
 	req.Header.Set("session_id", s.cacheKey)
 	req.Host = "chatgpt.com"
@@ -294,11 +299,11 @@ func (s *chatSession) parseSSE(body io.Reader) sseResult {
 				}
 				// 提取 usage
 				if usage, ok := resp["usage"].(map[string]any); ok {
-					result.inputTokens = jsonInt(usage, "input_tokens")
-					result.outputTokens = jsonInt(usage, "output_tokens")
+					result.inputTokens = openai.JsonInt(usage, "input_tokens")
+					result.outputTokens = openai.JsonInt(usage, "output_tokens")
 					// 缓存 tokens
 					if details, ok := usage["input_tokens_details"].(map[string]any); ok {
-						result.cacheTokens = jsonInt(details, "cached_tokens")
+						result.cacheTokens = openai.JsonInt(details, "cached_tokens")
 					}
 				}
 			}
@@ -336,14 +341,6 @@ func (s *chatSession) parseSSE(body io.Reader) sseResult {
 	result.text = textBuilder.String()
 	result.duration = time.Since(start)
 	return result
-}
-
-// jsonInt 从 map 中安全提取 int
-func jsonInt(m map[string]any, key string) int {
-	if v, ok := m[key].(float64); ok {
-		return int(v)
-	}
-	return 0
 }
 
 // generateCacheKey 生成随机的 prompt 缓存 key

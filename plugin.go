@@ -26,7 +26,7 @@ func (g *OpenAIGateway) Info() sdk.PluginInfo {
 			{Key: "api_key", Label: "API Key", Type: "password", Required: false, Placeholder: "sk-..."},
 			{Key: "access_token", Label: "Access Token (OAuth)", Type: "password", Required: false, Placeholder: "eyJhbG..."},
 			{Key: "chatgpt_account_id", Label: "ChatGPT Account ID", Type: "text", Required: false},
-			{Key: "base_url", Label: "自定义 API 地址", Type: "text", Required: false, Placeholder: "https://api.openai.com"},
+			{Key: "base_url", Label: "API 地址", Type: "text", Required: true, Placeholder: "https://api.openai.com"},
 		},
 		ConfigFields: []sdk.ConfigField{
 			{Key: "default_timeout", Type: "duration", Default: "300s", Description: "默认请求超时"},

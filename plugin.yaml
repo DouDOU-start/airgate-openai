@@ -102,7 +102,7 @@ gateway:
       type: text
       required: false
     - key: base_url
-      label: 自定义 API 地址
+      label: API 地址
       type: text
-      required: false
+      required: true
       placeholder: "https://api.openai.com"
