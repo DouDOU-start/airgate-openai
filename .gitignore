@@ -1,0 +1,4 @@
+# 编译产物
+*.exe
+/chat
+/airgate-openai
