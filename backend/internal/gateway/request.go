@@ -176,35 +176,7 @@ func wrapAsResponsesAPI(body []byte, model string) ([]byte, error) {
 
 	// Chat Completions 格式（有 messages 字段）→ 转换为 Responses API input
 	if gjson.GetBytes(body, "messages").Exists() {
-		var input []any
-		messages := gjson.GetBytes(body, "messages").Array()
-		for _, msg := range messages {
-			role := msg.Get("role").String()
-			content := msg.Get("content").String()
-			if role == "" || content == "" {
-				continue
-			}
-
-			// 映射 role：assistant → assistant，其他 → user
-			apiRole := "user"
-			if role == "assistant" {
-				apiRole = "assistant"
-			}
-
-			// 映射 content type
-			contentType := "input_text"
-			if apiRole == "assistant" {
-				contentType = "output_text"
-			}
-
-			input = append(input, map[string]any{
-				"type": "message",
-				"role": apiRole,
-				"content": []map[string]string{
-					{"type": contentType, "text": content},
-				},
-			})
-		}
+		input := convertChatMessagesToResponsesInput(gjson.GetBytes(body, "messages").Array())
 
 		wrapped := map[string]any{
 			"model":        model,
@@ -214,11 +186,197 @@ func wrapAsResponsesAPI(body []byte, model string) ([]byte, error) {
 			"store":        false,
 		}
 
+		// 转换 tools（Chat Completions → Responses API 格式）
+		if tools := gjson.GetBytes(body, "tools"); tools.Exists() && tools.IsArray() {
+			wrapped["tools"] = convertChatToolsToResponsesTools(tools.Array())
+		}
+
+		// 透传 tool_choice
+		if tc := gjson.GetBytes(body, "tool_choice"); tc.Exists() {
+			wrapped["tool_choice"] = json.RawMessage(tc.Raw)
+		}
+
 		return json.Marshal(wrapped)
 	}
 
 	// 无法识别的格式，原样返回
 	return body, nil
+}
+
+// convertChatMessagesToResponsesInput 将 Chat Completions messages 转换为 Responses API input 列表
+func convertChatMessagesToResponsesInput(messages []gjson.Result) []any {
+	var input []any
+	for _, msg := range messages {
+		role := msg.Get("role").String()
+		if role == "" {
+			continue
+		}
+
+		switch role {
+		case "system":
+			// system 消息在 Responses API 里用 instructions，这里跳过（已在外部设置）
+			continue
+
+		case "tool":
+			// 工具结果消息
+			callID := msg.Get("tool_call_id").String()
+			content := msg.Get("content").String()
+			if callID == "" {
+				continue
+			}
+			input = append(input, map[string]any{
+				"type":    "function_call_output",
+				"call_id": callID,
+				"output":  content,
+			})
+
+		case "assistant":
+			// 检查是否有 tool_calls
+			toolCalls := msg.Get("tool_calls")
+			if toolCalls.Exists() && toolCalls.IsArray() {
+				for _, tc := range toolCalls.Array() {
+					input = append(input, map[string]any{
+						"type":      "function_call",
+						"call_id":   tc.Get("id").String(),
+						"name":      tc.Get("function.name").String(),
+						"arguments": tc.Get("function.arguments").String(),
+					})
+				}
+			} else {
+				// 普通文本 assistant 消息
+				content := extractChatMessageText(msg)
+				if content == "" {
+					continue
+				}
+				input = append(input, map[string]any{
+					"type": "message",
+					"role": "assistant",
+					"content": []map[string]string{
+						{"type": "output_text", "text": content},
+					},
+				})
+			}
+
+		default:
+			// user 及其他角色
+			content := extractChatMessageText(msg)
+			if content == "" {
+				continue
+			}
+			input = append(input, map[string]any{
+				"type": "message",
+				"role": "user",
+				"content": []map[string]string{
+					{"type": "input_text", "text": content},
+				},
+			})
+		}
+	}
+	return input
+}
+
+// extractChatMessageText 从 Chat Completions 消息中提取文本内容
+func extractChatMessageText(msg gjson.Result) string {
+	content := msg.Get("content")
+	if !content.Exists() {
+		return ""
+	}
+	if content.Type == gjson.String {
+		return content.String()
+	}
+	// 数组格式：提取所有 text 块拼接
+	if content.IsArray() {
+		var parts []string
+		for _, part := range content.Array() {
+			if part.Get("type").String() == "text" {
+				if t := part.Get("text").String(); t != "" {
+					parts = append(parts, t)
+				}
+			}
+		}
+		return strings.Join(parts, "")
+	}
+	return ""
+}
+
+// convertChatToolsToResponsesTools 将 Chat Completions tools 转为 Responses API tools 格式
+// Chat Completions: {"type":"function","function":{"name":"...","description":"...","parameters":{...}}}
+// Responses API:    {"type":"function","name":"...","description":"...","parameters":{...}}
+func convertChatToolsToResponsesTools(tools []gjson.Result) []any {
+	var result []any
+	for _, tool := range tools {
+		if tool.Get("type").String() != "function" {
+			continue
+		}
+		fn := tool.Get("function")
+		if !fn.Exists() {
+			continue
+		}
+		t := map[string]any{
+			"type": "function",
+			"name": fn.Get("name").String(),
+		}
+		if desc := fn.Get("description").String(); desc != "" {
+			t["description"] = desc
+		}
+		if params := fn.Get("parameters"); params.Exists() {
+			t["parameters"] = fixObjectSchema([]byte(params.Raw))
+		}
+		if strict := fn.Get("strict"); strict.Exists() && strict.Bool() {
+			t["strict"] = true
+		}
+		result = append(result, t)
+	}
+	return result
+}
+
+// fixObjectSchema 递归修复 JSON Schema：为 type=object 但缺少 properties 的节点补充空 properties
+// Responses API 比 Chat Completions API 更严格，要求 object schema 必须有 properties
+func fixObjectSchema(raw []byte) json.RawMessage {
+	var schema map[string]any
+	if err := json.Unmarshal(raw, &schema); err != nil {
+		return json.RawMessage(raw)
+	}
+	fixSchemaNode(schema)
+	fixed, err := json.Marshal(schema)
+	if err != nil {
+		return json.RawMessage(raw)
+	}
+	return json.RawMessage(fixed)
+}
+
+func fixSchemaNode(node map[string]any) {
+	// 若 type=object 且没有 properties，补充空 properties
+	if t, _ := node["type"].(string); t == "object" {
+		if _, has := node["properties"]; !has {
+			node["properties"] = map[string]any{}
+		}
+	}
+
+	// 递归处理 properties 中的每个子 schema
+	if props, ok := node["properties"].(map[string]any); ok {
+		for _, v := range props {
+			if sub, ok := v.(map[string]any); ok {
+				fixSchemaNode(sub)
+			}
+		}
+	}
+
+	// 递归处理 items（数组元素 schema）
+	if items, ok := node["items"].(map[string]any); ok {
+		fixSchemaNode(items)
+	}
+
+	// 递归处理 anyOf / oneOf / allOf
+	for _, key := range []string{"anyOf", "oneOf", "allOf"} {
+		if arr, ok := node[key].([]any); ok {
+			for _, v := range arr {
+				if sub, ok := v.(map[string]any); ok {
+					fixSchemaNode(sub)
+				}
+			}
+		}
+	}
 }
 
 // ──────────────────────────────────────────────────────

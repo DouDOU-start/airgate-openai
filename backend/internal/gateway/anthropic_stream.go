@@ -30,6 +30,12 @@ type toolCallState struct {
 	Name string
 }
 
+// responsesToolState 跟踪 Responses API 工具调用（按 itemID 索引）
+type responsesToolState struct {
+	callID string
+	name   string
+}
+
 // anthropicStreamTranslator OpenAI SSE → Anthropic SSE 的有状态翻译器
 type anthropicStreamTranslator struct {
 	// 状态标志
@@ -53,7 +59,8 @@ type anthropicStreamTranslator struct {
 	stopReason *string
 
 	// 工具调用追踪
-	toolCalls map[int]toolCallState
+	toolCalls      map[int]toolCallState
+	responsesTools map[string]responsesToolState // Responses API：itemID → state
 
 	// Signature 缓冲：当 signature 在 thinking 之前到达时，暂存直到 thinking 结束
 	pendingSignature *string
@@ -69,8 +76,9 @@ type anthropicStreamTranslator struct {
 
 func newAnthropicStreamTranslator() *anthropicStreamTranslator {
 	return &anthropicStreamTranslator{
-		toolCalls: make(map[int]toolCallState),
-		messageID: generateMessageID(),
+		toolCalls:      make(map[int]toolCallState),
+		responsesTools: make(map[string]responsesToolState),
+		messageID:      generateMessageID(),
 	}
 }
 
@@ -375,6 +383,78 @@ func (t *anthropicStreamTranslator) handleToolCallDelta(tc gjson.Result) error {
 	return nil
 }
 
+// handleResponsesToolStart 处理 Responses API response.output_item.added 事件中的 function_call
+// itemID 是 Responses API 的 item.id，callID 是 item.call_id，name 是函数名
+func (t *anthropicStreamTranslator) handleResponsesToolStart(itemID, callID, name string) error {
+	if _, exists := t.responsesTools[itemID]; exists {
+		return nil
+	}
+
+	// 关闭之前打开的 text/thinking block
+	if t.hasTextContentStarted {
+		if err := t.closeCurrentContentBlock(); err != nil {
+			return err
+		}
+		t.contentIndex++
+		t.hasTextContentStarted = false
+	}
+	if t.hasThinkingContentStarted {
+		if err := t.flushPendingSignature(); err != nil {
+			return err
+		}
+		if err := t.closeCurrentContentBlock(); err != nil {
+			return err
+		}
+		t.contentIndex++
+		t.hasThinkingContentStarted = false
+	}
+
+	t.responsesTools[itemID] = responsesToolState{callID: callID, name: name}
+
+	if err := t.enqueueEvent(&AnthropicStreamEvent{
+		Type:  "content_block_start",
+		Index: ptrInt64(t.contentIndex),
+		ContentBlock: &AnthropicMessageContentBlock{
+			Type:  "tool_use",
+			ID:    callID,
+			Name:  ptrStr(name),
+			Input: json.RawMessage("{}"),
+		},
+	}); err != nil {
+		return err
+	}
+	t.hasToolContentStarted = true
+	return nil
+}
+
+// handleResponsesToolArgsDelta 处理 response.function_call_arguments.delta 事件
+func (t *anthropicStreamTranslator) handleResponsesToolArgsDelta(delta string) error {
+	if delta == "" {
+		return nil
+	}
+	return t.enqueueEvent(&AnthropicStreamEvent{
+		Type:  "content_block_delta",
+		Index: ptrInt64(t.contentIndex),
+		Delta: &AnthropicStreamDelta{
+			Type:        ptrStr("input_json_delta"),
+			PartialJSON: ptrStr(delta),
+		},
+	})
+}
+
+// handleResponsesToolDone 处理 response.output_item.done 事件中的 function_call
+func (t *anthropicStreamTranslator) handleResponsesToolDone() error {
+	if !t.hasToolContentStarted {
+		return nil
+	}
+	if err := t.closeCurrentContentBlock(); err != nil {
+		return err
+	}
+	t.contentIndex++
+	t.hasToolContentStarted = false
+	return nil
+}
+
 // handleFinishReason 处理完成原因
 func (t *anthropicStreamTranslator) handleFinishReason(reason string) error {
 	if t.hasFinished {
@@ -641,6 +721,48 @@ func translateResponsesSSEToAnthropicSSE(
 				flushTranslatorEvents(translator, w, flusher)
 			}
 
+		case "response.output_item.added":
+			// 新输出项开始，若是 function_call 则开启 tool_use block
+			item := parsed.Get("item")
+			if item.Get("type").String() == "function_call" {
+				if !translator.hasStarted {
+					translator.hasStarted = true
+					if err := translator.emitMessageStart(); err != nil {
+						streamErr = err
+						goto done
+					}
+				}
+				itemID := item.Get("id").String()
+				callID := item.Get("call_id").String()
+				name := item.Get("name").String()
+				if err := translator.handleResponsesToolStart(itemID, callID, name); err != nil {
+					streamErr = err
+					goto done
+				}
+				flushTranslatorEvents(translator, w, flusher)
+			}
+
+		case "response.function_call_arguments.delta":
+			// 工具参数增量
+			delta := parsed.Get("delta").String()
+			if delta != "" {
+				if err := translator.handleResponsesToolArgsDelta(delta); err != nil {
+					streamErr = err
+					goto done
+				}
+				flushTranslatorEvents(translator, w, flusher)
+			}
+
+		case "response.output_item.done":
+			// 输出项完成，若是 function_call 则关闭 tool_use block
+			if parsed.Get("item.type").String() == "function_call" {
+				if err := translator.handleResponsesToolDone(); err != nil {
+					streamErr = err
+					goto done
+				}
+				flushTranslatorEvents(translator, w, flusher)
+			}
+
 		case "response.completed", "response.done":
 			// 提取 usage
 			if usage := parsed.Get("response.usage"); usage.Exists() {
@@ -658,7 +780,12 @@ func translateResponsesSSEToAnthropicSSE(
 				translator.model = rm
 			}
 			if !translator.messageStoped {
-				if err := translator.handleFinishReason("stop"); err != nil {
+				// 若有工具调用，stop_reason 应为 tool_calls
+				finishReason := "stop"
+				if len(translator.responsesTools) > 0 {
+					finishReason = "tool_calls"
+				}
+				if err := translator.handleFinishReason(finishReason); err != nil {
 					streamErr = err
 					goto done
 				}
