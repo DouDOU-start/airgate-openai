@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"strings"
 	"time"
@@ -495,12 +496,12 @@ func (t *anthropicStreamTranslator) handleWebSearchCallStart(itemID string) erro
 
 	t.webSearchBlocks[itemID] = true
 
-	// 发送 tool_use block（input 为空对象，query 在 done 事件里才能拿到）
+	// 发送 server_tool_use block（Anthropic 原生工具类型，客户端只展示不执行）
 	if err := t.enqueueEvent(&AnthropicStreamEvent{
 		Type:  "content_block_start",
 		Index: ptrInt64(t.contentIndex),
 		ContentBlock: &AnthropicMessageContentBlock{
-			Type:  "tool_use",
+			Type:  "server_tool_use",
 			ID:    itemID,
 			Name:  ptrStr("web_search"),
 			Input: json.RawMessage("{}"),
@@ -714,6 +715,10 @@ func flushTranslatorEvents(t *anthropicStreamTranslator, w http.ResponseWriter, 
 		ev := t.eventQueue[t.queueIndex]
 		t.queueIndex++
 
+		// 只记录结构性事件，跳过高频的 delta 事件
+		if ev.Event != "content_block_delta" && ev.Event != "message_delta" {
+			slog.Info("[→客户端SSE]", "event", ev.Event, "data", truncate(string(ev.Data), 300))
+		}
 		fmt.Fprintf(w, "event: %s\ndata: %s\n\n", ev.Event, strings.ReplaceAll(string(ev.Data), "\n", ""))
 	}
 	if flusher != nil {
@@ -740,6 +745,25 @@ func translateResponsesSSEToAnthropicSSE(
 	translator := newAnthropicStreamTranslator()
 	translator.model = model
 
+	// 定期发送 SSE ping，防止客户端在上游推理/搜索期间超时断开
+	pingCtx, pingCancel := context.WithCancel(ctx)
+	defer pingCancel()
+	go func() {
+		ticker := time.NewTicker(2 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-pingCtx.Done():
+				return
+			case <-ticker.C:
+				fmt.Fprintf(w, ": ping\n\n")
+				if flusher != nil {
+					flusher.Flush()
+				}
+			}
+		}
+	}()
+
 	scanner := bufio.NewScanner(resp.Body)
 	scanner.Buffer(make([]byte, 64*1024), 1024*1024)
 
@@ -761,6 +785,10 @@ func translateResponsesSSEToAnthropicSSE(
 
 		parsed := gjson.Parse(data)
 		eventType := parsed.Get("type").String()
+		// 只记录结构性事件，跳过高频的 delta 事件
+		if eventType != "response.output_text.delta" && eventType != "response.reasoning_summary_text.delta" && eventType != "response.function_call_arguments.delta" {
+			slog.Info("[上游SSE]", "type", eventType, "data", truncate(data, 300))
+		}
 
 		switch eventType {
 		case "response.created":

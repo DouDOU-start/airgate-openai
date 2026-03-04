@@ -10,6 +10,7 @@ import (
 	"time"
 
 	sdk "github.com/DouDOU-start/airgate-sdk"
+	"github.com/tidwall/gjson"
 )
 
 // ──────────────────────────────────────────────────────
@@ -21,6 +22,14 @@ import (
 func (g *OpenAIGateway) forwardAnthropicMessage(ctx context.Context, req *sdk.ForwardRequest) (*sdk.ForwardResult, error) {
 	start := time.Now()
 	account := req.Account
+
+	g.logger.Info("[客户端→Anthropic] 收到请求",
+		"model", gjson.GetBytes(req.Body, "model").String(),
+		"messages", gjson.GetBytes(req.Body, "messages.#").Int(),
+		"tools", gjson.GetBytes(req.Body, "tools.#").Int(),
+		"stream", gjson.GetBytes(req.Body, "stream").Bool(),
+		"last_msg", truncate(gjson.GetBytes(req.Body, "messages.@last.content").String(), 200),
+	)
 
 	// 1. 解析 Anthropic 请求体
 	var anthropicReq AnthropicMessageRequest
@@ -75,6 +84,12 @@ func (g *OpenAIGateway) forwardAnthropicMessage(ctx context.Context, req *sdk.Fo
 		}
 		return &sdk.ForwardResult{StatusCode: http.StatusBadRequest, Duration: time.Since(start)}, nil
 	}
+	g.logger.Info("[Anthropic→OpenAI] 转换完成",
+		"model", gjson.GetBytes(openaiBody, "model").String(),
+		"messages", gjson.GetBytes(openaiBody, "messages.#").Int(),
+		"tools", gjson.GetBytes(openaiBody, "tools.#").Int(),
+		"reasoning_effort", gjson.GetBytes(openaiBody, "reasoning_effort").String(),
+	)
 
 	// 6. 根据账号类型选择转发方式
 	if account.Credentials["access_token"] != "" {
@@ -230,6 +245,12 @@ func (g *OpenAIGateway) forwardAnthropicViaResponsesSSE(
 	// 始终注入 web_search 工具，让上游模型具备联网搜索能力
 	// Claude Code 用自定义 provider 时不会主动发 web_search 工具，需要代理层注入
 	responsesBody = injectWebSearchTool(responsesBody)
+	g.logger.Info("[Anthropic→Responses] 发给上游",
+		"model", gjson.GetBytes(responsesBody, "model").String(),
+		"tools", gjson.GetBytes(responsesBody, "tools.#").Int(),
+		"input_items", gjson.GetBytes(responsesBody, "input.#").Int(),
+		"instructions_len", len(gjson.GetBytes(responsesBody, "instructions").String()),
+	)
 
 	// 2. 构建 HTTP 请求到 Responses SSE 端点
 	upstreamReq, err := http.NewRequestWithContext(ctx, http.MethodPost, ChatGPTSSEURL, bytes.NewReader(responsesBody))

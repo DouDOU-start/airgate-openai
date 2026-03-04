@@ -7,9 +7,12 @@ import (
 	"embed"
 	"encoding/json"
 	"flag"
+	"io"
 	"io/fs"
 	"log"
+	"log/slog"
 	"net/http"
+	"os"
 	"path/filepath"
 
 	"github.com/DouDOU-start/airgate-openai/backend/internal/gateway"
@@ -21,7 +24,19 @@ var staticFiles embed.FS
 func main() {
 	addr := flag.String("addr", ":8080", "监听地址")
 	dataDir := flag.String("data", "./devdata", "数据目录")
+	logFile := flag.String("log", "./devdata/debug.log", "日志文件路径")
 	flag.Parse()
+
+	// 初始化日志（同时写文件和 stderr）
+	if err := os.MkdirAll(filepath.Dir(*logFile), 0o755); err == nil {
+		f, err := os.OpenFile(*logFile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+		if err == nil {
+			multi := io.MultiWriter(os.Stderr, f)
+			slog.SetDefault(slog.New(slog.NewTextHandler(multi, &slog.HandlerOptions{Level: slog.LevelInfo})))
+			log.SetOutput(multi)
+			log.Printf("日志文件: %s", *logFile)
+		}
+	}
 
 	// 初始化插件
 	gw := &gateway.OpenAIGateway{}

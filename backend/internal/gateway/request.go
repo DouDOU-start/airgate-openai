@@ -191,9 +191,12 @@ func wrapAsResponsesAPI(body []byte, model string) ([]byte, error) {
 			wrapped["tools"] = convertChatToolsToResponsesTools(tools.Array())
 		}
 
-		// 透传 tool_choice
+		// tool_choice：如果历史中有工具调用记录（处于工具循环中），强制 required
+		// 避免模型在执行阶段只输出文字确认而不调用工具
 		if tc := gjson.GetBytes(body, "tool_choice"); tc.Exists() {
 			wrapped["tool_choice"] = json.RawMessage(tc.Raw)
+		} else if messagesHaveToolCalls(gjson.GetBytes(body, "messages").Array()) {
+			wrapped["tool_choice"] = "required"
 		}
 
 		return json.Marshal(wrapped)
@@ -273,6 +276,16 @@ func convertChatMessagesToResponsesInput(messages []gjson.Result) []any {
 		}
 	}
 	return input
+}
+
+// messagesHaveToolCalls 检查消息历史中是否存在工具调用（判断是否处于工具循环中）
+func messagesHaveToolCalls(messages []gjson.Result) bool {
+	for _, msg := range messages {
+		if msg.Get("tool_calls").Exists() {
+			return true
+		}
+	}
+	return false
 }
 
 // extractChatMessageText 从 Chat Completions 消息中提取文本内容
