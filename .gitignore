@@ -5,6 +5,9 @@
 /backend/airgate-openai
 /backend/chat
 
+# 运行时数据
+/backend/devdata/
+
 # 前端
 /web/node_modules/
 /web/dist/

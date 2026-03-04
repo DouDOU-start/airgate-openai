@@ -29,17 +29,16 @@ func (g *OpenAIGateway) Info() sdk.PluginInfo {
 				Description: "使用 OpenAI API Key 直连",
 				Fields: []sdk.CredentialField{
 					{Key: "api_key", Label: "API Key", Type: "password", Required: true, Placeholder: "sk-..."},
-					{Key: "base_url", Label: "API 地址", Type: "text", Required: false, Placeholder: "https://api.openai.com"},
 				},
 			},
 			{
 				Key:         "oauth",
 				Label:       "OAuth 登录",
-				Description: "使用 ChatGPT Access Token（WebSocket 模式）",
+				Description: "通过浏览器授权登录 ChatGPT 账号",
 				Fields: []sdk.CredentialField{
-					{Key: "access_token", Label: "Access Token", Type: "password", Required: true, Placeholder: "eyJhbG..."},
-					{Key: "chatgpt_account_id", Label: "ChatGPT Account ID", Type: "text", Required: false},
-					{Key: "base_url", Label: "API 地址", Type: "text", Required: false, Placeholder: "https://api.openai.com"},
+					{Key: "access_token", Label: "Access Token", Type: "password", Required: false, Placeholder: "授权后自动填充"},
+					{Key: "refresh_token", Label: "Refresh Token", Type: "password", Required: false, Placeholder: "授权后自动填充"},
+					{Key: "chatgpt_account_id", Label: "ChatGPT Account ID", Type: "text", Required: false, Placeholder: "授权后自动填充"},
 				},
 			},
 		},

@@ -7,6 +7,8 @@ export interface AccountFormProps {
   mode: 'create' | 'edit';
   accountType?: string;
   onAccountTypeChange?: (type: string) => void;
+  /** OAuth 授权回调：核心 shell 调用此函数发起 OAuth 流程 */
+  onOAuthStart?: () => void;
 }
 
 // 复用核心 CSS 变量的样式
@@ -64,7 +66,7 @@ function detectType(credentials: Record<string, string>): AccountType | '' {
 }
 
 /** OpenAI 插件自定义账号表单 */
-export function AccountForm({ credentials, onChange, mode, accountType: propType, onAccountTypeChange }: AccountFormProps) {
+export function AccountForm({ credentials, onChange, mode, accountType: propType, onAccountTypeChange, onOAuthStart }: AccountFormProps) {
   const [localType, setLocalType] = useState<AccountType | ''>(
     (propType as AccountType) || (mode === 'edit' ? detectType(credentials) : ''),
   );
@@ -86,7 +88,7 @@ export function AccountForm({ credentials, onChange, mode, accountType: propType
       if (type === 'apikey') {
         onChange({ api_key: '', base_url: baseUrl });
       } else {
-        onChange({ access_token: '', chatgpt_account_id: '', base_url: baseUrl });
+        onChange({ access_token: '', refresh_token: '', chatgpt_account_id: '', base_url: baseUrl });
       }
     },
     [credentials.base_url, onChange, onAccountTypeChange],
@@ -114,7 +116,7 @@ export function AccountForm({ credentials, onChange, mode, accountType: propType
             <div style={{ fontSize: '0.875rem', fontWeight: 500, color: 'var(--ag-text, #e8ecf4)' }}>
               OAuth 登录
             </div>
-            <div style={descStyle}>使用 ChatGPT Access Token</div>
+            <div style={descStyle}>通过浏览器授权登录</div>
           </div>
         </div>
       </div>
@@ -153,16 +155,54 @@ export function AccountForm({ credentials, onChange, mode, accountType: propType
       {/* OAuth 模式字段 */}
       {accountType === 'oauth' && (
         <>
+          {/* 授权登录按钮 */}
+          {mode === 'create' && onOAuthStart && (
+            <div style={{ textAlign: 'center', padding: '0.5rem 0' }}>
+              <button
+                type="button"
+                onClick={onOAuthStart}
+                style={{
+                  ...inputStyle,
+                  cursor: 'pointer',
+                  backgroundColor: 'var(--ag-primary, #3b82f6)',
+                  color: 'white',
+                  border: 'none',
+                  fontWeight: 500,
+                  fontSize: '0.9rem',
+                  padding: '0.6rem 1.5rem',
+                  width: 'auto',
+                  display: 'inline-block',
+                }}
+              >
+                浏览器授权登录
+              </button>
+              <div style={{ ...descStyle, marginTop: '0.5rem' }}>
+                点击后将打开 OpenAI 授权页面，授权完成后自动填充凭证
+              </div>
+            </div>
+          )}
+
+          {/* 手动填写凭证 */}
           <div>
             <label style={labelStyle}>
-              Access Token <span style={{ color: 'var(--ag-danger, #ef4444)' }}>*</span>
+              Access Token {!onOAuthStart && <span style={{ color: 'var(--ag-danger, #ef4444)' }}>*</span>}
             </label>
             <input
               type="password"
               style={inputStyle}
-              placeholder="eyJhbG..."
+              placeholder={onOAuthStart ? '授权后自动填充，或手动输入' : 'eyJhbG...'}
               value={credentials.access_token ?? ''}
               onChange={(e) => updateField('access_token', e.target.value)}
+            />
+          </div>
+          <div>
+            <label style={labelStyle}>Refresh Token</label>
+            <input
+              type="password"
+              style={inputStyle}
+              placeholder="授权后自动填充"
+              value={credentials.refresh_token ?? ''}
+              onChange={(e) => updateField('refresh_token', e.target.value)}
             />
           </div>
           <div>
@@ -170,19 +210,9 @@ export function AccountForm({ credentials, onChange, mode, accountType: propType
             <input
               type="text"
               style={inputStyle}
-              placeholder="可选，多账号时指定"
+              placeholder="授权后自动填充"
               value={credentials.chatgpt_account_id ?? ''}
               onChange={(e) => updateField('chatgpt_account_id', e.target.value)}
-            />
-          </div>
-          <div>
-            <label style={labelStyle}>API 地址</label>
-            <input
-              type="text"
-              style={inputStyle}
-              placeholder="https://api.openai.com"
-              value={credentials.base_url ?? ''}
-              onChange={(e) => updateField('base_url', e.target.value)}
             />
           </div>
         </>
