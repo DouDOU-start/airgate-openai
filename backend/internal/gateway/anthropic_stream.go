@@ -62,6 +62,9 @@ type anthropicStreamTranslator struct {
 	toolCalls      map[int]toolCallState
 	responsesTools map[string]responsesToolState // Responses API：itemID → state
 
+	// web_search_call 追踪：itemID → 是否已开启 block
+	webSearchBlocks map[string]bool
+
 	// Signature 缓冲：当 signature 在 thinking 之前到达时，暂存直到 thinking 结束
 	pendingSignature *string
 
@@ -76,9 +79,10 @@ type anthropicStreamTranslator struct {
 
 func newAnthropicStreamTranslator() *anthropicStreamTranslator {
 	return &anthropicStreamTranslator{
-		toolCalls:      make(map[int]toolCallState),
-		responsesTools: make(map[string]responsesToolState),
-		messageID:      generateMessageID(),
+		toolCalls:       make(map[int]toolCallState),
+		responsesTools:  make(map[string]responsesToolState),
+		webSearchBlocks: make(map[string]bool),
+		messageID:       generateMessageID(),
 	}
 }
 
@@ -455,6 +459,89 @@ func (t *anthropicStreamTranslator) handleResponsesToolDone() error {
 	return nil
 }
 
+// handleWebSearchCallStart 处理 response.output_item.added item_type=web_search_call
+// 翻译为 tool_use block（name=web_search），让客户端显示搜索进度
+func (t *anthropicStreamTranslator) handleWebSearchCallStart(itemID string) error {
+	if t.webSearchBlocks[itemID] {
+		return nil
+	}
+
+	// 确保 message_start 已发送
+	if !t.hasStarted {
+		t.hasStarted = true
+		if err := t.emitMessageStart(); err != nil {
+			return err
+		}
+	}
+
+	// 关闭之前打开的 text/thinking block
+	if t.hasTextContentStarted {
+		if err := t.closeCurrentContentBlock(); err != nil {
+			return err
+		}
+		t.contentIndex++
+		t.hasTextContentStarted = false
+	}
+	if t.hasThinkingContentStarted {
+		if err := t.flushPendingSignature(); err != nil {
+			return err
+		}
+		if err := t.closeCurrentContentBlock(); err != nil {
+			return err
+		}
+		t.contentIndex++
+		t.hasThinkingContentStarted = false
+	}
+
+	t.webSearchBlocks[itemID] = true
+
+	// 发送 tool_use block（input 为空对象，query 在 done 事件里才能拿到）
+	if err := t.enqueueEvent(&AnthropicStreamEvent{
+		Type:  "content_block_start",
+		Index: ptrInt64(t.contentIndex),
+		ContentBlock: &AnthropicMessageContentBlock{
+			Type:  "tool_use",
+			ID:    itemID,
+			Name:  ptrStr("web_search"),
+			Input: json.RawMessage("{}"),
+		},
+	}); err != nil {
+		return err
+	}
+	t.hasToolContentStarted = true
+	return nil
+}
+
+// handleWebSearchCallDone 处理 response.output_item.done item_type=web_search_call
+// 用 query 填充 input，关闭 tool_use block
+func (t *anthropicStreamTranslator) handleWebSearchCallDone(itemID, query string) error {
+	if !t.webSearchBlocks[itemID] || !t.hasToolContentStarted {
+		return nil
+	}
+
+	// 发送 query 作为 input_json_delta
+	if query != "" {
+		inputJSON := fmt.Sprintf(`{"query":%q}`, query)
+		if err := t.enqueueEvent(&AnthropicStreamEvent{
+			Type:  "content_block_delta",
+			Index: ptrInt64(t.contentIndex),
+			Delta: &AnthropicStreamDelta{
+				Type:        ptrStr("input_json_delta"),
+				PartialJSON: ptrStr(inputJSON),
+			},
+		}); err != nil {
+			return err
+		}
+	}
+
+	if err := t.closeCurrentContentBlock(); err != nil {
+		return err
+	}
+	t.contentIndex++
+	t.hasToolContentStarted = false
+	return nil
+}
+
 // handleFinishReason 处理完成原因
 func (t *anthropicStreamTranslator) handleFinishReason(reason string) error {
 	if t.hasFinished {
@@ -722,9 +809,10 @@ func translateResponsesSSEToAnthropicSSE(
 			}
 
 		case "response.output_item.added":
-			// 新输出项开始，若是 function_call 则开启 tool_use block
+			// 新输出项开始
 			item := parsed.Get("item")
-			if item.Get("type").String() == "function_call" {
+			switch item.Get("type").String() {
+			case "function_call":
 				if !translator.hasStarted {
 					translator.hasStarted = true
 					if err := translator.emitMessageStart(); err != nil {
@@ -736,6 +824,14 @@ func translateResponsesSSEToAnthropicSSE(
 				callID := item.Get("call_id").String()
 				name := item.Get("name").String()
 				if err := translator.handleResponsesToolStart(itemID, callID, name); err != nil {
+					streamErr = err
+					goto done
+				}
+				flushTranslatorEvents(translator, w, flusher)
+			case "web_search_call":
+				// 开启 web_search tool_use block，让客户端显示搜索进度
+				itemID := item.Get("id").String()
+				if err := translator.handleWebSearchCallStart(itemID); err != nil {
 					streamErr = err
 					goto done
 				}
@@ -754,9 +850,19 @@ func translateResponsesSSEToAnthropicSSE(
 			}
 
 		case "response.output_item.done":
-			// 输出项完成，若是 function_call 则关闭 tool_use block
-			if parsed.Get("item.type").String() == "function_call" {
+			// 输出项完成
+			switch parsed.Get("item.type").String() {
+			case "function_call":
 				if err := translator.handleResponsesToolDone(); err != nil {
+					streamErr = err
+					goto done
+				}
+				flushTranslatorEvents(translator, w, flusher)
+			case "web_search_call":
+				// 从 item.action.query 或 item.id 取查询词，关闭 web_search tool_use block
+				itemID := parsed.Get("item.id").String()
+				query := parsed.Get("item.action.query").String()
+				if err := translator.handleWebSearchCallDone(itemID, query); err != nil {
 					streamErr = err
 					goto done
 				}

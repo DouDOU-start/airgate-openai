@@ -184,6 +184,10 @@ func convertAnthropicMsgToOpenAI(msg AnthropicMsgParam) []map[string]any {
 			// 透传（上游可能不支持，但保留数据）
 
 		case "tool_use":
+			// web_search 是 Responses API 原生工具，由上游自动处理，不转发给 Chat Completions
+			if derefStr(block.Name) == "web_search" {
+				continue
+			}
 			args := "{}"
 			if len(block.Input) > 0 {
 				args = string(block.Input)
@@ -199,6 +203,12 @@ func convertAnthropicMsgToOpenAI(msg AnthropicMsgParam) []map[string]any {
 			hasContent = true
 
 		case "tool_result":
+			toolUseID := derefStr(block.ToolUseID)
+			// 过滤 web_search 的 tool_result（客户端无法执行此工具，错误结果不转发上游）
+			// web_search 的 tool_use_id 对应 Responses API item id（ws_ 前缀）
+			if strings.HasPrefix(toolUseID, "ws_") {
+				continue
+			}
 			content := extractToolResultContent(block.Content)
 			// is_error: true 时在内容前加错误标记，让模型感知工具执行失败
 			if block.IsError != nil && *block.IsError {
@@ -206,7 +216,7 @@ func convertAnthropicMsgToOpenAI(msg AnthropicMsgParam) []map[string]any {
 			}
 			toolResult := map[string]any{
 				"role":         "tool",
-				"tool_call_id": derefStr(block.ToolUseID),
+				"tool_call_id": toolUseID,
 				"content":      content,
 			}
 			toolResults = append(toolResults, toolResult)
@@ -268,13 +278,58 @@ func convertAnthropicImageToOpenAI(source *AnthropicImageSource) string {
 	return ""
 }
 
+// anthropicReqHasWebSearch 检查 Anthropic 请求是否包含 web_search 原生工具
+func anthropicReqHasWebSearch(req *AnthropicMessageRequest) bool {
+	for _, tool := range req.Tools {
+		switch tool.Type {
+		case "web_search_20250305", "web_search":
+			return true
+		}
+	}
+	return false
+}
+
+// injectWebSearchTool 向 Responses API JSON 请求体注入 web_search 工具
+// 参考 codex-rs/core/src/client_common.rs ToolSpec::WebSearch
+func injectWebSearchTool(body []byte) []byte {
+	var req map[string]any
+	if err := json.Unmarshal(body, &req); err != nil {
+		return body
+	}
+
+	// live 模式（external_web_access: true），支持实时联网搜索
+	webSearchTool := map[string]any{
+		"type":                "web_search",
+		"external_web_access": true,
+	}
+
+	// 若已有 tools 列表，追加；否则新建
+	if existing, ok := req["tools"].([]any); ok {
+		for _, t := range existing {
+			if tm, ok := t.(map[string]any); ok && tm["type"] == "web_search" {
+				return body
+			}
+		}
+		req["tools"] = append(existing, webSearchTool)
+	} else {
+		req["tools"] = []any{webSearchTool}
+	}
+
+	result, err := json.Marshal(req)
+	if err != nil {
+		return body
+	}
+	return result
+}
+
 // convertAnthropicToolsToOpenAI 转换 Anthropic tools 为 OpenAI 格式
 func convertAnthropicToolsToOpenAI(tools []AnthropicTool) []map[string]any {
 	var result []map[string]any
 	for _, tool := range tools {
 		switch tool.Type {
 		case "web_search_20250305", "web_search":
-			// 跳过 web_search 原生工具（OpenAI 不直接支持）
+			// web_search 在 Responses API 路径由 injectWebSearchTool 单独处理
+			// Chat Completions 路径不支持，跳过
 			continue
 		case "", "custom":
 			openaiTool := map[string]any{

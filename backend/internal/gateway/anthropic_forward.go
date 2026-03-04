@@ -227,6 +227,10 @@ func (g *OpenAIGateway) forwardAnthropicViaResponsesSSE(
 		return nil, fmt.Errorf("转换 Responses API 格式失败: %w", err)
 	}
 
+	// 始终注入 web_search 工具，让上游模型具备联网搜索能力
+	// Claude Code 用自定义 provider 时不会主动发 web_search 工具，需要代理层注入
+	responsesBody = injectWebSearchTool(responsesBody)
+
 	// 2. 构建 HTTP 请求到 Responses SSE 端点
 	upstreamReq, err := http.NewRequestWithContext(ctx, http.MethodPost, ChatGPTSSEURL, bytes.NewReader(responsesBody))
 	if err != nil {
