@@ -23,6 +23,11 @@ import (
 
 // forwardHTTP 根据账号凭证类型分发到不同转发模式
 func (g *OpenAIGateway) forwardHTTP(ctx context.Context, req *sdk.ForwardRequest) (*sdk.ForwardResult, error) {
+	// 检测 Anthropic Messages API 请求，走协议翻译
+	if isAnthropicRequest(req) {
+		return g.forwardAnthropicMessage(ctx, req)
+	}
+
 	account := req.Account
 
 	if account.Credentials["api_key"] != "" {

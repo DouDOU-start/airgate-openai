@@ -49,6 +49,10 @@ func (p *ProxyHandler) handleHTTP(w http.ResponseWriter, r *http.Request) {
 	stream := strings.Contains(string(body), `"stream":true`) ||
 		strings.Contains(string(body), `"stream": true`)
 
+	headers := r.Header.Clone()
+	// 注入转发路径，供插件识别请求类型（如 /v1/messages → Anthropic）
+	headers.Set("X-Forwarded-Path", r.URL.Path)
+
 	fwdReq := &sdk.ForwardRequest{
 		Account: &sdk.Account{
 			ID:          account.ID,
@@ -56,7 +60,7 @@ func (p *ProxyHandler) handleHTTP(w http.ResponseWriter, r *http.Request) {
 			ProxyURL:    account.ProxyURL,
 		},
 		Body:    body,
-		Headers: r.Header.Clone(),
+		Headers: headers,
 		Stream:  stream,
 		Writer:  w,
 	}

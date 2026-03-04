@@ -15,6 +15,40 @@ import (
 )
 
 // ──────────────────────────────────────────────────────
+// Anthropic 请求检测
+// ──────────────────────────────────────────────────────
+
+// isAnthropicRequest 检测是否为 Anthropic Messages API 请求
+func isAnthropicRequest(req *sdk.ForwardRequest) bool {
+	// 1. 通过转发路径检测
+	path := extractForwardedPath(req.Headers)
+	if strings.Contains(path, "/v1/messages") && !strings.Contains(path, "/chat/completions") {
+		return true
+	}
+
+	// 2. 通过请求头检测
+	if req.Headers != nil && req.Headers.Get("Anthropic-Version") != "" {
+		return true
+	}
+
+	// 3. 通过请求体特征检测：有 max_tokens + messages 但无 input 字段（区分 Responses API）
+	if len(req.Body) > 0 {
+		trimmed := bytes.TrimSpace(req.Body)
+		hasMaxTokens := gjson.GetBytes(trimmed, "max_tokens").Exists()
+		hasMessages := gjson.GetBytes(trimmed, "messages").Exists()
+		hasInput := gjson.GetBytes(trimmed, "input").Exists()
+		// Anthropic 特有字段
+		hasSystem := gjson.GetBytes(trimmed, "system").Exists()
+
+		if hasMaxTokens && hasMessages && !hasInput && hasSystem {
+			return true
+		}
+	}
+
+	return false
+}
+
+// ──────────────────────────────────────────────────────
 // URL 构建
 // ──────────────────────────────────────────────────────
 
