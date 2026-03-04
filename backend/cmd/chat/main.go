@@ -64,7 +64,8 @@ func main() {
 				AccountID: *accountID,
 				ProxyURL:  *proxy,
 			},
-			model: *model,
+			model:    *model,
+			cacheKey: generateCacheKey(),
 		}
 		defer ws.close()
 		session = ws
@@ -100,6 +101,9 @@ func main() {
 				s.cacheKey = generateCacheKey()
 			case *wsSession:
 				s.history = nil
+				s.previousResponseID = ""
+				s.cacheKey = generateCacheKey()
+				s.turnState = ""
 				s.close()
 			}
 			fmt.Println("对话已清空")
@@ -138,7 +142,7 @@ func (s *sseSession) chat(input string) error {
 
 	reqBody := map[string]any{
 		"model":            s.model,
-		"instructions":     resources.DefaultInstructions,
+		"instructions":     resources.Instructions,
 		"input":            allInput,
 		"stream":           true,
 		"store":            false,
@@ -207,10 +211,17 @@ type wsSession struct {
 	conn               *websocket.Conn
 	history            []any
 	previousResponseID string
+	cacheKey           string
+	turnState          string // 粘性路由令牌
 }
 
 func (s *wsSession) connect() error {
-	conn, resp, err := gateway.DialWebSocket(s.cfg)
+	cfg := s.cfg
+	cfg.SessionID = s.cacheKey
+	cfg.Originator = "codex_cli_rs"
+	cfg.TurnState = s.turnState
+
+	conn, resp, err := gateway.DialWebSocket(cfg)
 	if err != nil {
 		return err
 	}
@@ -218,6 +229,9 @@ func (s *wsSession) connect() error {
 	if resp != nil {
 		if model := resp.Header.Get("openai-model"); model != "" {
 			fmt.Fprintf(os.Stderr, "[服务端模型: %s]\n", model)
+		}
+		if ts := resp.Header.Get("x-codex-turn-state"); ts != "" {
+			s.turnState = ts
 		}
 	}
 
@@ -244,11 +258,12 @@ func (s *wsSession) chat(input string) error {
 	userMsg := buildUserMsg(input)
 
 	createReq := map[string]any{
-		"type":         "response.create",
-		"model":        s.model,
-		"instructions": resources.DefaultInstructions,
-		"stream":       true,
-		"store":        false,
+		"type":             "response.create",
+		"model":            s.model,
+		"instructions":     resources.Instructions,
+		"stream":           true,
+		"store":            false,
+		"prompt_cache_key": s.cacheKey,
 	}
 
 	if s.previousResponseID != "" {

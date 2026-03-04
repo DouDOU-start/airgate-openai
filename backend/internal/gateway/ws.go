@@ -28,9 +28,12 @@ const (
 
 // WSConfig WebSocket 连接配置
 type WSConfig struct {
-	Token     string
-	AccountID string
-	ProxyURL  string
+	Token      string
+	AccountID  string
+	ProxyURL   string
+	SessionID  string // prompt 缓存 key，同 SSE 的 session_id
+	TurnState  string // 粘性路由令牌，从上次握手响应获取
+	Originator string // 客户端标识，如 "codex_cli_rs"
 }
 
 // WSResult 事件解析结果
@@ -76,6 +79,15 @@ func DialWebSocket(cfg WSConfig) (*websocket.Conn, *http.Response, error) {
 	headers.Set("OpenAI-Beta", WSBetaHeader)
 	if cfg.AccountID != "" {
 		headers.Set("ChatGPT-Account-ID", cfg.AccountID)
+	}
+	if cfg.SessionID != "" {
+		headers.Set("session_id", cfg.SessionID)
+	}
+	if cfg.TurnState != "" {
+		headers.Set("x-codex-turn-state", cfg.TurnState)
+	}
+	if cfg.Originator != "" {
+		headers.Set("originator", cfg.Originator)
 	}
 
 	conn, resp, err := dialer.Dial(ChatGPTWSURL, headers)

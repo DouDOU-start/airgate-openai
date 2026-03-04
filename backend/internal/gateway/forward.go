@@ -105,11 +105,14 @@ func (g *OpenAIGateway) forwardOAuth(ctx context.Context, req *sdk.ForwardReques
 	start := time.Now()
 	account := req.Account
 
-	// 建立 WebSocket 连接
+	// 建立 WebSocket 连接，透传客户端的缓存与路由相关头
 	cfg := WSConfig{
-		Token:     account.Credentials["access_token"],
-		AccountID: account.Credentials["chatgpt_account_id"],
-		ProxyURL:  account.ProxyURL,
+		Token:      account.Credentials["access_token"],
+		AccountID:  account.Credentials["chatgpt_account_id"],
+		ProxyURL:   account.ProxyURL,
+		SessionID:  req.Headers.Get("session_id"),
+		TurnState:  req.Headers.Get("x-codex-turn-state"),
+		Originator: req.Headers.Get("originator"),
 	}
 	conn, _, err := DialWebSocket(cfg)
 	if err != nil {

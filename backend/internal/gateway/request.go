@@ -133,7 +133,7 @@ func wrapAsResponsesAPI(body []byte, model string) ([]byte, error) {
 	if gjson.GetBytes(body, "input").Exists() {
 		result := body
 		if !gjson.GetBytes(body, "instructions").Exists() {
-			if modified, err := sjson.SetBytes(result, "instructions", resources.DefaultInstructions); err == nil {
+			if modified, err := sjson.SetBytes(result, "instructions", resources.Instructions); err == nil {
 				result = modified
 			}
 		}
@@ -175,7 +175,7 @@ func wrapAsResponsesAPI(body []byte, model string) ([]byte, error) {
 		wrapped := map[string]any{
 			"model":        model,
 			"input":        input,
-			"instructions": resources.DefaultInstructions,
+			"instructions": resources.Instructions,
 			"stream":       true,
 			"store":        false,
 		}
