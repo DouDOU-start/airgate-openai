@@ -328,10 +328,13 @@ func convertAnthropicToolsToOpenAI(tools []AnthropicTool) []map[string]any {
 	for _, tool := range tools {
 		switch tool.Type {
 		case "web_search_20250305", "web_search":
-			// web_search 在 Responses API 路径由 injectWebSearchTool 单独处理
-			// Chat Completions 路径不支持，跳过
+			// web_search is handled separately in Responses API path.
 			continue
-		case "", "custom":
+		default:
+			// Treat all other tools as function tools for compatibility.
+			if strings.TrimSpace(tool.Name) == "" {
+				continue
+			}
 			openaiTool := map[string]any{
 				"type": "function",
 				"function": map[string]any{
@@ -349,15 +352,12 @@ func convertAnthropicToolsToOpenAI(tools []AnthropicTool) []map[string]any {
 				fn["strict"] = true
 			}
 			result = append(result, openaiTool)
-		default:
-			// 跳过其他原生工具
-			continue
 		}
 	}
 	return result
 }
 
-// convertAnthropicToolChoiceToOpenAI 转换 tool_choice
+// convertAnthropicToolChoiceToOpenAI converts tool_choice to OpenAI format.
 func convertAnthropicToolChoiceToOpenAI(tc *AnthropicToolChoice) any {
 	if tc == nil {
 		return nil

@@ -39,6 +39,9 @@ type WSConfig struct {
 // WSResult 事件解析结果
 type WSResult struct {
 	Text         string
+	Reasoning    string
+	StopReason   string
+	ToolUses     []AnthropicMessageContentBlock
 	ResponseID   string
 	Model        string
 	InputTokens  int
