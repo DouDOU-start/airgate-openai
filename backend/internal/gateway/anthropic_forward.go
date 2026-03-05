@@ -13,6 +13,8 @@ import (
 	"github.com/tidwall/gjson"
 )
 
+const defaultThinkingBudgetTokens int64 = 12000
+
 // ──────────────────────────────────────────────────────
 // Anthropic Messages API 转发入口
 // 参考 AxonHub llm/transformer/anthropic/inbound.go
@@ -51,6 +53,9 @@ func (g *OpenAIGateway) forwardAnthropicMessage(ctx context.Context, req *sdk.Fo
 		t := true
 		anthropicReq.Stream = &t
 	}
+
+	// 默认开启 thinking：未显式传 thinking 时注入 enabled + budget_tokens
+	applyDefaultThinking(&anthropicReq)
 
 	// 2. 验证请求
 	if errResp := validateAnthropicRequest(&anthropicReq); errResp != nil {
@@ -122,7 +127,7 @@ func (g *OpenAIGateway) forwardAnthropicMessage(ctx context.Context, req *sdk.Fo
 	// 根据流式/非流式处理响应（返回原始 Claude 模型名给客户端）
 	isStream := anthropicReq.Stream != nil && *anthropicReq.Stream
 	if isStream && req.Writer != nil {
-		return translateOpenAISSEToAnthropicSSE(ctx, resp, req.Writer, originalModel, start)
+		return translateOpenAISSEToAnthropicSSE(ctx, resp, req.Writer, originalModel, anthropicReq.Tools, start)
 	}
 
 	return g.handleAnthropicNonStream(resp, req.Writer, originalModel, start)
@@ -279,7 +284,7 @@ func (g *OpenAIGateway) forwardAnthropicViaResponsesSSE(
 	// 3. 把 Responses SSE 翻译成 Anthropic SSE 写给客户端
 	isStream := anthropicReq.Stream != nil && *anthropicReq.Stream
 	if isStream && req.Writer != nil {
-		return translateResponsesSSEToAnthropicSSE(ctx, resp, req.Writer, originalModel, start)
+		return translateResponsesSSEToAnthropicSSE(ctx, resp, req.Writer, originalModel, anthropicReq.Tools, start)
 	}
 
 	// 非流式：聚合 Responses SSE 后构造 Anthropic 响应
@@ -288,21 +293,36 @@ func (g *OpenAIGateway) forwardAnthropicViaResponsesSSE(
 		return nil, wsResult.Err
 	}
 
+	stopReason := normalizeAnthropicStopReason(wsResult.StopReason)
+	contentBlocks := make([]AnthropicMessageContentBlock, 0, 2+len(wsResult.ToolUses))
+	if wsResult.Reasoning != "" {
+		contentBlocks = append(contentBlocks, AnthropicMessageContentBlock{
+			Type:      "thinking",
+			Thinking:  ptrStr(wsResult.Reasoning),
+			Signature: ptrStr(""),
+		})
+	}
+	if wsResult.Text != "" || len(wsResult.ToolUses) == 0 {
+		contentBlocks = append(contentBlocks, AnthropicMessageContentBlock{Type: "text", Text: ptrStr(wsResult.Text)})
+	}
+	if len(wsResult.ToolUses) > 0 {
+		contentBlocks = append(contentBlocks, wsResult.ToolUses...)
+	}
+
 	msgID := generateMessageID()
 	anthropicResp := AnthropicMessage{
-		ID:    msgID,
-		Type:  "message",
-		Role:  "assistant",
-		Model: originalModel,
-		Content: []AnthropicMessageContentBlock{
-			{Type: "text", Text: ptrStr(wsResult.Text)},
-		},
-		StopReason: ptrStr("end_turn"),
+		ID:         msgID,
+		Type:       "message",
+		Role:       "assistant",
+		Model:      originalModel,
+		Content:    contentBlocks,
+		StopReason: ptrStr(stopReason),
 		Usage: &AnthropicUsage{
 			InputTokens:  wsResult.InputTokens,
 			OutputTokens: wsResult.OutputTokens,
 		},
 	}
+
 	respData, _ := json.Marshal(anthropicResp)
 
 	if req.Writer != nil {
@@ -408,4 +428,14 @@ func validateAnthropicRequest(req *AnthropicMessageRequest) *anthropicValidation
 	}
 
 	return nil
+}
+
+func applyDefaultThinking(req *AnthropicMessageRequest) {
+	if req == nil || req.Thinking != nil {
+		return
+	}
+	req.Thinking = &AnthropicThinking{
+		Type:         "enabled",
+		BudgetTokens: defaultThinkingBudgetTokens,
+	}
 }

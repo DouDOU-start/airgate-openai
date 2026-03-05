@@ -8,8 +8,8 @@ import (
 	"net/url"
 	"strings"
 
-	sdk "github.com/DouDOU-start/airgate-sdk"
 	"github.com/DouDOU-start/airgate-openai/backend/resources"
+	sdk "github.com/DouDOU-start/airgate-sdk"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
@@ -171,6 +171,16 @@ func wrapAsResponsesAPI(body []byte, model string) ([]byte, error) {
 				result = modified
 			}
 		}
+		// 为 Responses 请求补齐 reasoning，确保可回传 reasoning_summary_text.delta
+		if !gjson.GetBytes(result, "reasoning").Exists() {
+			if reasoning := buildResponsesReasoningConfig(body); reasoning != nil {
+				if modified, err := sjson.SetBytes(result, "reasoning", reasoning); err == nil {
+					result = modified
+				}
+			}
+		}
+		// 请求显式包含加密 reasoning，便于客户端/代理在多轮中保留 reasoning 上下文
+		result = ensureResponsesInclude(result, "reasoning.encrypted_content")
 		return result, nil
 	}
 
@@ -186,24 +196,78 @@ func wrapAsResponsesAPI(body []byte, model string) ([]byte, error) {
 			"store":        false,
 		}
 
+		// Chat Completions 的 reasoning_effort 映射到 Responses 的 reasoning
+		if reasoning := buildResponsesReasoningConfig(body); reasoning != nil {
+			wrapped["reasoning"] = reasoning
+		}
+
 		// 转换 tools（Chat Completions → Responses API 格式）
 		if tools := gjson.GetBytes(body, "tools"); tools.Exists() && tools.IsArray() {
 			wrapped["tools"] = convertChatToolsToResponsesTools(tools.Array())
 		}
 
-		// tool_choice：如果历史中有工具调用记录（处于工具循环中），强制 required
-		// 避免模型在执行阶段只输出文字确认而不调用工具
+		// tool_choice：仅在存在未闭合的工具调用时强制 required
+		// 避免“历史里出现过一次工具调用”后永久 required，导致模型被迫每轮都继续调工具
 		if tc := gjson.GetBytes(body, "tool_choice"); tc.Exists() {
 			wrapped["tool_choice"] = json.RawMessage(tc.Raw)
-		} else if messagesHaveToolCalls(gjson.GetBytes(body, "messages").Array()) {
+		} else if hasPendingToolCalls(gjson.GetBytes(body, "messages").Array()) {
 			wrapped["tool_choice"] = "required"
 		}
+		// 显式请求返回加密 reasoning 内容
+		wrapped["include"] = []string{"reasoning.encrypted_content"}
 
 		return json.Marshal(wrapped)
 	}
 
 	// 无法识别的格式，原样返回
 	return body, nil
+}
+
+func ensureResponsesInclude(body []byte, includeValue string) []byte {
+	if includeValue == "" {
+		return body
+	}
+	include := gjson.GetBytes(body, "include")
+	if include.Exists() && include.IsArray() {
+		for _, item := range include.Array() {
+			if item.String() == includeValue {
+				return body
+			}
+		}
+		if modified, err := sjson.SetBytes(body, "include.-1", includeValue); err == nil {
+			return modified
+		}
+		return body
+	}
+	if modified, err := sjson.SetBytes(body, "include", []string{includeValue}); err == nil {
+		return modified
+	}
+	return body
+}
+
+// buildResponsesReasoningConfig 将 Chat Completions 的 reasoning_effort 映射为 Responses reasoning 配置
+func buildResponsesReasoningConfig(body []byte) map[string]any {
+	effort := normalizeResponsesReasoningEffort(gjson.GetBytes(body, "reasoning_effort").String())
+	if effort == "" {
+		return nil
+	}
+	// detailed 可稳定触发 reasoning summary 事件，便于前端显示 thinking 标识
+	return map[string]any{
+		"effort":  effort,
+		"summary": "detailed",
+	}
+}
+
+func normalizeResponsesReasoningEffort(effort string) string {
+	switch strings.ToLower(strings.TrimSpace(effort)) {
+	case "minimal", "low", "medium", "high":
+		return strings.ToLower(strings.TrimSpace(effort))
+	case "xhigh":
+		// Responses API 不一定支持 xhigh，向下兼容到 high
+		return "high"
+	default:
+		return ""
+	}
 }
 
 // convertChatMessagesToResponsesInput 将 Chat Completions messages 转换为 Responses API input 列表
@@ -278,14 +342,40 @@ func convertChatMessagesToResponsesInput(messages []gjson.Result) []any {
 	return input
 }
 
-// messagesHaveToolCalls 检查消息历史中是否存在工具调用（判断是否处于工具循环中）
-func messagesHaveToolCalls(messages []gjson.Result) bool {
+// hasPendingToolCalls 检查是否存在未闭合的工具调用：
+// assistant tool_calls 已发出，但尚未收到对应 role=tool 的 tool_call_id 结果。
+func hasPendingToolCalls(messages []gjson.Result) bool {
+	if len(messages) == 0 {
+		return false
+	}
+
+	pending := make(map[string]struct{})
+
 	for _, msg := range messages {
-		if msg.Get("tool_calls").Exists() {
-			return true
+		role := msg.Get("role").String()
+		switch role {
+		case "assistant":
+			toolCalls := msg.Get("tool_calls")
+			if !toolCalls.Exists() || !toolCalls.IsArray() {
+				continue
+			}
+			for _, tc := range toolCalls.Array() {
+				id := strings.TrimSpace(tc.Get("id").String())
+				if id == "" {
+					continue
+				}
+				pending[id] = struct{}{}
+			}
+		case "tool":
+			id := strings.TrimSpace(msg.Get("tool_call_id").String())
+			if id == "" {
+				continue
+			}
+			delete(pending, id)
 		}
 	}
-	return false
+
+	return len(pending) > 0
 }
 
 // extractChatMessageText 从 Chat Completions 消息中提取文本内容

@@ -65,20 +65,26 @@ func thinkingBudgetToReasoningEffort(budget int64) string {
 	}
 }
 
-// convertFinishReasonToAnthropic 将 OpenAI finish_reason 转为 Anthropic stop_reason
-func convertFinishReasonToAnthropic(reason string) string {
-	switch reason {
-	case "stop":
+// normalizeAnthropicStopReason 统一 stop_reason 映射：兼容 OpenAI finish_reason 和 Responses stop_reason
+func normalizeAnthropicStopReason(reason string) string {
+	normalized := strings.ToLower(strings.TrimSpace(reason))
+	switch normalized {
+	case "", "stop", "end_turn":
 		return "end_turn"
-	case "length":
+	case "length", "max_tokens", "max_output_tokens":
 		return "max_tokens"
-	case "tool_calls":
+	case "tool_calls", "tool_use":
 		return "tool_use"
-	case "content_filter":
+	case "content_filter", "refusal":
 		return "refusal"
 	default:
-		return reason
+		return normalized
 	}
+}
+
+// convertFinishReasonToAnthropic 将 OpenAI finish_reason 转为 Anthropic stop_reason
+func convertFinishReasonToAnthropic(reason string) string {
+	return normalizeAnthropicStopReason(reason)
 }
 
 // ptrStr 返回字符串指针
