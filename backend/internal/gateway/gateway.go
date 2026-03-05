@@ -32,6 +32,16 @@ func (g *OpenAIGateway) Info() sdk.PluginInfo {
 				},
 			},
 			{
+				Key:         "sub2api",
+				Label:       "Sub2API",
+				Description: "通过 sub2api API Key 转发（仅 Responses 协议）",
+				Fields: []sdk.CredentialField{
+					{Key: "api_key", Label: "API Key", Type: "password", Required: true, Placeholder: "sk-..."},
+					{Key: "base_url", Label: "API 地址", Type: "text", Required: false, Placeholder: "https://sub2api.xxxx.com"},
+					{Key: "provider", Label: "Provider", Type: "text", Required: false, Placeholder: "sub2api"},
+				},
+			},
+			{
 				Key:         "oauth",
 				Label:       "OAuth 登录",
 				Description: "通过浏览器授权登录 ChatGPT 账号",

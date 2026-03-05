@@ -148,6 +148,11 @@ func (g *OpenAIGateway) forwardAnthropicViaAPIKeyResponses(
 	upstreamReq.Header.Set("Content-Type", "application/json")
 	upstreamReq.Header.Set("Accept", "text/event-stream")
 	passHeaders(req.Headers, upstreamReq.Header)
+	if isSub2APIAccount(account) {
+		// sub2api 仅走 /v1/responses，清理仅官方链路使用的透传头
+		upstreamReq.Header.Del("OpenAI-Beta")
+		upstreamReq.Header.Del("ChatGPT-Account-ID")
+	}
 
 	client := g.buildHTTPClient(account)
 	resp, err := client.Do(upstreamReq)

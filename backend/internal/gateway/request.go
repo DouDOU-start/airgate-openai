@@ -145,19 +145,26 @@ func buildAPIKeyURL(account *sdk.Account, reqPath string) string {
 // 请求预处理
 // ──────────────────────────────────────────────────────
 
-// preprocessRequestBody 预处理请求体（同步 model 字段）
-func preprocessRequestBody(body []byte, model string) []byte {
-	if len(body) == 0 || model == "" {
+// preprocessRequestBody 预处理请求体（同步 model 字段 + 上下文预算守卫）
+func preprocessRequestBody(body []byte, model, reqPath string) []byte {
+	if len(body) == 0 {
 		return body
 	}
 
-	bodyModel := gjson.GetBytes(body, "model").String()
-	if bodyModel != model {
-		if modified, err := sjson.SetBytes(body, "model", model); err == nil {
-			return modified
+	result := body
+	if model != "" {
+		bodyModel := gjson.GetBytes(result, "model").String()
+		if bodyModel != model {
+			if modified, err := sjson.SetBytes(result, "model", model); err == nil {
+				result = modified
+			}
 		}
 	}
-	return body
+
+	if shouldApplyContextGuard(reqPath) {
+		result = applyContextWindowGuard(result)
+	}
+	return result
 }
 
 // wrapAsResponsesAPI 将请求包装为 Responses API 格式（模拟客户端模式）
@@ -241,6 +248,187 @@ func ensureResponsesDefaults(body []byte) []byte {
 		result = modified
 	}
 	return result
+}
+
+const (
+	contextGuardMinChars         = 12000
+	contextGuardReserveMinTokens = 2048
+	contextGuardReserveRatio     = 0.15
+	contextGuardMaxTailMessages  = 18
+)
+
+// shouldApplyContextGuard 仅对易触发上下文膨胀的写请求启用守卫
+func shouldApplyContextGuard(reqPath string) bool {
+	path := strings.ToLower(strings.TrimSpace(reqPath))
+	switch path {
+	case "/v1/responses", "/v1/chat/completions", "/v1/messages":
+		return true
+	default:
+		return false
+	}
+}
+
+// applyContextWindowGuard 在超长上下文时做保守裁剪，降低上游 context window 超限概率
+func applyContextWindowGuard(body []byte) []byte {
+	if len(body) == 0 {
+		return body
+	}
+
+	window := modelContextWindow(gjson.GetBytes(body, "model").String())
+	if window <= 0 {
+		window = 200000
+	}
+	if !shouldCompactByChars(body, window) {
+		return body
+	}
+
+	trimmed := trimRequestConversation(body)
+	if len(trimmed) == 0 {
+		return body
+	}
+	return trimmed
+}
+
+func shouldCompactByChars(body []byte, contextWindow int) bool {
+	textChars := 0
+	if input := gjson.GetBytes(body, "input"); input.Exists() {
+		textChars += len(input.Raw)
+	}
+	if messages := gjson.GetBytes(body, "messages"); messages.Exists() {
+		textChars += len(messages.Raw)
+	}
+	if textChars < contextGuardMinChars {
+		return false
+	}
+
+	estimatedTokens := textChars / 4
+	reserve := int(float64(contextWindow) * contextGuardReserveRatio)
+	if reserve < contextGuardReserveMinTokens {
+		reserve = contextGuardReserveMinTokens
+	}
+	return estimatedTokens+reserve > contextWindow
+}
+
+func trimRequestConversation(body []byte) []byte {
+	if gjson.GetBytes(body, "input").Exists() {
+		return trimResponsesInput(body)
+	}
+	if gjson.GetBytes(body, "messages").Exists() {
+		return trimChatMessages(body)
+	}
+	return body
+}
+
+func trimResponsesInput(body []byte) []byte {
+	input := gjson.GetBytes(body, "input")
+	if !input.Exists() || !input.IsArray() {
+		return body
+	}
+	arr := input.Array()
+	if len(arr) <= contextGuardMaxTailMessages {
+		return body
+	}
+
+	start := len(arr) - contextGuardMaxTailMessages
+	keptRaw := make([]string, 0, contextGuardMaxTailMessages+1)
+	for i, item := range arr {
+		if i < start && isSystemInputItem(item) {
+			keptRaw = append(keptRaw, item.Raw)
+		}
+		if i >= start {
+			keptRaw = append(keptRaw, item.Raw)
+		}
+	}
+	if len(keptRaw) == len(arr) {
+		return body
+	}
+
+	replacement := []byte("[" + strings.Join(keptRaw, ",") + "]")
+	modified, err := sjson.SetRawBytes(body, "input", replacement)
+	if err != nil {
+		return body
+	}
+	return modified
+}
+
+func isSystemInputItem(item gjson.Result) bool {
+	if item.Get("type").String() != "message" {
+		return false
+	}
+	role := strings.ToLower(strings.TrimSpace(item.Get("role").String()))
+	return role == "system" || role == "developer"
+}
+
+// getModelMetadataByID 返回网关内置模型元信息，用于 /v1/models 字段补齐与上下文预算估算
+func getModelMetadataByID(modelID string) map[string]any {
+	window := modelContextWindow(modelID)
+	if window <= 0 {
+		return nil
+	}
+	meta := map[string]any{
+		"context_length":   window,
+		"context_window":   window,
+		"max_input_tokens": window,
+	}
+	switch strings.ToLower(strings.TrimSpace(modelID)) {
+	case "codex-mini-latest", "gpt-4o", "gpt-4o-mini":
+		meta["max_output_tokens"] = 16384
+	case "gpt-4.1", "gpt-4.1-mini", "gpt-4.1-nano":
+		meta["max_output_tokens"] = 32768
+	case "o3", "o3-pro", "o4-mini", "o3-mini":
+		meta["max_output_tokens"] = 32768
+	}
+	return meta
+}
+
+func trimChatMessages(body []byte) []byte {
+	messages := gjson.GetBytes(body, "messages")
+	if !messages.Exists() || !messages.IsArray() {
+		return body
+	}
+	arr := messages.Array()
+	if len(arr) <= contextGuardMaxTailMessages {
+		return body
+	}
+
+	start := len(arr) - contextGuardMaxTailMessages
+	keptRaw := make([]string, 0, contextGuardMaxTailMessages+2)
+	for i, item := range arr {
+		if i < start && isSystemChatMessage(item) {
+			keptRaw = append(keptRaw, item.Raw)
+		}
+		if i >= start {
+			keptRaw = append(keptRaw, item.Raw)
+		}
+	}
+	if len(keptRaw) == len(arr) {
+		return body
+	}
+
+	replacement := []byte("[" + strings.Join(keptRaw, ",") + "]")
+	modified, err := sjson.SetRawBytes(body, "messages", replacement)
+	if err != nil {
+		return body
+	}
+	return modified
+}
+
+func isSystemChatMessage(item gjson.Result) bool {
+	role := strings.ToLower(strings.TrimSpace(item.Get("role").String()))
+	return role == "system" || role == "developer"
+}
+
+func modelContextWindow(model string) int {
+	switch strings.ToLower(strings.TrimSpace(model)) {
+	case "gpt-4.1", "gpt-4.1-mini", "gpt-4.1-nano":
+		return 1047576
+	case "gpt-4o", "gpt-4o-mini", "codex-mini-latest":
+		return 128000
+	case "o3", "o3-pro", "o4-mini", "o3-mini":
+		return 200000
+	default:
+		return 200000
+	}
 }
 
 // convertChatMessagesToResponsesInput 将 Chat Completions messages 转换为 Responses API input 列表

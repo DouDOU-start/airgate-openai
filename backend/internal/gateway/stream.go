@@ -281,7 +281,7 @@ func parseSSEFailureEvent(data []byte) error {
 		errCode := strings.ToLower(errNode.Get("code").String())
 
 		switch {
-		case containsAny(errType, errCode, msg, "context_length", "context window", "max_tokens"):
+		case containsAny(errType, errCode, msg, "context_length", "context window", "max_tokens", "max_input_tokens", "max_output_tokens", "token limit", "too many tokens"):
 			return fmt.Errorf("上游上下文窗口超限: %s", msg)
 		case containsAny(errType, errCode, msg, "quota", "insufficient_quota"):
 			return fmt.Errorf("上游配额不足: %s", msg)

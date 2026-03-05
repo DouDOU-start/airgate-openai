@@ -14,8 +14,9 @@ import (
 	"time"
 
 	sdk "github.com/DouDOU-start/airgate-sdk"
+	"github.com/tidwall/gjson"
+	"github.com/tidwall/sjson"
 )
-
 
 // ──────────────────────────────────────────────────────
 // 转发入口（三模式分发）
@@ -51,10 +52,10 @@ func (g *OpenAIGateway) forwardAPIKey(ctx context.Context, req *sdk.ForwardReque
 	reqMethod, reqPath := resolveAPIKeyRoute(req)
 	targetURL := buildAPIKeyURL(account, reqPath)
 
-	// 预处理请求体
+	// 预处理请求体（含 model 同步与上下文预算守卫）
 	body := req.Body
 	if methodAllowsBody(reqMethod) {
-		body = preprocessRequestBody(body, req.Model)
+		body = preprocessRequestBody(body, req.Model, reqPath)
 	}
 
 	var bodyReader io.Reader
@@ -94,11 +95,77 @@ func (g *OpenAIGateway) forwardAPIKey(ctx context.Context, req *sdk.ForwardReque
 		}, fmt.Errorf("上游返回 %d: %s", resp.StatusCode, truncate(string(respBody), 200))
 	}
 
+	// /v1/models 路径补齐上下文元信息（不影响其它路由）
+	if reqMethod == http.MethodGet && strings.HasPrefix(reqPath, "/v1/models") {
+		resp = enrichModelsResponse(resp)
+	}
+
 	// 流式 / 非流式响应处理
 	if req.Stream && req.Writer != nil {
 		return handleStreamResponse(resp, req.Writer, start)
 	}
 	return handleNonStreamResponse(resp, req.Writer, start)
+}
+
+func enrichModelsResponse(resp *http.Response) *http.Response {
+	if resp == nil || resp.Body == nil {
+		return resp
+	}
+
+	raw, err := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	if err != nil || len(raw) == 0 {
+		resp.Body = io.NopCloser(bytes.NewReader(raw))
+		if len(raw) > 0 {
+			resp.ContentLength = int64(len(raw))
+		}
+		return resp
+	}
+
+	dataNode := gjson.GetBytes(raw, "data")
+	if !dataNode.Exists() || !dataNode.IsArray() {
+		resp.Body = io.NopCloser(bytes.NewReader(raw))
+		resp.ContentLength = int64(len(raw))
+		return resp
+	}
+
+	updated := raw
+	changed := false
+	for idx, item := range dataNode.Array() {
+		modelID := strings.TrimSpace(item.Get("id").String())
+		if modelID == "" {
+			continue
+		}
+
+		meta := getModelMetadataByID(modelID)
+		if len(meta) == 0 {
+			continue
+		}
+		for key, value := range meta {
+			path := fmt.Sprintf("data.%d.%s", idx, key)
+			if gjson.GetBytes(updated, path).Exists() {
+				continue
+			}
+			patched, setErr := sjson.SetBytes(updated, path, value)
+			if setErr != nil {
+				continue
+			}
+			updated = patched
+			changed = true
+		}
+	}
+
+	if !changed {
+		updated = raw
+	}
+
+	resp.Body = io.NopCloser(bytes.NewReader(updated))
+	resp.ContentLength = int64(len(updated))
+	if resp.Header != nil {
+		resp.Header.Set("Content-Length", fmt.Sprintf("%d", len(updated)))
+		resp.Header.Set("Content-Type", "application/json")
+	}
+	return resp
 }
 
 // ──────────────────────────────────────────────────────
@@ -187,8 +254,8 @@ type sseEventWriter struct {
 }
 
 func (s *sseEventWriter) OnTextDelta(string)      {}
-func (s *sseEventWriter) OnReasoningDelta(string)  {}
-func (s *sseEventWriter) OnRateLimits(float64)     {}
+func (s *sseEventWriter) OnReasoningDelta(string) {}
+func (s *sseEventWriter) OnRateLimits(float64)    {}
 
 func (s *sseEventWriter) OnRawEvent(eventType string, data []byte) {
 	if s.w == nil || eventType == "" {
@@ -259,6 +326,14 @@ func (g *OpenAIGateway) buildHTTPClient(account *sdk.Account) *http.Client {
 // ──────────────────────────────────────────────────────
 // 工具函数
 // ──────────────────────────────────────────────────────
+
+func isSub2APIAccount(account *sdk.Account) bool {
+	if account == nil {
+		return false
+	}
+	provider := strings.ToLower(strings.TrimSpace(account.Credentials["provider"]))
+	return provider == "sub2api"
+}
 
 func truncate(s string, maxLen int) string {
 	if len(s) <= maxLen {
