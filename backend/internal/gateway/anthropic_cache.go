@@ -1,197 +1,194 @@
 package gateway
 
+import (
+	"fmt"
+
+	"github.com/tidwall/gjson"
+	"github.com/tidwall/sjson"
+)
+
 // ──────────────────────────────────────────────────────
-// Cache Control 优化
-// 参考 AxonHub llm/transformer/anthropic/ensure_cache_control.go
+// Cache Control 优化（纯 gjson/sjson，零 struct）
 // ──────────────────────────────────────────────────────
 
 const (
-	// maxCacheControlBreakpoints Anthropic API 允许的最大 cache_control 断点数
-	maxCacheControlBreakpoints = 4
-	// adaptiveCacheControlBlockWindow 自适应窗口大小
-	adaptiveCacheControlBlockWindow = 20
+	// maxCacheBreakpoints Anthropic API 允许的最大 cache_control 断点数
+	maxCacheBreakpoints = 4
+	// cacheBlockWindow 自适应窗口大小
+	cacheBlockWindow = 20
 )
 
-// optimizeCacheControl 统一自动优化 cache_control 断点位置：
-//   - 先清空全部断点，再按固定规划重建
-//   - 结构锚点：tools(last) + system(last)
-//   - 消息锚点：短内容 1 个、长内容 2 个（受 4 个上限约束）
-//   - thinking 与空 text 不允许打点
-func optimizeCacheControl(req *AnthropicMessageRequest) {
-	normalizeMessageContents(req)
-	clearCacheControls(req)
+// optimizeCacheControlJSON 统一自动优化 cache_control 断点位置
+// 操作原始 []byte，返回优化后的 []byte
+func optimizeCacheControlJSON(body []byte) []byte {
+	body = normalizeStringContents(body)
+	body = clearAllCacheControls(body)
 
-	structural := ensureStructuralCacheControls(req)
+	structural := 0
 
-	remaining := maxCacheControlBreakpoints - structural
+	// ─── 结构锚点：tools 末尾 ───
+	if toolsCount := gjson.GetBytes(body, "tools.#").Int(); toolsCount > 0 {
+		path := fmt.Sprintf("tools.%d.cache_control", toolsCount-1)
+		body, _ = sjson.SetRawBytes(body, path, []byte(`{"type":"ephemeral"}`))
+		structural++
+	}
+
+	// ─── 结构锚点：system 末尾 ───
+	sysResult := gjson.GetBytes(body, "system")
+	if sysResult.IsArray() {
+		sysCount := sysResult.Get("#").Int()
+		if sysCount > 0 {
+			path := fmt.Sprintf("system.%d.cache_control", sysCount-1)
+			body, _ = sjson.SetRawBytes(body, path, []byte(`{"type":"ephemeral"}`))
+			structural++
+		}
+	} else if sysResult.Type == gjson.String && sysResult.String() != "" {
+		// string 形式 system → 归一化为数组再打点
+		text := sysResult.String()
+		sysArray := fmt.Sprintf(`[{"type":"text","text":%q,"cache_control":{"type":"ephemeral"}}]`, text)
+		body, _ = sjson.SetRawBytes(body, "system", []byte(sysArray))
+		structural++
+	}
+
+	// ─── 消息锚点 ───
+	remaining := maxCacheBreakpoints - structural
 	if remaining <= 0 {
-		return
+		return body
 	}
 
-	refs := collectMessageBlockRefs(req)
-	messageAnchors := min(desiredMessageCacheAnchors(len(refs)), remaining)
-	injectPlannedMessageCacheControls(refs, messageAnchors)
-
-	sanitizeUnsupportedCacheControls(req)
-}
-
-// normalizeMessageContents 将 Messages 中的纯字符串 Content 统一归一化为 MultipleContent 数组格式
-func normalizeMessageContents(req *AnthropicMessageRequest) {
-	for i := range req.Messages {
-		msg := &req.Messages[i]
-		if len(msg.Content.MultipleContent) == 0 && msg.Content.Content != nil && *msg.Content.Content != "" {
-			text := *msg.Content.Content
-			msg.Content.Content = nil
-			msg.Content.MultipleContent = []AnthropicMessageContentBlock{{
-				Type: "text",
-				Text: &text,
-			}}
-		}
+	// 收集可缓存消息块路径
+	type blockRef struct {
+		msgIdx   int
+		blockIdx int
 	}
-}
+	var refs []blockRef
 
-// ensureStructuralCacheControls 确保 tools 和 system 的最后一个元素有 cache_control
-func ensureStructuralCacheControls(req *AnthropicMessageRequest) int {
-	count := 0
-
-	if len(req.Tools) > 0 {
-		req.Tools[len(req.Tools)-1].CacheControl = &AnthropicCacheControl{Type: "ephemeral"}
-		count++
-	}
-
-	if req.System == nil {
-		return count
-	}
-
-	if len(req.System.MultiplePrompts) > 0 {
-		last := len(req.System.MultiplePrompts) - 1
-		req.System.MultiplePrompts[last].CacheControl = &AnthropicCacheControl{Type: "ephemeral"}
-		count++
-		return count
-	}
-
-	// system 是字符串形式时归一化为 MultiplePrompts 数组格式
-	if req.System.Prompt != nil && *req.System.Prompt != "" {
-		text := *req.System.Prompt
-		req.System.Prompt = nil
-		req.System.MultiplePrompts = []AnthropicSystemPromptPart{{
-			Type:         "text",
-			Text:         text,
-			CacheControl: &AnthropicCacheControl{Type: "ephemeral"},
-		}}
-		count++
-	}
-
-	return count
-}
-
-// sanitizeUnsupportedCacheControls 清理不允许设置 cache_control 的内容块
-func sanitizeUnsupportedCacheControls(req *AnthropicMessageRequest) {
-	for i := range req.Messages {
-		for j := range req.Messages[i].Content.MultipleContent {
-			block := &req.Messages[i].Content.MultipleContent[j]
-			if !isCacheableMessageBlock(*block) && block.CacheControl != nil {
-				block.CacheControl = nil
+	messages := gjson.GetBytes(body, "messages")
+	if messages.IsArray() {
+		for mi, msg := range messages.Array() {
+			content := msg.Get("content")
+			if content.IsArray() {
+				for bi, block := range content.Array() {
+					if isCacheableBlock(block) {
+						refs = append(refs, blockRef{mi, bi})
+					}
+				}
 			}
 		}
 	}
-}
 
-func desiredMessageCacheAnchors(cacheableBlocks int) int {
-	if cacheableBlocks == 0 {
-		return 0
-	}
-	if cacheableBlocks >= adaptiveCacheControlBlockWindow {
-		return 2
-	}
-	return 1
-}
-
-func injectPlannedMessageCacheControls(refs []**AnthropicCacheControl, target int) {
-	if target <= 0 || len(refs) == 0 {
-		return
-	}
-
-	// 第一优先级：最后一个可缓存块
-	*refs[len(refs)-1] = &AnthropicCacheControl{Type: "ephemeral"}
-
-	// 第二优先级：末尾前 20 blocks 的窗口边界
-	if target > 1 {
-		idx := pickWindowAnchorIndex(refs, adaptiveCacheControlBlockWindow)
-		if idx >= 0 {
-			*refs[idx] = &AnthropicCacheControl{Type: "ephemeral"}
+	// 确定消息锚点数量
+	messageAnchors := 0
+	if len(refs) > 0 {
+		messageAnchors = 1
+		if len(refs) >= cacheBlockWindow {
+			messageAnchors = 2
 		}
 	}
+	if messageAnchors > remaining {
+		messageAnchors = remaining
+	}
+
+	if messageAnchors <= 0 || len(refs) == 0 {
+		return body
+	}
+
+	// 第一锚点：最后一个可缓存块
+	last := refs[len(refs)-1]
+	path := fmt.Sprintf("messages.%d.content.%d.cache_control", last.msgIdx, last.blockIdx)
+	body, _ = sjson.SetRawBytes(body, path, []byte(`{"type":"ephemeral"}`))
+
+	// 第二锚点：末尾前 cacheBlockWindow 个位置
+	if messageAnchors > 1 {
+		target := len(refs) - 1 - cacheBlockWindow
+		if target < 0 {
+			target = 0
+		}
+		// 避免与第一锚点重复
+		if target != len(refs)-1 {
+			r := refs[target]
+			path = fmt.Sprintf("messages.%d.content.%d.cache_control", r.msgIdx, r.blockIdx)
+			body, _ = sjson.SetRawBytes(body, path, []byte(`{"type":"ephemeral"}`))
+		}
+	}
+
+	// ─── 清理不允许缓存的块（thinking/empty text）───
+	body = sanitizeUnsupportedCacheControlsJSON(body)
+
+	return body
 }
 
-// pickWindowAnchorIndex 选择距离末尾 window 个位置的未标记锚点
-func pickWindowAnchorIndex(refs []**AnthropicCacheControl, window int) int {
-	if len(refs) == 0 {
-		return -1
+// normalizeStringContents 将 messages 中纯字符串 content 归一化为数组格式
+func normalizeStringContents(body []byte) []byte {
+	messages := gjson.GetBytes(body, "messages")
+	if !messages.IsArray() {
+		return body
 	}
-	if window < 0 {
-		window = 0
-	}
-
-	target := max(len(refs)-1-window, 0)
-
-	// 优先选择目标窗口左侧
-	for i := target; i >= 0; i-- {
-		if *refs[i] != nil {
-			continue
+	for i, msg := range messages.Array() {
+		content := msg.Get("content")
+		if content.Type == gjson.String && content.String() != "" {
+			text := content.String()
+			arr := `[{"type":"text"}]`
+			arr, _ = sjson.Set(arr, "0.text", text)
+			body, _ = sjson.SetRawBytes(body, fmt.Sprintf("messages.%d.content", i), []byte(arr))
 		}
-		return i
 	}
-
-	for i := target + 1; i < len(refs); i++ {
-		if *refs[i] != nil {
-			continue
-		}
-		return i
-	}
-
-	return -1
+	return body
 }
 
-// collectMessageBlockRefs 收集所有消息中可缓存块的 CacheControl 指针引用
-func collectMessageBlockRefs(req *AnthropicMessageRequest) []**AnthropicCacheControl {
-	var refs []**AnthropicCacheControl
-	for i := range req.Messages {
-		for j := range req.Messages[i].Content.MultipleContent {
-			if !isCacheableMessageBlock(req.Messages[i].Content.MultipleContent[j]) {
-				continue
+// clearAllCacheControls 清除所有 cache_control 断点
+func clearAllCacheControls(body []byte) []byte {
+	// 清理 tools
+	if tools := gjson.GetBytes(body, "tools"); tools.IsArray() {
+		for i := range tools.Array() {
+			body, _ = sjson.DeleteBytes(body, fmt.Sprintf("tools.%d.cache_control", i))
+		}
+	}
+
+	// 清理 system
+	if sys := gjson.GetBytes(body, "system"); sys.IsArray() {
+		for i := range sys.Array() {
+			body, _ = sjson.DeleteBytes(body, fmt.Sprintf("system.%d.cache_control", i))
+		}
+	}
+
+	// 清理 messages
+	if msgs := gjson.GetBytes(body, "messages"); msgs.IsArray() {
+		for mi, msg := range msgs.Array() {
+			if content := msg.Get("content"); content.IsArray() {
+				for bi := range content.Array() {
+					body, _ = sjson.DeleteBytes(body, fmt.Sprintf("messages.%d.content.%d.cache_control", mi, bi))
+				}
 			}
-			refs = append(refs, &req.Messages[i].Content.MultipleContent[j].CacheControl)
 		}
 	}
-	return refs
+
+	return body
 }
 
-// clearCacheControls 清除所有 cache_control 断点
-func clearCacheControls(req *AnthropicMessageRequest) {
-	for i := range req.Tools {
-		req.Tools[i].CacheControl = nil
-	}
-	if req.System != nil {
-		for i := range req.System.MultiplePrompts {
-			req.System.MultiplePrompts[i].CacheControl = nil
+// sanitizeUnsupportedCacheControlsJSON 清理不允许设置 cache_control 的内容块
+func sanitizeUnsupportedCacheControlsJSON(body []byte) []byte {
+	if msgs := gjson.GetBytes(body, "messages"); msgs.IsArray() {
+		for mi, msg := range msgs.Array() {
+			if content := msg.Get("content"); content.IsArray() {
+				for bi, block := range content.Array() {
+					if !isCacheableBlock(block) && block.Get("cache_control").Exists() {
+						body, _ = sjson.DeleteBytes(body, fmt.Sprintf("messages.%d.content.%d.cache_control", mi, bi))
+					}
+				}
+			}
 		}
 	}
-	for i := range req.Messages {
-		msg := &req.Messages[i]
-		for j := range msg.Content.MultipleContent {
-			msg.Content.MultipleContent[j].CacheControl = nil
-		}
-	}
+	return body
 }
 
-// isCacheableMessageBlock 判断内容块是否可缓存
-func isCacheableMessageBlock(block AnthropicMessageContentBlock) bool {
-	switch block.Type {
+// isCacheableBlock 判断内容块是否可缓存
+func isCacheableBlock(block gjson.Result) bool {
+	switch block.Get("type").String() {
 	case "thinking", "redacted_thinking":
 		return false
 	case "text":
-		return block.Text != nil && *block.Text != ""
+		return block.Get("text").String() != ""
 	default:
 		return true
 	}

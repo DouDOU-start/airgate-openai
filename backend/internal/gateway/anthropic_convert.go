@@ -1,554 +1,370 @@
 package gateway
 
 import (
-	"encoding/json"
 	"fmt"
 	"strings"
 
 	"github.com/tidwall/gjson"
+	"github.com/tidwall/sjson"
 )
 
 // ──────────────────────────────────────────────────────
-// Anthropic → OpenAI 请求转换
-// 参考 AxonHub llm/transformer/anthropic/inbound_convert.go
+// Anthropic → Responses API 一步直转（纯 gjson/sjson，零 struct）
+// 参考 CLIProxyAPI translator/codex/claude/codex_claude_request.go
 // ──────────────────────────────────────────────────────
 
-// convertAnthropicToOpenAIWithMapping 将 Anthropic Messages 请求转换为 OpenAI Chat Completions 格式
-// mappingEffort 为模型映射注入的 reasoning_effort，优先级高于 thinking 推导
-func convertAnthropicToOpenAIWithMapping(req *AnthropicMessageRequest, mappingEffort string) ([]byte, error) {
-	result := map[string]any{
-		"model": req.Model,
-	}
+// convertAnthropicRequestToResponses 将 Anthropic Messages API JSON 请求一步转换为 Responses API JSON
+// modelName: 映射后的上游模型名
+// mappingEffort: 模型映射注入的 reasoning_effort（优先级最高）
+func convertAnthropicRequestToResponses(rawJSON []byte, modelName, mappingEffort string) []byte {
+	root := gjson.ParseBytes(rawJSON)
+	template := `{"model":"","input":[]}`
+	template, _ = sjson.Set(template, "model", modelName)
 
-	// max_tokens
-	if req.MaxTokens > 0 {
-		result["max_tokens"] = req.MaxTokens
-	}
-
-	// stream
-	if req.Stream != nil && *req.Stream {
-		result["stream"] = true
-		// OpenAI 需要 stream_options 才能返回 usage
-		result["stream_options"] = map[string]any{"include_usage": true}
-	}
-
-	// temperature / top_p
-	if req.Temperature != nil {
-		result["temperature"] = *req.Temperature
-	}
-	if req.TopP != nil {
-		result["top_p"] = *req.TopP
-	}
-
-	// stop sequences
-	if len(req.StopSequences) > 0 {
-		if len(req.StopSequences) == 1 {
-			result["stop"] = req.StopSequences[0]
-		} else {
-			result["stop"] = req.StopSequences
-		}
-	}
-
-	// 转换 messages
-	messages, err := convertAnthropicMessagesToOpenAI(req)
-	if err != nil {
-		return nil, err
-	}
-	result["messages"] = messages
-
-	// 转换 tools
-	if len(req.Tools) > 0 {
-		tools := convertAnthropicToolsToOpenAI(req.Tools)
-		if len(tools) > 0 {
-			result["tools"] = tools
-		}
-	}
-
-	// 转换 tool_choice
-	if req.ToolChoice != nil {
-		if tc := convertAnthropicToolChoiceToOpenAI(req.ToolChoice); tc != nil {
-			result["tool_choice"] = tc
-		}
-	}
-
-	// reasoning_effort 优先级：模型映射 > thinking 推导
-	if mappingEffort != "" {
-		result["reasoning_effort"] = mappingEffort
-	} else if req.Thinking != nil {
-		switch req.Thinking.Type {
-		case "enabled":
-			if effort := thinkingBudgetToReasoningEffort(req.Thinking.BudgetTokens); effort != "" {
-				result["reasoning_effort"] = effort
-			}
-		case "adaptive":
-			if req.OutputConfig != nil && req.OutputConfig.Effort != "" {
-				result["reasoning_effort"] = req.OutputConfig.Effort
-			}
-		}
-	}
-
-	return json.Marshal(result)
-}
-
-// convertAnthropicMessagesToOpenAI 转换消息列表
-func convertAnthropicMessagesToOpenAI(req *AnthropicMessageRequest) ([]map[string]any, error) {
-	var messages []map[string]any
-
-	// 1. 转换 system prompt（多条合并为一条，OpenAI 只支持单条 system 消息）
-	if req.System != nil {
-		if req.System.Prompt != nil {
-			messages = append(messages, map[string]any{
-				"role":    "system",
-				"content": *req.System.Prompt,
-			})
-		} else if len(req.System.MultiplePrompts) > 0 {
-			parts := make([]string, 0, len(req.System.MultiplePrompts))
-			for _, prompt := range req.System.MultiplePrompts {
-				if prompt.Text != "" {
-					parts = append(parts, prompt.Text)
+	// ─── system → instructions（多条文本合并，过滤 billing header）───
+	systemResult := root.Get("system")
+	if systemResult.IsArray() {
+		var parts []string
+		for _, item := range systemResult.Array() {
+			if item.Get("type").String() == "text" {
+				text := item.Get("text").String()
+				if strings.HasPrefix(text, "x-anthropic-billing-header: ") {
+					continue
+				}
+				if text != "" {
+					parts = append(parts, text)
 				}
 			}
-			if len(parts) > 0 {
-				messages = append(messages, map[string]any{
-					"role":    "system",
-					"content": strings.Join(parts, "\n\n"),
-				})
-			}
+		}
+		if len(parts) > 0 {
+			template, _ = sjson.Set(template, "instructions", strings.Join(parts, "\n\n"))
+		}
+	} else if systemResult.Type == gjson.String {
+		if text := systemResult.String(); text != "" {
+			template, _ = sjson.Set(template, "instructions", text)
 		}
 	}
 
-	// 2. 转换用户/助手消息
-	for _, msg := range req.Messages {
-		converted := convertAnthropicMsgToOpenAI(msg)
-		messages = append(messages, converted...)
-	}
+	// ─── messages → input[] ───
+	toolNameMap := buildToolShortNameMapFromJSON(rawJSON)
 
-	return messages, nil
-}
+	messagesResult := root.Get("messages")
+	if messagesResult.IsArray() {
+		for _, msgResult := range messagesResult.Array() {
+			msgRole := msgResult.Get("role").String()
 
-// convertAnthropicMsgToOpenAI 转换单条 Anthropic 消息为 OpenAI 消息（可能产生多条）
-func convertAnthropicMsgToOpenAI(msg AnthropicMsgParam) []map[string]any {
-	// 简单字符串 content
-	if msg.Content.Content != nil {
-		return []map[string]any{{
-			"role":    msg.Role,
-			"content": *msg.Content.Content,
-		}}
-	}
+			newMessage := func() string {
+				msg := `{"type":"message","role":"","content":[]}`
+				msg, _ = sjson.Set(msg, "role", msgRole)
+				return msg
+			}
 
-	// 多 content block
-	if len(msg.Content.MultipleContent) == 0 {
-		return nil
-	}
+			message := newMessage()
+			contentIndex := 0
+			hasContent := false
 
-	var (
-		contentParts []map[string]any
-		toolCalls    []map[string]any
-		toolResults  []map[string]any
-		hasContent   bool
-		// thinking 相关
-		reasoningContent string
-		hasReasoning     bool
-	)
+			flushMessage := func() {
+				if hasContent {
+					template, _ = sjson.SetRaw(template, "input.-1", message)
+					message = newMessage()
+					contentIndex = 0
+					hasContent = false
+				}
+			}
 
-	for _, block := range msg.Content.MultipleContent {
-		switch block.Type {
-		case "text":
-			if block.Text != nil {
-				contentParts = append(contentParts, map[string]any{
-					"type": "text",
-					"text": *block.Text,
-				})
+			appendTextContent := func(text string) {
+				partType := "input_text"
+				if msgRole == "assistant" {
+					partType = "output_text"
+				}
+				message, _ = sjson.Set(message, fmt.Sprintf("content.%d.type", contentIndex), partType)
+				message, _ = sjson.Set(message, fmt.Sprintf("content.%d.text", contentIndex), text)
+				contentIndex++
 				hasContent = true
 			}
 
-		case "image":
-			if block.Source != nil {
-				imageURL := convertAnthropicImageToOpenAI(block.Source)
-				if imageURL != "" {
-					contentParts = append(contentParts, map[string]any{
-						"type":      "image_url",
-						"image_url": map[string]string{"url": imageURL},
-					})
-					hasContent = true
-				}
+			appendImageContent := func(dataURL string) {
+				message, _ = sjson.Set(message, fmt.Sprintf("content.%d.type", contentIndex), "input_image")
+				message, _ = sjson.Set(message, fmt.Sprintf("content.%d.image_url", contentIndex), dataURL)
+				contentIndex++
+				hasContent = true
 			}
 
-		case "thinking":
-			if block.Thinking != nil && *block.Thinking != "" {
-				reasoningContent = *block.Thinking
-				hasReasoning = true
-			}
-
-		case "redacted_thinking":
-			// 透传（上游可能不支持，但保留数据）
-
-		case "tool_use":
-			// web_search 是 Responses API 原生工具，由上游自动处理，不转发给 Chat Completions
-			if derefStr(block.Name) == "web_search" {
-				continue
-			}
-			args := "{}"
-			if len(block.Input) > 0 {
-				args = string(block.Input)
-			}
-			toolCalls = append(toolCalls, map[string]any{
-				"id":   block.ID,
-				"type": "function",
-				"function": map[string]any{
-					"name":      derefStr(block.Name),
-					"arguments": args,
-				},
-			})
-			hasContent = true
-
-		case "tool_result":
-			toolUseID := derefStr(block.ToolUseID)
-			// 过滤 web_search 的 tool_result（客户端无法执行此工具，错误结果不转发上游）
-			// web_search 的 tool_use_id 对应 Responses API item id（ws_ 前缀）
-			if strings.HasPrefix(toolUseID, "ws_") {
-				continue
-			}
-			content := extractToolResultContent(block.Content)
-			// is_error: true 时在内容前加错误标记，让模型感知工具执行失败
-			if block.IsError != nil && *block.IsError {
-				content = "[tool_error] " + content
-			}
-			toolResult := map[string]any{
-				"role":         "tool",
-				"tool_call_id": toolUseID,
-				"content":      content,
-			}
-			toolResults = append(toolResults, toolResult)
-		}
-	}
-
-	var result []map[string]any
-
-	// 主消息（user/assistant）
-	if hasContent || hasReasoning || len(toolCalls) > 0 {
-		mainMsg := map[string]any{
-			"role": msg.Role,
-		}
-
-		// 单文本块优化
-		if len(contentParts) == 1 && contentParts[0]["type"] == "text" && len(toolCalls) == 0 {
-			mainMsg["content"] = contentParts[0]["text"]
-		} else if len(contentParts) > 0 {
-			mainMsg["content"] = contentParts
-		}
-
-		if len(toolCalls) > 0 {
-			mainMsg["tool_calls"] = toolCalls
-			// 如果没有文本内容但有 tool_calls，content 可为 null
-			if len(contentParts) == 0 && !hasReasoning {
-				mainMsg["content"] = nil
-			}
-		}
-
-		// reasoning_content 放入消息（如上游支持）
-		if hasReasoning {
-			mainMsg["reasoning_content"] = reasoningContent
-		}
-
-		result = append(result, mainMsg)
-	}
-
-	// tool_result 消息（独立的 tool 消息）
-	result = append(result, toolResults...)
-
-	return result
-}
-
-// convertAnthropicImageToOpenAI 将 Anthropic 图片格式转为 OpenAI image_url
-func convertAnthropicImageToOpenAI(source *AnthropicImageSource) string {
-	if source == nil {
-		return ""
-	}
-	if source.Type == "base64" && source.Data != "" {
-		mediaType := source.MediaType
-		if mediaType == "" {
-			mediaType = "application/octet-stream"
-		}
-		return fmt.Sprintf("data:%s;base64,%s", mediaType, source.Data)
-	}
-	if source.URL != "" {
-		return source.URL
-	}
-	return ""
-}
-
-// anthropicReqHasWebSearch 检查 Anthropic 请求是否包含 web_search 原生工具
-func anthropicReqHasWebSearch(req *AnthropicMessageRequest) bool {
-	for _, tool := range req.Tools {
-		switch tool.Type {
-		case "web_search_20250305", "web_search":
-			return true
-		}
-	}
-	return false
-}
-
-// injectWebSearchTool 向 Responses API JSON 请求体注入 web_search 工具
-// 参考 codex-rs/core/src/client_common.rs ToolSpec::WebSearch
-func injectWebSearchTool(body []byte) []byte {
-	var req map[string]any
-	if err := json.Unmarshal(body, &req); err != nil {
-		return body
-	}
-
-	// live 模式（external_web_access: true），支持实时联网搜索
-	webSearchTool := map[string]any{
-		"type":                "web_search",
-		"external_web_access": true,
-	}
-
-	// 若已有 tools 列表，追加；否则新建
-	if existing, ok := req["tools"].([]any); ok {
-		for _, t := range existing {
-			if tm, ok := t.(map[string]any); ok && tm["type"] == "web_search" {
-				return body
-			}
-		}
-		req["tools"] = append(existing, webSearchTool)
-	} else {
-		req["tools"] = []any{webSearchTool}
-	}
-
-	result, err := json.Marshal(req)
-	if err != nil {
-		return body
-	}
-	return result
-}
-
-// convertAnthropicToolsToOpenAI 转换 Anthropic tools 为 OpenAI 格式
-func convertAnthropicToolsToOpenAI(tools []AnthropicTool) []map[string]any {
-	var result []map[string]any
-	for _, tool := range tools {
-		switch tool.Type {
-		case "web_search_20250305", "web_search":
-			// web_search is handled separately in Responses API path.
-			continue
-		default:
-			// Treat all other tools as function tools for compatibility.
-			if strings.TrimSpace(tool.Name) == "" {
-				continue
-			}
-			openaiTool := map[string]any{
-				"type": "function",
-				"function": map[string]any{
-					"name": tool.Name,
-				},
-			}
-			fn := openaiTool["function"].(map[string]any)
-			if tool.Description != "" {
-				fn["description"] = tool.Description
-			}
-			if len(tool.InputSchema) > 0 {
-				fn["parameters"] = json.RawMessage(tool.InputSchema)
-			}
-			if tool.Strict != nil && *tool.Strict {
-				fn["strict"] = true
-			}
-			result = append(result, openaiTool)
-		}
-	}
-	return result
-}
-
-// convertAnthropicToolChoiceToOpenAI converts tool_choice to OpenAI format.
-func convertAnthropicToolChoiceToOpenAI(tc *AnthropicToolChoice) any {
-	if tc == nil {
-		return nil
-	}
-	switch tc.Type {
-	case "auto":
-		return "auto"
-	case "none":
-		return "none"
-	case "any":
-		return "required"
-	case "tool":
-		if tc.Name != nil {
-			return map[string]any{
-				"type": "function",
-				"function": map[string]any{
-					"name": *tc.Name,
-				},
-			}
-		}
-	}
-	return nil
-}
-
-// derefStr 安全解引用字符串指针
-func derefStr(s *string) string {
-	if s == nil {
-		return ""
-	}
-	return *s
-}
-
-// extractToolResultContent 从 tool_result 的 content 中提取文本
-func extractToolResultContent(content *AnthropicMessageContent) string {
-	if content == nil {
-		return ""
-	}
-	if content.Content != nil {
-		return *content.Content
-	}
-	if len(content.MultipleContent) > 0 {
-		var parts []string
-		for _, block := range content.MultipleContent {
-			if block.Type == "text" && block.Text != nil {
-				parts = append(parts, *block.Text)
-			}
-		}
-		return strings.Join(parts, "\n")
-	}
-	return ""
-}
-
-// ──────────────────────────────────────────────────────
-// OpenAI → Anthropic 非流式响应转换
-// 参考 AxonHub llm/transformer/anthropic/inbound_convert.go convertToAnthropicResponse
-// ──────────────────────────────────────────────────────
-
-// convertOpenAIResponseToAnthropic 将 OpenAI Chat Completions 响应转为 Anthropic Message 格式
-func convertOpenAIResponseToAnthropic(body []byte, requestModel string) (*AnthropicMessage, error) {
-	parsed := gjson.ParseBytes(body)
-
-	resp := &AnthropicMessage{
-		ID:   parsed.Get("id").String(),
-		Type: "message",
-		Role: "assistant",
-	}
-
-	// model
-	if m := parsed.Get("model").String(); m != "" {
-		resp.Model = m
-	} else {
-		resp.Model = requestModel
-	}
-
-	if resp.ID == "" {
-		resp.ID = generateMessageID()
-	}
-
-	// 处理 choices[0]
-	choice := parsed.Get("choices.0")
-	if !choice.Exists() {
-		return resp, nil
-	}
-
-	message := choice.Get("message")
-	if !message.Exists() {
-		// 可能是 delta 格式
-		message = choice.Get("delta")
-	}
-
-	if message.Exists() {
-		var contentBlocks []AnthropicMessageContentBlock
-
-		// reasoning_content → thinking block（放在最前面）
-		if rc := message.Get("reasoning_content").String(); rc != "" {
-			contentBlocks = append(contentBlocks, AnthropicMessageContentBlock{
-				Type:      "thinking",
-				Thinking:  ptrStr(rc),
-				Signature: ptrStr(""),
-			})
-		}
-
-		// content
-		contentResult := message.Get("content")
-		if contentResult.Exists() {
-			if contentResult.Type == gjson.String {
-				// 简单字符串内容
-				text := contentResult.String()
-				if text != "" {
-					contentBlocks = append(contentBlocks, AnthropicMessageContentBlock{
-						Type: "text",
-						Text: ptrStr(text),
-					})
-				}
-			} else if contentResult.IsArray() {
-				// 数组内容
-				for _, part := range contentResult.Array() {
-					partType := part.Get("type").String()
-					switch partType {
+			msgContents := msgResult.Get("content")
+			if msgContents.IsArray() {
+				for _, block := range msgContents.Array() {
+					contentType := block.Get("type").String()
+					switch contentType {
 					case "text":
-						if t := part.Get("text").String(); t != "" {
-							contentBlocks = append(contentBlocks, AnthropicMessageContentBlock{
-								Type: "text",
-								Text: ptrStr(t),
-							})
+						appendTextContent(block.Get("text").String())
+
+					case "image":
+						source := block.Get("source")
+						if source.Exists() {
+							data := source.Get("data").String()
+							if data == "" {
+								data = source.Get("base64").String()
+							}
+							if data != "" {
+								mediaType := source.Get("media_type").String()
+								if mediaType == "" {
+									mediaType = source.Get("mime_type").String()
+								}
+								if mediaType == "" {
+									mediaType = "application/octet-stream"
+								}
+								appendImageContent(fmt.Sprintf("data:%s;base64,%s", mediaType, data))
+							}
 						}
-					case "image_url":
-						if u := part.Get("image_url.url").String(); u != "" {
-							contentBlocks = append(contentBlocks, convertOpenAIImageToAnthropic(u))
+
+					case "tool_use":
+						flushMessage()
+						fcMsg := `{"type":"function_call"}`
+						fcMsg, _ = sjson.Set(fcMsg, "call_id", block.Get("id").String())
+						name := block.Get("name").String()
+						if short, ok := toolNameMap[name]; ok {
+							name = short
+						} else {
+							name = shortenNameIfNeeded(name)
 						}
+						fcMsg, _ = sjson.Set(fcMsg, "name", name)
+						if inputRaw := block.Get("input").Raw; inputRaw != "" {
+							fcMsg, _ = sjson.SetRaw(fcMsg, "arguments", inputRaw)
+						} else {
+							fcMsg, _ = sjson.SetRaw(fcMsg, "arguments", `{}`)
+						}
+						template, _ = sjson.SetRaw(template, "input.-1", fcMsg)
+
+					case "tool_result":
+						flushMessage()
+						fcoMsg := `{"type":"function_call_output"}`
+						fcoMsg, _ = sjson.Set(fcoMsg, "call_id", block.Get("tool_use_id").String())
+
+						contentResult := block.Get("content")
+						if contentResult.IsArray() {
+							outputIndex := 0
+							output := `[]`
+							for _, part := range contentResult.Array() {
+								partType := part.Get("type").String()
+								switch partType {
+								case "image":
+									source := part.Get("source")
+									if source.Exists() {
+										data := source.Get("data").String()
+										if data == "" {
+											data = source.Get("base64").String()
+										}
+										if data != "" {
+											mediaType := source.Get("media_type").String()
+											if mediaType == "" {
+												mediaType = source.Get("mime_type").String()
+											}
+											if mediaType == "" {
+												mediaType = "application/octet-stream"
+											}
+											dataURL := fmt.Sprintf("data:%s;base64,%s", mediaType, data)
+											output, _ = sjson.Set(output, fmt.Sprintf("%d.type", outputIndex), "input_image")
+											output, _ = sjson.Set(output, fmt.Sprintf("%d.image_url", outputIndex), dataURL)
+											outputIndex++
+										}
+									}
+								case "text":
+									output, _ = sjson.Set(output, fmt.Sprintf("%d.type", outputIndex), "input_text")
+									output, _ = sjson.Set(output, fmt.Sprintf("%d.text", outputIndex), part.Get("text").String())
+									outputIndex++
+								}
+							}
+							if output != `[]` {
+								fcoMsg, _ = sjson.SetRaw(fcoMsg, "output", output)
+							} else {
+								fcoMsg, _ = sjson.Set(fcoMsg, "output", contentResult.String())
+							}
+						} else if contentResult.Type == gjson.String {
+							fcoMsg, _ = sjson.Set(fcoMsg, "output", contentResult.String())
+						} else {
+							fcoMsg, _ = sjson.Set(fcoMsg, "output", "")
+						}
+
+						// is_error 标记
+						if block.Get("is_error").Bool() {
+							// 在 output 前加 [tool_error] 标记
+							if out := gjson.Get(fcoMsg, "output"); out.Type == gjson.String {
+								fcoMsg, _ = sjson.Set(fcoMsg, "output", "[tool_error] "+out.String())
+							}
+						}
+
+						template, _ = sjson.SetRaw(template, "input.-1", fcoMsg)
 					}
 				}
+				flushMessage()
+			} else if msgContents.Type == gjson.String {
+				appendTextContent(msgContents.String())
+				flushMessage()
 			}
 		}
+	}
 
-		// tool_calls → tool_use blocks
-		toolCalls := message.Get("tool_calls")
-		if toolCalls.Exists() && toolCalls.IsArray() {
-			for _, tc := range toolCalls.Array() {
-				input := safeJSONRawMessage(tc.Get("function.arguments").String())
-				contentBlocks = append(contentBlocks, AnthropicMessageContentBlock{
-					Type:  "tool_use",
-					ID:    tc.Get("id").String(),
-					Name:  ptrStr(tc.Get("function.name").String()),
-					Input: input,
-				})
+	// ─── tools → tools[] ───
+	toolsResult := root.Get("tools")
+	if toolsResult.IsArray() {
+		template, _ = sjson.SetRaw(template, "tools", `[]`)
+
+		var names []string
+		for _, t := range toolsResult.Array() {
+			if n := t.Get("name").String(); n != "" {
+				names = append(names, n)
 			}
 		}
+		shortMap := buildShortNameMap(names)
 
-		resp.Content = contentBlocks
-	}
+		for _, toolResult := range toolsResult.Array() {
+			// web_search 特殊处理
+			toolType := toolResult.Get("type").String()
+			if toolType == "web_search_20250305" || toolType == "web_search" {
+				template, _ = sjson.SetRaw(template, "tools.-1", `{"type":"web_search"}`)
+				continue
+			}
 
-	// finish_reason → stop_reason
-	if fr := choice.Get("finish_reason").String(); fr != "" {
-		stopReason := convertFinishReasonToAnthropic(fr)
-		resp.StopReason = &stopReason
-	}
+			tool := toolResult.Raw
+			tool, _ = sjson.Set(tool, "type", "function")
 
-	// usage
-	usage := parsed.Get("usage")
-	if usage.Exists() {
-		resp.Usage = &AnthropicUsage{
-			InputTokens:  int(usage.Get("prompt_tokens").Int()),
-			OutputTokens: int(usage.Get("completion_tokens").Int()),
+			// 应用短名
+			if v := toolResult.Get("name"); v.Exists() {
+				name := v.String()
+				if short, ok := shortMap[name]; ok {
+					name = short
+				} else {
+					name = shortenNameIfNeeded(name)
+				}
+				tool, _ = sjson.Set(tool, "name", name)
+			}
+
+			// input_schema → parameters
+			tool, _ = sjson.SetRaw(tool, "parameters", normalizeToolParametersJSON(toolResult.Get("input_schema").Raw))
+			tool, _ = sjson.Delete(tool, "input_schema")
+			tool, _ = sjson.Delete(tool, "parameters.$schema")
+			tool, _ = sjson.Set(tool, "strict", false)
+
+			// 清理 Anthropic 特有字段
+			tool, _ = sjson.Delete(tool, "cache_control")
+
+			template, _ = sjson.SetRaw(template, "tools.-1", tool)
 		}
-		// 缓存 tokens
-		if ct := usage.Get("prompt_tokens_details.cached_tokens").Int(); ct > 0 {
-			resp.Usage.CacheReadInputTokens = int(ct)
+	}
+
+	// ─── tool_choice 转换 ───
+	if tc := root.Get("tool_choice"); tc.Exists() && tc.IsObject() {
+		tcType := tc.Get("type").String()
+		switch tcType {
+		case "auto":
+			template, _ = sjson.Set(template, "tool_choice", "auto")
+		case "none":
+			template, _ = sjson.Set(template, "tool_choice", "none")
+		case "any":
+			template, _ = sjson.Set(template, "tool_choice", "required")
+		case "tool":
+			name := tc.Get("name").String()
+			if name == "web_search" || name == "web_search_20250305" {
+				template, _ = sjson.SetRaw(template, "tool_choice", `{"type":"web_search"}`)
+			} else {
+				if short, ok := toolNameMap[name]; ok {
+					name = short
+				} else {
+					name = shortenNameIfNeeded(name)
+				}
+				tcJSON := `{"type":"function","name":""}`
+				tcJSON, _ = sjson.Set(tcJSON, "name", name)
+				template, _ = sjson.SetRaw(template, "tool_choice", tcJSON)
+			}
 		}
 	}
 
-	return resp, nil
+	// ─── thinking → reasoning ───
+	reasoningEffort := "medium"
+	if mappingEffort != "" {
+		reasoningEffort = mappingEffort
+	} else if thinkingConfig := root.Get("thinking"); thinkingConfig.Exists() && thinkingConfig.IsObject() {
+		switch thinkingConfig.Get("type").String() {
+		case "enabled":
+			if budgetTokens := thinkingConfig.Get("budget_tokens"); budgetTokens.Exists() {
+				if effort := thinkingBudgetToReasoningEffort(budgetTokens.Int()); effort != "" {
+					reasoningEffort = effort
+				}
+			}
+		case "adaptive", "auto":
+			effort := ""
+			if v := root.Get("output_config.effort"); v.Exists() && v.Type == gjson.String {
+				effort = strings.ToLower(strings.TrimSpace(v.String()))
+			}
+			if effort != "" {
+				reasoningEffort = effort
+			} else {
+				reasoningEffort = "xhigh"
+			}
+		case "disabled":
+			if effort := thinkingBudgetToReasoningEffort(0); effort != "" {
+				reasoningEffort = effort
+			}
+		}
+	}
+
+	// ─── 固定参数 ───
+	template, _ = sjson.Set(template, "parallel_tool_calls", true)
+	template, _ = sjson.Set(template, "reasoning.effort", reasoningEffort)
+	template, _ = sjson.Set(template, "reasoning.summary", "auto")
+	template, _ = sjson.Set(template, "stream", true)
+	template, _ = sjson.Set(template, "store", false)
+	template, _ = sjson.Set(template, "include", []string{"reasoning.encrypted_content"})
+
+	return []byte(template)
 }
 
-// convertOpenAIImageToAnthropic 将 OpenAI image_url 转为 Anthropic image content block
-func convertOpenAIImageToAnthropic(imageURL string) AnthropicMessageContentBlock {
-	if mediaType, data, ok := parseDataURL(imageURL); ok {
-		return AnthropicMessageContentBlock{
-			Type: "image",
-			Source: &AnthropicImageSource{
-				Type:      "base64",
-				MediaType: mediaType,
-				Data:      data,
-			},
+// ──────────────────────────────────────────────────────
+// 请求验证（纯 gjson，不依赖 struct）
+// ──────────────────────────────────────────────────────
+
+// validateAnthropicRequestJSON 验证 Anthropic 请求 JSON 基本字段
+// 返回 (statusCode, errType, errMsg) 或 (0, "", "") 表示验证通过
+func validateAnthropicRequestJSON(body []byte) (int, string, string) {
+	root := gjson.ParseBytes(body)
+
+	if !root.Get("model").Exists() || root.Get("model").String() == "" {
+		return 400, "invalid_request_error", "model is required"
+	}
+	if !root.Get("messages").Exists() || !root.Get("messages").IsArray() || root.Get("messages.#").Int() == 0 {
+		return 400, "invalid_request_error", "messages is required"
+	}
+	if !root.Get("max_tokens").Exists() || root.Get("max_tokens").Int() <= 0 {
+		return 400, "invalid_request_error", "max_tokens must be greater than 0"
+	}
+
+	// 验证 thinking
+	if thinking := root.Get("thinking"); thinking.Exists() && thinking.IsObject() {
+		switch thinking.Get("type").String() {
+		case "enabled":
+			if thinking.Get("budget_tokens").Int() <= 0 {
+				return 400, "invalid_request_error", "budget_tokens is required when thinking type is enabled"
+			}
+		case "adaptive", "disabled":
+			// ok
+		default:
+			return 400, "invalid_request_error", "thinking type must be one of: enabled, disabled, adaptive"
 		}
 	}
-	return AnthropicMessageContentBlock{
-		Type: "image",
-		Source: &AnthropicImageSource{
-			Type: "url",
-			URL:  imageURL,
-		},
+
+	// 验证 tool_choice
+	if tc := root.Get("tool_choice"); tc.Exists() && tc.IsObject() {
+		switch tc.Get("type").String() {
+		case "auto", "none", "any":
+			// ok
+		case "tool":
+			if tc.Get("name").String() == "" {
+				return 400, "invalid_request_error", "name is required when tool_choice type is tool"
+			}
+		default:
+			return 400, "invalid_request_error", "tool_choice type must be one of: auto, none, any, tool"
+		}
 	}
+
+	return 0, "", ""
 }

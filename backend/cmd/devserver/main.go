@@ -22,7 +22,7 @@ import (
 var staticFiles embed.FS
 
 func main() {
-	addr := flag.String("addr", ":8080", "监听地址")
+	addr := flag.String("addr", ":18080", "监听地址")
 	dataDir := flag.String("data", "./devdata", "数据目录")
 	logFile := flag.String("log", "./devdata/debug.log", "日志文件路径")
 	flag.Parse()

@@ -107,30 +107,6 @@ func ParseSSEStream(reader io.Reader, handler WSEventHandler) WSResult {
 	start := time.Now()
 	result := WSResult{}
 	var textBuilder strings.Builder
-	var reasoningBuilder strings.Builder
-	upsertWebSearchToolUse := func(itemID, query string) {
-		if strings.TrimSpace(itemID) == "" {
-			return
-		}
-		input := `{}`
-		if strings.TrimSpace(query) != "" {
-			input = fmt.Sprintf(`{"query":%q}`, query)
-		}
-		for i := range result.ToolUses {
-			if result.ToolUses[i].ID == itemID {
-				result.ToolUses[i].Type = "tool_use"
-				result.ToolUses[i].Name = ptrStr("web_search")
-				result.ToolUses[i].Input = safeJSONRawMessage(input)
-				return
-			}
-		}
-		result.ToolUses = append(result.ToolUses, AnthropicMessageContentBlock{
-			Type:  "tool_use",
-			ID:    itemID,
-			Name:  ptrStr("web_search"),
-			Input: safeJSONRawMessage(input),
-		})
-	}
 
 	scanner := bufio.NewScanner(reader)
 	scanner.Buffer(make([]byte, 64*1024), 1024*1024)
@@ -150,6 +126,7 @@ func ParseSSEStream(reader io.Reader, handler WSEventHandler) WSResult {
 
 		eventType, _ := ev["type"].(string)
 
+		// 通知 handler 原始事件
 		if handler != nil {
 			handler.OnRawEvent(eventType, []byte(data))
 		}
@@ -172,47 +149,13 @@ func ParseSSEStream(reader io.Reader, handler WSEventHandler) WSResult {
 
 		case "response.reasoning_summary_text.delta":
 			if delta, ok := ev["delta"].(string); ok {
-				reasoningBuilder.WriteString(delta)
 				if handler != nil {
 					handler.OnReasoningDelta(delta)
 				}
 			}
 
-		case "response.output_item.added":
-			item := gjson.GetBytes([]byte(data), "item")
-			if item.Get("type").String() == "web_search_call" {
-				upsertWebSearchToolUse(item.Get("id").String(), "")
-			}
-
-		case "response.output_item.done":
-			item := gjson.GetBytes([]byte(data), "item")
-			switch item.Get("type").String() {
-			case "web_search_call":
-				query := item.Get("action.query").String()
-				if query == "" {
-					query = item.Get("query").String()
-				}
-				upsertWebSearchToolUse(item.Get("id").String(), query)
-			case "function_call":
-				name := item.Get("name").String()
-				if name == "" {
-					name = item.Get("function.name").String()
-				}
-				if name != "" {
-					args := "{}"
-					if a := item.Get("arguments").String(); a != "" && gjson.Valid(a) {
-						args = a
-					}
-					result.ToolUses = append(result.ToolUses, AnthropicMessageContentBlock{
-						Type:  "tool_use",
-						ID:    item.Get("call_id").String(),
-						Name:  ptrStr(name),
-						Input: safeJSONRawMessage(args),
-					})
-				}
-			}
-
 		case "response.completed", "response.done":
+			result.CompletedEventRaw = append([]byte(nil), []byte(data)...)
 			if resp, ok := ev["response"].(map[string]any); ok {
 				if id, ok := resp["id"].(string); ok {
 					result.ResponseID = id
@@ -227,12 +170,8 @@ func ParseSSEStream(reader io.Reader, handler WSEventHandler) WSResult {
 						result.CacheTokens = JsonInt(details, "cached_tokens")
 					}
 				}
-				if sr, ok := resp["stop_reason"].(string); ok && sr != "" {
-					result.StopReason = sr
-				}
 			}
 			result.Text = textBuilder.String()
-			result.Reasoning = reasoningBuilder.String()
 			result.Duration = time.Since(start)
 			return result
 
@@ -247,7 +186,6 @@ func ParseSSEStream(reader io.Reader, handler WSEventHandler) WSResult {
 			}
 			result.Err = fmt.Errorf("上游错误: %s", errMsg)
 			result.Text = textBuilder.String()
-			result.Reasoning = reasoningBuilder.String()
 			result.Duration = time.Since(start)
 			return result
 
@@ -260,10 +198,8 @@ func ParseSSEStream(reader io.Reader, handler WSEventHandler) WSResult {
 					}
 				}
 			}
-			result.StopReason = reason
 			result.Err = fmt.Errorf("响应不完整: %s", reason)
 			result.Text = textBuilder.String()
-			result.Reasoning = reasoningBuilder.String()
 			result.Duration = time.Since(start)
 			return result
 
@@ -285,7 +221,6 @@ func ParseSSEStream(reader io.Reader, handler WSEventHandler) WSResult {
 	}
 
 	result.Text = textBuilder.String()
-	result.Reasoning = reasoningBuilder.String()
 	result.Duration = time.Since(start)
 	return result
 }

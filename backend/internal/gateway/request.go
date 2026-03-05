@@ -8,7 +8,6 @@ import (
 	"net/url"
 	"strings"
 
-	"github.com/DouDOU-start/airgate-openai/backend/resources"
 	sdk "github.com/DouDOU-start/airgate-sdk"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
@@ -163,42 +162,29 @@ func preprocessRequestBody(body []byte, model string) []byte {
 
 // wrapAsResponsesAPI 将请求包装为 Responses API 格式（模拟客户端模式）
 func wrapAsResponsesAPI(body []byte, model string) ([]byte, error) {
-	// 已是 Responses 格式（有 input 字段），只注入 instructions
+	// 已是 Responses 格式（有 input 字段），直接补齐默认字段
 	if gjson.GetBytes(body, "input").Exists() {
-		result := body
-		if !gjson.GetBytes(body, "instructions").Exists() {
-			if modified, err := sjson.SetBytes(result, "instructions", resources.Instructions); err == nil {
-				result = modified
-			}
-		}
-		// 为 Responses 请求补齐 reasoning，确保可回传 reasoning_summary_text.delta
-		if !gjson.GetBytes(result, "reasoning").Exists() {
-			if reasoning := buildResponsesReasoningConfig(body); reasoning != nil {
-				if modified, err := sjson.SetBytes(result, "reasoning", reasoning); err == nil {
-					result = modified
-				}
-			}
-		}
-		// 请求显式包含加密 reasoning，便于客户端/代理在多轮中保留 reasoning 上下文
-		result = ensureResponsesInclude(result, "reasoning.encrypted_content")
-		return result, nil
+		return ensureResponsesDefaults(body), nil
 	}
 
 	// Chat Completions 格式（有 messages 字段）→ 转换为 Responses API input
 	if gjson.GetBytes(body, "messages").Exists() {
-		input := convertChatMessagesToResponsesInput(gjson.GetBytes(body, "messages").Array())
+		input, instructions := convertChatMessagesToResponsesInput(gjson.GetBytes(body, "messages").Array())
 
 		wrapped := map[string]any{
-			"model":        model,
-			"input":        input,
-			"instructions": resources.Instructions,
-			"stream":       true,
-			"store":        false,
+			"model":  model,
+			"input":  input,
+			"stream": true,
+			"store":  false,
 		}
-
-		// Chat Completions 的 reasoning_effort 映射到 Responses 的 reasoning
-		if reasoning := buildResponsesReasoningConfig(body); reasoning != nil {
-			wrapped["reasoning"] = reasoning
+		if instructions != "" {
+			wrapped["instructions"] = instructions
+		}
+		if effort := strings.TrimSpace(gjson.GetBytes(body, "reasoning_effort").String()); effort != "" {
+			wrapped["reasoning"] = map[string]any{
+				"effort":  effort,
+				"summary": "auto",
+			}
 		}
 
 		// 转换 tools（Chat Completions → Responses API 格式）
@@ -206,73 +192,62 @@ func wrapAsResponsesAPI(body []byte, model string) ([]byte, error) {
 			wrapped["tools"] = convertChatToolsToResponsesTools(tools.Array())
 		}
 
-		// tool_choice：仅在存在未闭合的工具调用时强制 required
-		// 避免“历史里出现过一次工具调用”后永久 required，导致模型被迫每轮都继续调工具
+		// tool_choice：如果历史中有工具调用记录（处于工具循环中），强制 required
+		// 避免模型在执行阶段只输出文字确认而不调用工具
 		if tc := gjson.GetBytes(body, "tool_choice"); tc.Exists() {
-			wrapped["tool_choice"] = json.RawMessage(tc.Raw)
-		} else if hasPendingToolCalls(gjson.GetBytes(body, "messages").Array()) {
+			wrapped["tool_choice"] = normalizeResponsesToolChoice(tc)
+		} else if messagesHaveToolCalls(gjson.GetBytes(body, "messages").Array()) {
 			wrapped["tool_choice"] = "required"
 		}
-		// 显式请求返回加密 reasoning 内容
-		wrapped["include"] = []string{"reasoning.encrypted_content"}
 
-		return json.Marshal(wrapped)
+		out, err := json.Marshal(wrapped)
+		if err != nil {
+			return nil, err
+		}
+		return ensureResponsesDefaults(out), nil
 	}
 
 	// 无法识别的格式，原样返回
-	return body, nil
+	return ensureResponsesDefaults(body), nil
 }
 
-func ensureResponsesInclude(body []byte, includeValue string) []byte {
-	if includeValue == "" {
-		return body
+// ensureResponsesDefaults 统一补齐 Responses API 请求默认字段，贴近 cliproxy 的 codex 请求策略
+func ensureResponsesDefaults(body []byte) []byte {
+	result := body
+	if modified, err := sjson.SetBytes(result, "stream", true); err == nil {
+		result = modified
 	}
-	include := gjson.GetBytes(body, "include")
-	if include.Exists() && include.IsArray() {
-		for _, item := range include.Array() {
-			if item.String() == includeValue {
-				return body
+	if modified, err := sjson.SetBytes(result, "store", false); err == nil {
+		result = modified
+	}
+	if modified, err := sjson.SetBytes(result, "parallel_tool_calls", true); err == nil {
+		result = modified
+	}
+	if gjson.GetBytes(result, "reasoning").Exists() {
+		if !gjson.GetBytes(result, "reasoning.summary").Exists() {
+			if modified, err := sjson.SetBytes(result, "reasoning.summary", "auto"); err == nil {
+				result = modified
 			}
 		}
-		if modified, err := sjson.SetBytes(body, "include.-1", includeValue); err == nil {
-			return modified
+	} else if effort := strings.TrimSpace(gjson.GetBytes(result, "reasoning_effort").String()); effort != "" {
+		if modified, err := sjson.SetBytes(result, "reasoning.effort", effort); err == nil {
+			result = modified
 		}
-		return body
+		if modified, err := sjson.SetBytes(result, "reasoning.summary", "auto"); err == nil {
+			result = modified
+		}
 	}
-	if modified, err := sjson.SetBytes(body, "include", []string{includeValue}); err == nil {
-		return modified
+	if modified, err := sjson.SetBytes(result, "include", []string{"reasoning.encrypted_content"}); err == nil {
+		result = modified
 	}
-	return body
-}
-
-// buildResponsesReasoningConfig 将 Chat Completions 的 reasoning_effort 映射为 Responses reasoning 配置
-func buildResponsesReasoningConfig(body []byte) map[string]any {
-	effort := normalizeResponsesReasoningEffort(gjson.GetBytes(body, "reasoning_effort").String())
-	if effort == "" {
-		return nil
-	}
-	// detailed 可稳定触发 reasoning summary 事件，便于前端显示 thinking 标识
-	return map[string]any{
-		"effort":  effort,
-		"summary": "detailed",
-	}
-}
-
-func normalizeResponsesReasoningEffort(effort string) string {
-	switch strings.ToLower(strings.TrimSpace(effort)) {
-	case "minimal", "low", "medium", "high":
-		return strings.ToLower(strings.TrimSpace(effort))
-	case "xhigh":
-		// Responses API 不一定支持 xhigh，向下兼容到 high
-		return "high"
-	default:
-		return ""
-	}
+	return result
 }
 
 // convertChatMessagesToResponsesInput 将 Chat Completions messages 转换为 Responses API input 列表
-func convertChatMessagesToResponsesInput(messages []gjson.Result) []any {
+// 返回 input 列表和从 system 提取出的 instructions 文本
+func convertChatMessagesToResponsesInput(messages []gjson.Result) ([]any, string) {
 	var input []any
+	var instructionsParts []string
 	for _, msg := range messages {
 		role := msg.Get("role").String()
 		if role == "" {
@@ -281,7 +256,10 @@ func convertChatMessagesToResponsesInput(messages []gjson.Result) []any {
 
 		switch role {
 		case "system":
-			// system 消息在 Responses API 里用 instructions，这里跳过（已在外部设置）
+			// system 消息聚合到 instructions，保留原始语义
+			if text := extractChatMessageText(msg); text != "" {
+				instructionsParts = append(instructionsParts, text)
+			}
 			continue
 
 		case "tool":
@@ -290,14 +268,34 @@ func convertChatMessagesToResponsesInput(messages []gjson.Result) []any {
 			if callID == "" {
 				continue
 			}
-			output := extractChatMessageText(msg)
 			item := map[string]any{
 				"type":    "function_call_output",
 				"call_id": callID,
-				"output":  output,
 			}
-			// Responses API 没有 is_error 字段，但若工具返回错误，在 output 前加标记让模型感知
-			// （OpenAI Chat Completions 路径已在 anthropic_convert.go 中单独处理）
+			if content := msg.Get("content"); content.Exists() && content.IsArray() {
+				var outputParts []map[string]any
+				for _, part := range content.Array() {
+					ptype := part.Get("type").String()
+					switch ptype {
+					case "text":
+						if text := part.Get("text").String(); text != "" {
+							outputParts = append(outputParts, map[string]any{"type": "input_text", "text": text})
+						}
+					case "image_url":
+						url := part.Get("image_url.url").String()
+						if url != "" {
+							outputParts = append(outputParts, map[string]any{"type": "input_image", "image_url": url})
+						}
+					}
+				}
+				if len(outputParts) > 0 {
+					item["output"] = outputParts
+				} else {
+					item["output"] = extractChatMessageText(msg)
+				}
+			} else {
+				item["output"] = extractChatMessageText(msg)
+			}
 			input = append(input, item)
 
 		case "assistant":
@@ -339,43 +337,17 @@ func convertChatMessagesToResponsesInput(messages []gjson.Result) []any {
 			})
 		}
 	}
-	return input
+	return input, strings.Join(instructionsParts, "\n\n")
 }
 
-// hasPendingToolCalls 检查是否存在未闭合的工具调用：
-// assistant tool_calls 已发出，但尚未收到对应 role=tool 的 tool_call_id 结果。
-func hasPendingToolCalls(messages []gjson.Result) bool {
-	if len(messages) == 0 {
-		return false
-	}
-
-	pending := make(map[string]struct{})
-
+// messagesHaveToolCalls 检查消息历史中是否存在工具调用（判断是否处于工具循环中）
+func messagesHaveToolCalls(messages []gjson.Result) bool {
 	for _, msg := range messages {
-		role := msg.Get("role").String()
-		switch role {
-		case "assistant":
-			toolCalls := msg.Get("tool_calls")
-			if !toolCalls.Exists() || !toolCalls.IsArray() {
-				continue
-			}
-			for _, tc := range toolCalls.Array() {
-				id := strings.TrimSpace(tc.Get("id").String())
-				if id == "" {
-					continue
-				}
-				pending[id] = struct{}{}
-			}
-		case "tool":
-			id := strings.TrimSpace(msg.Get("tool_call_id").String())
-			if id == "" {
-				continue
-			}
-			delete(pending, id)
+		if msg.Get("tool_calls").Exists() {
+			return true
 		}
 	}
-
-	return len(pending) > 0
+	return false
 }
 
 // extractChatMessageText 从 Chat Completions 消息中提取文本内容
@@ -446,6 +418,53 @@ func fixObjectSchema(raw []byte) json.RawMessage {
 		return json.RawMessage(raw)
 	}
 	return json.RawMessage(fixed)
+}
+
+// normalizeResponsesToolChoice 将 ChatCompletions 风格 tool_choice 规范化为 Responses 兼容格式
+func normalizeResponsesToolChoice(tc gjson.Result) any {
+	if !tc.Exists() {
+		return nil
+	}
+	if tc.Type == gjson.String {
+		v := strings.TrimSpace(tc.String())
+		if v == "" {
+			return nil
+		}
+		switch v {
+		case "required":
+			return "required"
+		case "auto", "none":
+			return v
+		default:
+			return v
+		}
+	}
+	if !tc.IsObject() {
+		return json.RawMessage(tc.Raw)
+	}
+
+	typeVal := strings.TrimSpace(tc.Get("type").String())
+	switch typeVal {
+	case "function":
+		name := strings.TrimSpace(tc.Get("function.name").String())
+		if name != "" {
+			return map[string]any{"type": "function", "name": name}
+		}
+	case "tool":
+		name := strings.TrimSpace(tc.Get("name").String())
+		if name != "" {
+			if name == "web_search" || name == "web_search_20250305" {
+				return map[string]any{"type": "web_search"}
+			}
+			return map[string]any{"type": "function", "name": name}
+		}
+	case "web_search":
+		return map[string]any{"type": "web_search"}
+	case "auto", "none", "required":
+		return typeVal
+	}
+
+	return json.RawMessage(tc.Raw)
 }
 
 func fixSchemaNode(node map[string]any) {

@@ -38,17 +38,15 @@ type WSConfig struct {
 
 // WSResult 事件解析结果
 type WSResult struct {
-	Text         string
-	Reasoning    string
-	StopReason   string
-	ToolUses     []AnthropicMessageContentBlock
-	ResponseID   string
-	Model        string
-	InputTokens  int
-	OutputTokens int
-	CacheTokens  int
-	Duration     time.Duration
-	Err          error
+	Text              string
+	ResponseID        string
+	Model             string
+	InputTokens       int
+	OutputTokens      int
+	CacheTokens       int
+	CompletedEventRaw []byte
+	Duration          time.Duration
+	Err               error
 }
 
 // WSEventHandler 事件回调接口，不同场景实现不同输出
@@ -165,6 +163,7 @@ func ReceiveWSResponse(ctx context.Context, conn *websocket.Conn, handler WSEven
 			}
 
 		case "response.completed", "response.done":
+			result.CompletedEventRaw = append([]byte(nil), msg...)
 			if resp, ok := ev["response"].(map[string]any); ok {
 				if id, ok := resp["id"].(string); ok {
 					result.ResponseID = id
