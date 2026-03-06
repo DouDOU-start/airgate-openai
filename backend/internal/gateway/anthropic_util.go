@@ -53,7 +53,7 @@ func thinkingBudgetToReasoningEffort(budget int64) string {
 	case budget == 0:
 		return "none"
 	case budget <= 512:
-		return "minimal"
+		return "low"
 	case budget <= 1024:
 		return "low"
 	case budget <= 8192:
@@ -273,6 +273,133 @@ func extractResponsesUsage(usage gjson.Result) (int64, int64, int64) {
 		}
 	}
 	return inputTokens, outputTokens, cachedTokens
+}
+
+// ──────────────────────────────────────────────────────
+// 动态推理 effort 推断（adaptive thinking 优化）
+// ──────────────────────────────────────────────────────
+
+// isToolTurnMatching 通用检测：最后一轮是否为工具结果处理轮次，且所有工具都满足 predicate
+// 条件：最后一条 user 消息全部是 tool_result，且前一条 assistant 的 tool_use 全部满足 predicate
+func isToolTurnMatching(rawJSON []byte, toolMatcher func(string) bool) bool {
+	messages := gjson.GetBytes(rawJSON, "messages")
+	if !messages.IsArray() {
+		return false
+	}
+	arr := messages.Array()
+	if len(arr) < 2 {
+		return false
+	}
+
+	// 最后一条消息必须是 user 且全部是 tool_result
+	lastMsg := arr[len(arr)-1]
+	if lastMsg.Get("role").String() != "user" {
+		return false
+	}
+	lastContent := lastMsg.Get("content")
+	if !lastContent.IsArray() {
+		return false
+	}
+	for _, block := range lastContent.Array() {
+		if block.Get("type").String() != "tool_result" {
+			return false
+		}
+	}
+
+	// 查找前一条 assistant 消息，检查 tool_use 名称
+	var prevAssistant gjson.Result
+	for i := len(arr) - 2; i >= 0; i-- {
+		if arr[i].Get("role").String() == "assistant" {
+			prevAssistant = arr[i]
+			break
+		}
+	}
+	if !prevAssistant.Exists() {
+		return false
+	}
+
+	hasToolUse := false
+	allMatch := true
+	prevContent := prevAssistant.Get("content")
+	if prevContent.IsArray() {
+		for _, block := range prevContent.Array() {
+			if block.Get("type").String() == "tool_use" {
+				hasToolUse = true
+				if !toolMatcher(block.Get("name").String()) {
+					allMatch = false
+					break
+				}
+			}
+		}
+	}
+
+	return hasToolUse && allMatch
+}
+
+// isReadOnlyToolTurn 检测当前请求是否为只读工具结果处理轮次（用于 adaptive effort 降级）
+func isReadOnlyToolTurn(rawJSON []byte) bool {
+	return isToolTurnMatching(rawJSON, isReadOnlyTool)
+}
+
+// isSparkEligibleToolTurn 检测当前请求是否适合路由到 Spark 模型
+// 比 isReadOnlyToolTurn 更严格：仅 Grep/Glob/Search/Find 等搜索类工具
+// Read/Fetch 返回完整内容可能需要深度分析，不适合 Spark
+func isSparkEligibleToolTurn(rawJSON []byte) bool {
+	return isToolTurnMatching(rawJSON, isSparkEligibleTool)
+}
+
+// inferAdaptiveEffort 基于最后一轮 tool 类型动态推断 reasoning effort
+// 当最近一轮是只读工具的结果处理时，降低 effort 以加快响应
+// 返回 "" 表示无法推断，调用者应使用模型映射默认值
+func inferAdaptiveEffort(rawJSON []byte, modelDefault string) string {
+	if !isReadOnlyToolTurn(rawJSON) {
+		return ""
+	}
+	return lowerEffort(modelDefault)
+}
+
+// isReadOnlyTool 判断工具是否为只读/信息收集类（含 Read/Fetch，用于 effort 降级）
+func isReadOnlyTool(name string) bool {
+	lower := strings.ToLower(name)
+	for _, kw := range []string{
+		"read", "grep", "glob", "search", "fetch",
+		"list", "find", "taskoutput", "taskget", "tasklist",
+	} {
+		if strings.Contains(lower, kw) {
+			return true
+		}
+	}
+	return false
+}
+
+// isSparkEligibleTool 判断工具是否适合 Spark 快速模型处理
+// 仅搜索/索引类工具（结果是路径列表或匹配行，决策简单）
+// Read/Fetch 返回完整内容需要深度分析，不走 Spark
+func isSparkEligibleTool(name string) bool {
+	lower := strings.ToLower(name)
+	for _, kw := range []string{
+		"grep", "glob", "search", "find", "list",
+		"taskoutput", "taskget", "tasklist",
+	} {
+		if strings.Contains(lower, kw) {
+			return true
+		}
+	}
+	return false
+}
+
+// lowerEffort 将 effort 降低一级
+func lowerEffort(effort string) string {
+	switch effort {
+	case "xhigh":
+		return "high"
+	case "high":
+		return "medium"
+	case "medium":
+		return "low"
+	default:
+		return effort
+	}
 }
 
 // injectWebSearchToolJSON 向 Responses API JSON 请求体注入 web_search 工具

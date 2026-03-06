@@ -19,7 +19,7 @@ import (
 // 参考 CLIProxyAPI translator/codex/claude/codex_claude_response.go
 // ──────────────────────────────────────────────────────
 
-// anthropicStreamState 轻量流式状态（从 20+ 字段缩减为 4 个核心字段）
+// anthropicStreamState 轻量流式状态
 type anthropicStreamState struct {
 	HasToolCall               bool
 	BlockIndex                int
@@ -27,11 +27,13 @@ type anthropicStreamState struct {
 	InputTokens               int
 	OutputTokens              int
 	CacheTokens               int
+	reverseNameMap            map[string]string // 缓存 short→original 工具名映射，避免每次事件重建
 }
 
 // convertResponsesEventToAnthropic 将单条 Responses API SSE 事件转换为 Anthropic SSE 事件字符串
+// model: 回传给客户端的模型名（使用原始 Claude 模型名）
 // 返回空字符串表示该事件不需要输出
-func convertResponsesEventToAnthropic(rawLine []byte, originalRequest []byte, state *anthropicStreamState) string {
+func convertResponsesEventToAnthropic(rawLine []byte, originalRequest []byte, state *anthropicStreamState, model string) string {
 	if len(rawLine) == 0 {
 		return ""
 	}
@@ -48,7 +50,12 @@ func convertResponsesEventToAnthropic(rawLine []byte, originalRequest []byte, st
 	switch typeStr {
 	case "response.created":
 		template := `{"type":"message_start","message":{"id":"","type":"message","role":"assistant","model":"","stop_sequence":null,"usage":{"input_tokens":0,"output_tokens":0},"content":[],"stop_reason":null}}`
-		template, _ = sjson.Set(template, "message.model", root.Get("response.model").String())
+		// 使用原始 Claude 模型名，让 Claude Code 正确识别模型能力（上下文按钮等）
+		modelName := model
+		if modelName == "" {
+			modelName = root.Get("response.model").String()
+		}
+		template, _ = sjson.Set(template, "message.model", modelName)
 		template, _ = sjson.Set(template, "message.id", root.Get("response.id").String())
 		return "event: message_start\n" + fmt.Sprintf("data: %s\n\n", template)
 
@@ -93,10 +100,12 @@ func convertResponsesEventToAnthropic(rawLine []byte, originalRequest []byte, st
 			state.HasToolCall = true
 			state.HasReceivedArgumentsDelta = false
 
-			// 还原工具短名
+			// 还原工具短名（懒初始化缓存）
+			if state.reverseNameMap == nil {
+				state.reverseNameMap = buildReverseMapFromAnthropicOriginalShortToOriginal(originalRequest)
+			}
 			name := item.Get("name").String()
-			rev := buildReverseMapFromAnthropicOriginalShortToOriginal(originalRequest)
-			if orig, ok := rev[name]; ok {
+			if orig, ok := state.reverseNameMap[name]; ok {
 				name = orig
 			}
 
@@ -158,9 +167,10 @@ func convertResponsesEventToAnthropic(rawLine []byte, originalRequest []byte, st
 		stopReason := root.Get("response.stop_reason").String()
 		if state.HasToolCall {
 			template, _ = sjson.Set(template, "delta.stop_reason", "tool_use")
-		} else if stopReason == "max_tokens" || stopReason == "stop" {
-			template, _ = sjson.Set(template, "delta.stop_reason", stopReason)
+		} else if stopReason == "max_tokens" {
+			template, _ = sjson.Set(template, "delta.stop_reason", "max_tokens")
 		} else {
+			// "stop" / "" / 其他值统一映射为 Anthropic 的 "end_turn"
 			template, _ = sjson.Set(template, "delta.stop_reason", "end_turn")
 		}
 
@@ -175,15 +185,62 @@ func convertResponsesEventToAnthropic(rawLine []byte, originalRequest []byte, st
 		return output
 
 	case "response.failed":
-		// 转为错误日志，不生成 Anthropic 事件
-		return ""
+		errMsg := root.Get("response.error.message").String()
+		if errMsg == "" {
+			errMsg = "upstream response failed"
+		}
+		errType := mapResponsesErrorType(root.Get("response.error.type").String(), root.Get("response.error.code").String())
+		return buildAnthropicStreamError(errType, errMsg)
 
 	case "response.incomplete":
-		return ""
+		reason := root.Get("response.incomplete_details.reason").String()
+		if reason == "" {
+			reason = "unknown"
+		}
+		return buildAnthropicStreamError("api_error", "response incomplete: "+reason)
 	}
 
 	// 忽略未知事件（web_search_call.* 等）
 	return ""
+}
+
+// buildAnthropicStreamError 构建 Anthropic SSE 错误事件
+// errType: Anthropic 错误类型（invalid_request_error, rate_limit_error, api_error 等）
+func buildAnthropicStreamError(errType, message string) string {
+	if errType == "" {
+		errType = "api_error"
+	}
+	template := `{"type":"error","error":{"type":"","message":""}}`
+	template, _ = sjson.Set(template, "error.type", errType)
+	template, _ = sjson.Set(template, "error.message", message)
+	return "event: error\n" + fmt.Sprintf("data: %s\n\n", template)
+}
+
+// mapResponsesErrorType 将 Responses API 错误类型映射为 Anthropic 错误类型
+func mapResponsesErrorType(errType, errCode string) string {
+	errType = strings.ToLower(strings.TrimSpace(errType))
+	errCode = strings.ToLower(strings.TrimSpace(errCode))
+
+	switch errType {
+	case "invalid_request_error":
+		return "invalid_request_error"
+	case "rate_limit_error":
+		return "rate_limit_error"
+	case "authentication_error":
+		return "authentication_error"
+	case "not_found_error":
+		return "not_found_error"
+	}
+
+	// 通过 code 推断类型
+	switch errCode {
+	case "context_length_exceeded", "max_tokens_exceeded", "input_too_long":
+		return "invalid_request_error"
+	case "rate_limit_exceeded":
+		return "rate_limit_error"
+	}
+
+	return "api_error"
 }
 
 // ──────────────────────────────────────────────────────
@@ -206,11 +263,8 @@ func convertResponsesCompletedToAnthropicJSON(completedJSON, originalRequest []b
 
 	out := `{"id":"","type":"message","role":"assistant","model":"","content":[],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":0,"output_tokens":0}}`
 	out, _ = sjson.Set(out, "id", responseData.Get("id").String())
-	if m := responseData.Get("model").String(); m != "" {
-		out, _ = sjson.Set(out, "model", m)
-	} else {
-		out, _ = sjson.Set(out, "model", model)
-	}
+	// 始终使用原始 Claude 模型名，让 Claude Code 正确识别模型能力
+	out, _ = sjson.Set(out, "model", model)
 
 	inputTokens, outputTokens, cachedTokens := extractResponsesUsage(responseData.Get("usage"))
 	out, _ = sjson.Set(out, "usage.input_tokens", inputTokens)
@@ -270,10 +324,10 @@ func convertResponsesCompletedToAnthropicJSON(completedJSON, originalRequest []b
 		}
 	}
 
-	if stopReason := responseData.Get("stop_reason"); stopReason.Exists() && stopReason.String() != "" {
-		out, _ = sjson.Set(out, "stop_reason", stopReason.String())
-	} else if hasToolCall {
+	if hasToolCall {
 		out, _ = sjson.Set(out, "stop_reason", "tool_use")
+	} else if sr := responseData.Get("stop_reason").String(); sr == "max_tokens" {
+		out, _ = sjson.Set(out, "stop_reason", "max_tokens")
 	} else {
 		out, _ = sjson.Set(out, "stop_reason", "end_turn")
 	}
@@ -374,28 +428,31 @@ func translateResponsesSSEToAnthropicSSE(
 				responseModel = rm
 			}
 
-			// 检查错误事件
+			// 检查错误事件 —— 先让 convertResponsesEventToAnthropic 输出错误事件再终止
 			if eventType == "response.failed" {
 				errMsg := gjson.Get(data, "response.error.message").String()
 				if errMsg == "" {
 					errMsg = "上游返回 response.failed"
 				}
 				streamErr = fmt.Errorf("上游错误: %s", errMsg)
-				goto done
 			}
 			if eventType == "response.incomplete" {
 				reason := gjson.Get(data, "response.incomplete_details.reason").String()
 				streamErr = fmt.Errorf("响应不完整: %s", reason)
-				goto done
 			}
 		}
 
-		output := convertResponsesEventToAnthropic(line, originalRequest, state)
+		output := convertResponsesEventToAnthropic(line, originalRequest, state, model)
 		if output != "" {
 			_, _ = fmt.Fprint(w, output)
 			if flusher != nil {
 				flusher.Flush()
 			}
+		}
+
+		// 错误事件已输出给客户端，现在终止流
+		if streamErr != nil {
+			goto done
 		}
 	}
 

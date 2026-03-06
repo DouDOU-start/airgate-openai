@@ -32,6 +32,16 @@ func (g *OpenAIGateway) Info() sdk.PluginInfo {
 				},
 			},
 			{
+				Key:         "sub2api",
+				Label:       "Sub2API",
+				Description: "通过 sub2api API Key 转发（仅 Responses 协议）",
+				Fields: []sdk.CredentialField{
+					{Key: "api_key", Label: "API Key", Type: "password", Required: true, Placeholder: "sk-..."},
+					{Key: "base_url", Label: "API 地址", Type: "text", Required: false, Placeholder: "https://sub2api.xxxx.com"},
+					{Key: "provider", Label: "Provider", Type: "text", Required: false, Placeholder: "sub2api"},
+				},
+			},
+			{
 				Key:         "oauth",
 				Label:       "OAuth 登录",
 				Description: "通过浏览器授权登录 ChatGPT 账号",
@@ -76,7 +86,13 @@ func (g *OpenAIGateway) Platform() string {
 
 func (g *OpenAIGateway) Models() []sdk.ModelInfo {
 	return []sdk.ModelInfo{
-		// Codex 系列
+		// Codex 5.x 系列
+		{ID: "gpt-5.3-codex", Name: "GPT 5.3 Codex", MaxTokens: 400000, InputPrice: 2.0, OutputPrice: 8.0},
+		{ID: "gpt-5.3-codex-spark", Name: "GPT 5.3 Codex Spark", MaxTokens: 128000, InputPrice: 0.5, OutputPrice: 2.0},
+		{ID: "gpt-5.2-codex", Name: "GPT 5.2 Codex", MaxTokens: 400000, InputPrice: 2.0, OutputPrice: 8.0},
+		{ID: "gpt-5.1-codex", Name: "GPT 5.1 Codex", MaxTokens: 400000, InputPrice: 2.0, OutputPrice: 8.0},
+		{ID: "gpt-5-codex", Name: "GPT 5 Codex", MaxTokens: 400000, InputPrice: 2.0, OutputPrice: 8.0},
+		// Codex 旧版
 		{ID: "codex-mini-latest", Name: "Codex Mini", MaxTokens: 128000, InputPrice: 1.5, OutputPrice: 6.0},
 		// GPT 系列
 		{ID: "gpt-4.1", Name: "GPT-4.1", MaxTokens: 1047576, InputPrice: 2.0, OutputPrice: 8.0},

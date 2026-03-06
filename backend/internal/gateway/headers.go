@@ -92,6 +92,15 @@ func passCodexRateLimitHeaders(src, dst http.Header) {
 	}
 }
 
+// setCodexClientHeaders 设置 Codex CLI 身份标识头，用于对接 sub2api 时模拟 Codex 客户端
+// sub2api 通过 User-Agent 和 Originator 识别 Codex CLI 请求，据此决定是否注入 instructions、
+// 跳过非 Codex 请求转换等行为。backend 作为协议翻译中间层，已完成 Anthropic→Responses 转换，
+// 需要让 sub2api 将请求当作原生 Codex 请求透传。
+func setCodexClientHeaders(req *http.Request) {
+	req.Header.Set("User-Agent", "codex_cli_rs/0.104.0")
+	req.Header.Set("Originator", "codex_cli_rs")
+}
+
 // isCodexCLI 检测请求是否来自 Codex CLI
 func isCodexCLI(headers http.Header) bool {
 	ua := strings.ToLower(headers.Get("User-Agent"))

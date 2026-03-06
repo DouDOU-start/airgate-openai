@@ -18,13 +18,14 @@ import (
 // mappingEffort: 模型映射注入的 reasoning_effort（优先级最高）
 func convertAnthropicRequestToResponses(rawJSON []byte, modelName, mappingEffort string) []byte {
 	root := gjson.ParseBytes(rawJSON)
-	template := `{"model":"","input":[]}`
+	template := `{"model":"","instructions":"","input":[]}`
 	template, _ = sjson.Set(template, "model", modelName)
 
-	// ─── system → instructions（多条文本合并，过滤 billing header）───
+	// ─── system → developer 消息（对齐 CLIProxyAPI：放入 input 数组而非 instructions 字段）───
 	systemResult := root.Get("system")
 	if systemResult.IsArray() {
-		var parts []string
+		message := `{"type":"message","role":"developer","content":[]}`
+		contentIndex := 0
 		for _, item := range systemResult.Array() {
 			if item.Get("type").String() == "text" {
 				text := item.Get("text").String()
@@ -32,16 +33,21 @@ func convertAnthropicRequestToResponses(rawJSON []byte, modelName, mappingEffort
 					continue
 				}
 				if text != "" {
-					parts = append(parts, text)
+					message, _ = sjson.Set(message, fmt.Sprintf("content.%d.type", contentIndex), "input_text")
+					message, _ = sjson.Set(message, fmt.Sprintf("content.%d.text", contentIndex), text)
+					contentIndex++
 				}
 			}
 		}
-		if len(parts) > 0 {
-			template, _ = sjson.Set(template, "instructions", strings.Join(parts, "\n\n"))
+		if contentIndex > 0 {
+			template, _ = sjson.SetRaw(template, "input.-1", message)
 		}
 	} else if systemResult.Type == gjson.String {
 		if text := systemResult.String(); text != "" {
-			template, _ = sjson.Set(template, "instructions", text)
+			message := `{"type":"message","role":"developer","content":[]}`
+			message, _ = sjson.Set(message, "content.0.type", "input_text")
+			message, _ = sjson.Set(message, "content.0.text", text)
+			template, _ = sjson.SetRaw(template, "input.-1", message)
 		}
 	}
 
@@ -129,9 +135,9 @@ func convertAnthropicRequestToResponses(rawJSON []byte, modelName, mappingEffort
 						}
 						fcMsg, _ = sjson.Set(fcMsg, "name", name)
 						if inputRaw := block.Get("input").Raw; inputRaw != "" {
-							fcMsg, _ = sjson.SetRaw(fcMsg, "arguments", inputRaw)
+							fcMsg, _ = sjson.Set(fcMsg, "arguments", inputRaw)
 						} else {
-							fcMsg, _ = sjson.SetRaw(fcMsg, "arguments", `{}`)
+							fcMsg, _ = sjson.Set(fcMsg, "arguments", "{}")
 						}
 						template, _ = sjson.SetRaw(template, "input.-1", fcMsg)
 
@@ -280,15 +286,16 @@ func convertAnthropicRequestToResponses(rawJSON []byte, modelName, mappingEffort
 	}
 
 	// ─── thinking → reasoning ───
+	// 优先级：客户端 thinking 配置 > 模型映射默认值 > 全局默认 "medium"
 	reasoningEffort := "medium"
-	if mappingEffort != "" {
-		reasoningEffort = mappingEffort
-	} else if thinkingConfig := root.Get("thinking"); thinkingConfig.Exists() && thinkingConfig.IsObject() {
+	clientEffortSet := false
+	if thinkingConfig := root.Get("thinking"); thinkingConfig.Exists() && thinkingConfig.IsObject() {
 		switch thinkingConfig.Get("type").String() {
 		case "enabled":
 			if budgetTokens := thinkingConfig.Get("budget_tokens"); budgetTokens.Exists() {
 				if effort := thinkingBudgetToReasoningEffort(budgetTokens.Int()); effort != "" {
 					reasoningEffort = effort
+					clientEffortSet = true
 				}
 			}
 		case "adaptive", "auto":
@@ -297,15 +304,26 @@ func convertAnthropicRequestToResponses(rawJSON []byte, modelName, mappingEffort
 				effort = strings.ToLower(strings.TrimSpace(v.String()))
 			}
 			if effort != "" {
+				// 客户端显式指定 effort，直接使用
 				reasoningEffort = effort
-			} else {
-				reasoningEffort = "xhigh"
+				clientEffortSet = true
+			} else if inferred := inferAdaptiveEffort(rawJSON, mappingEffort); inferred != "" {
+				// 动态推断：只读工具结果处理 → 降低 effort 加快响应
+				reasoningEffort = inferred
+				clientEffortSet = true
 			}
+			// 都未匹配时，不设 clientEffortSet，
+			// 让模型映射默认值（如 Opus→high）生效
 		case "disabled":
 			if effort := thinkingBudgetToReasoningEffort(0); effort != "" {
 				reasoningEffort = effort
+				clientEffortSet = true
 			}
 		}
+	}
+	// 客户端未指定 thinking 时，使用模型映射的默认 effort
+	if !clientEffortSet && mappingEffort != "" {
+		reasoningEffort = mappingEffort
 	}
 
 	// ─── 固定参数 ───

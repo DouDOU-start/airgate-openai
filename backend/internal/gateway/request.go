@@ -36,10 +36,10 @@ func isAnthropicRequest(req *sdk.ForwardRequest) bool {
 		hasMaxTokens := gjson.GetBytes(trimmed, "max_tokens").Exists()
 		hasMessages := gjson.GetBytes(trimmed, "messages").Exists()
 		hasInput := gjson.GetBytes(trimmed, "input").Exists()
-		// Anthropic 特有字段
-		hasSystem := gjson.GetBytes(trimmed, "system").Exists()
 
-		if hasMaxTokens && hasMessages && !hasInput && hasSystem {
+		// max_tokens + messages + 无 input → Anthropic Messages API
+		// system 是可选字段，不作为必要条件；thinking 也是 Anthropic 特有
+		if hasMaxTokens && hasMessages && !hasInput {
 			return true
 		}
 	}
@@ -146,18 +146,24 @@ func buildAPIKeyURL(account *sdk.Account, reqPath string) string {
 // ──────────────────────────────────────────────────────
 
 // preprocessRequestBody 预处理请求体（同步 model 字段）
-func preprocessRequestBody(body []byte, model string) []byte {
-	if len(body) == 0 || model == "" {
+// 注: 上下文管理交由客户端（Claude Code autocompact）和上游 API 处理，
+// 与 CLIProxyAPI 保持一致，不在网关层做裁剪
+func preprocessRequestBody(body []byte, model, reqPath string) []byte {
+	if len(body) == 0 {
 		return body
 	}
 
-	bodyModel := gjson.GetBytes(body, "model").String()
-	if bodyModel != model {
-		if modified, err := sjson.SetBytes(body, "model", model); err == nil {
-			return modified
+	result := body
+	if model != "" {
+		bodyModel := gjson.GetBytes(result, "model").String()
+		if bodyModel != model {
+			if modified, err := sjson.SetBytes(result, "model", model); err == nil {
+				result = modified
+			}
 		}
 	}
-	return body
+
+	return result
 }
 
 // wrapAsResponsesAPI 将请求包装为 Responses API 格式（模拟客户端模式）
@@ -240,7 +246,78 @@ func ensureResponsesDefaults(body []byte) []byte {
 	if modified, err := sjson.SetBytes(result, "include", []string{"reasoning.encrypted_content"}); err == nil {
 		result = modified
 	}
+
+	// 剥离 Codex 上游不支持的参数
+	// context_management: Codex 返回 "Unsupported parameter: context_management"
+	// truncation: Codex 不支持
+	// max_output_tokens / max_completion_tokens: Codex Responses 不接受 token 限制字段
+	// temperature / top_p / service_tier: Codex 不支持采样参数
+	for _, field := range []string{
+		"context_management",
+		"truncation",
+		"max_output_tokens",
+		"max_completion_tokens",
+		"temperature",
+		"top_p",
+		"service_tier",
+		"user",
+	} {
+		if gjson.GetBytes(result, field).Exists() {
+			result, _ = sjson.DeleteBytes(result, field)
+		}
+	}
+
 	return result
+}
+
+// getModelMetadataByID 返回网关内置模型元信息，用于 /v1/models 字段补齐与上下文预算估算
+func getModelMetadataByID(modelID string) map[string]any {
+	window := modelContextWindow(modelID)
+	if window <= 0 {
+		return nil
+	}
+	meta := map[string]any{
+		"context_length":   window,
+		"context_window":   window,
+		"max_input_tokens": window,
+	}
+	switch strings.ToLower(strings.TrimSpace(modelID)) {
+	case "codex-mini-latest", "gpt-4o", "gpt-4o-mini":
+		meta["max_output_tokens"] = 16384
+	case "gpt-4.1", "gpt-4.1-mini", "gpt-4.1-nano":
+		meta["max_output_tokens"] = 32768
+	case "o3", "o3-pro", "o4-mini", "o3-mini":
+		meta["max_output_tokens"] = 32768
+	case "gpt-5-codex", "gpt-5-codex-mini", "gpt-5.1-codex", "gpt-5.1-codex-mini",
+		"gpt-5.1-codex-max", "gpt-5.2-codex", "gpt-5.3-codex", "gpt-5.3-codex-spark":
+		meta["max_output_tokens"] = 128000
+	case "gpt-5", "gpt-5.1", "gpt-5.2":
+		meta["max_output_tokens"] = 128000
+	}
+	return meta
+}
+
+func modelContextWindow(model string) int {
+	switch strings.ToLower(strings.TrimSpace(model)) {
+	case "gpt-4.1", "gpt-4.1-mini", "gpt-4.1-nano":
+		return 1047576
+	case "gpt-4o", "gpt-4o-mini", "codex-mini-latest":
+		return 128000
+	case "o3", "o3-pro", "o4-mini", "o3-mini":
+		return 200000
+	// Codex 5.x 系列
+	case "gpt-5-codex", "gpt-5.1-codex", "gpt-5.1-codex-max",
+		"gpt-5.2-codex", "gpt-5.3-codex":
+		return 400000
+	case "gpt-5-codex-mini", "gpt-5.1-codex-mini":
+		return 400000
+	case "gpt-5.3-codex-spark":
+		return 128000
+	case "gpt-5", "gpt-5.1", "gpt-5.2":
+		return 400000
+	default:
+		return 200000
+	}
 }
 
 // convertChatMessagesToResponsesInput 将 Chat Completions messages 转换为 Responses API input 列表
