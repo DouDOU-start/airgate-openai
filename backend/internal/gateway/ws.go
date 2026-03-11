@@ -182,13 +182,7 @@ func ReceiveWSResponse(ctx context.Context, conn *websocket.Conn, handler WSEven
 			if resp, ok := ev["response"].(map[string]any); ok {
 				mergeResponseMetadata(&result, resp)
 				result.StopReason = jsonString(resp["stop_reason"])
-				if usage, ok := resp["usage"].(map[string]any); ok {
-					result.InputTokens = JsonInt(usage, "input_tokens")
-					result.OutputTokens = JsonInt(usage, "output_tokens")
-					if details, ok := usage["input_tokens_details"].(map[string]any); ok {
-						result.CacheTokens = JsonInt(details, "cached_tokens")
-					}
-				}
+				extractUsageFromResponseMap(&result, resp)
 			}
 			finalizeWSResult(&result, &textBuilder, &reasoningBuilder, start)
 			return result
@@ -357,4 +351,15 @@ func JsonInt(m map[string]any, key string) int {
 		return int(v)
 	}
 	return 0
+}
+
+// extractUsageFromResponseMap 从 Responses API response 对象中提取 usage 到 WSResult
+func extractUsageFromResponseMap(result *WSResult, resp map[string]any) {
+	if usage, ok := resp["usage"].(map[string]any); ok {
+		result.InputTokens = JsonInt(usage, "input_tokens")
+		result.OutputTokens = JsonInt(usage, "output_tokens")
+		if details, ok := usage["input_tokens_details"].(map[string]any); ok {
+			result.CacheTokens = JsonInt(details, "cached_tokens")
+		}
+	}
 }

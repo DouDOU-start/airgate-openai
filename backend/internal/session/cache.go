@@ -1,4 +1,4 @@
-package gateway
+package session
 
 import (
 	"crypto/rand"
@@ -12,31 +12,30 @@ import (
 
 // ──────────────────────────────────────────────────────
 // Session 缓存管理（为 sub2api 提供 sticky session 路由）
-// 参照 CLIProxyAPI cache_helpers.go 模式
 // ──────────────────────────────────────────────────────
 
-type sessionEntry struct {
+type entry struct {
 	ID     string
 	Expire time.Time
 }
 
 var (
-	sessionMap  = make(map[string]sessionEntry)
+	sessionMap  = make(map[string]entry)
 	sessionMu   sync.RWMutex
 	sessionTTL  = 1 * time.Hour
 	cleanupOnce sync.Once
 )
 
-// getOrCreateSessionID 查找或创建 session 缓存条目
+// GetOrCreate 查找或创建 session 缓存条目
 // cacheKey 格式: "model-userID" 或 "model-accountHash"
-func getOrCreateSessionID(cacheKey string) string {
-	cleanupOnce.Do(startSessionCleanup)
+func GetOrCreate(cacheKey string) string {
+	cleanupOnce.Do(startCleanup)
 
 	// 快路径：读锁查找
 	sessionMu.RLock()
-	if entry, ok := sessionMap[cacheKey]; ok && time.Now().Before(entry.Expire) {
+	if e, ok := sessionMap[cacheKey]; ok && time.Now().Before(e.Expire) {
 		sessionMu.RUnlock()
-		return entry.ID
+		return e.ID
 	}
 	sessionMu.RUnlock()
 
@@ -45,20 +44,20 @@ func getOrCreateSessionID(cacheKey string) string {
 	defer sessionMu.Unlock()
 
 	// double-check
-	if entry, ok := sessionMap[cacheKey]; ok && time.Now().Before(entry.Expire) {
-		return entry.ID
+	if e, ok := sessionMap[cacheKey]; ok && time.Now().Before(e.Expire) {
+		return e.ID
 	}
 
-	entry := sessionEntry{
+	e := entry{
 		ID:     newUUID(),
 		Expire: time.Now().Add(sessionTTL),
 	}
-	sessionMap[cacheKey] = entry
-	return entry.ID
+	sessionMap[cacheKey] = e
+	return e.ID
 }
 
-// startSessionCleanup 启动后台清理协程（每 15 分钟清理过期条目）
-func startSessionCleanup() {
+// startCleanup 启动后台清理协程（每 15 分钟清理过期条目）
+func startCleanup() {
 	go func() {
 		ticker := time.NewTicker(15 * time.Minute)
 		defer ticker.Stop()
@@ -75,15 +74,15 @@ func startSessionCleanup() {
 	}()
 }
 
-// deriveSessionID 从请求上下文派生稳定的 session ID
+// DeriveID 从请求上下文派生稳定的 session ID
 // 优先使用 Anthropic metadata.user_id，回退到 account 凭证 hash
-func deriveSessionID(originalBody []byte, account *sdk.Account, model string) string {
+func DeriveID(originalBody []byte, account *sdk.Account, modelName string) string {
 	// 优先从 Anthropic 请求的 metadata.user_id 提取
 	userID := gjson.GetBytes(originalBody, "metadata.user_id").String()
 
 	var cacheKey string
 	if userID != "" {
-		cacheKey = fmt.Sprintf("%s-%s", model, userID)
+		cacheKey = fmt.Sprintf("%s-%s", modelName, userID)
 	} else {
 		// 回退：使用 account api_key 前 16 字符 + model 构造稳定 key
 		apiKey := account.Credentials["api_key"]
@@ -91,10 +90,10 @@ func deriveSessionID(originalBody []byte, account *sdk.Account, model string) st
 		if len(keyPrefix) > 16 {
 			keyPrefix = keyPrefix[:16]
 		}
-		cacheKey = fmt.Sprintf("%s-%s", model, keyPrefix)
+		cacheKey = fmt.Sprintf("%s-%s", modelName, keyPrefix)
 	}
 
-	return getOrCreateSessionID(cacheKey)
+	return GetOrCreate(cacheKey)
 }
 
 // newUUID 生成 UUID v4（不依赖外部库）

@@ -58,9 +58,6 @@ func BuildPluginInfo() sdk.PluginInfo {
 				},
 			},
 		},
-		ConfigFields: []sdk.ConfigField{
-			{Key: "default_timeout", Type: "duration", Default: "300s", Description: "默认请求超时"},
-		},
 	}
 }
 

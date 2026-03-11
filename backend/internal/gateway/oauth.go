@@ -17,6 +17,32 @@ import (
 	sdk "github.com/DouDOU-start/airgate-sdk"
 )
 
+// OAuth 请求/响应类型（插件内部定义，不依赖 SDK）
+// OAuth 仅在 devserver 中使用，不走 gRPC
+
+// OAuthStartRequest OAuth 授权发起请求
+type OAuthStartRequest struct{}
+
+// OAuthStartResponse OAuth 授权发起响应
+type OAuthStartResponse struct {
+	AuthorizeURL string
+	State        string
+}
+
+// OAuthCallbackRequest OAuth 回调请求
+type OAuthCallbackRequest struct {
+	Code     string
+	State    string
+	ProxyURL string
+}
+
+// OAuthResult OAuth 授权结果
+type OAuthResult struct {
+	AccountType string
+	Credentials map[string]string
+	AccountName string
+}
+
 // OAuth 常量（与 codex 项目完全一致）
 const (
 	oauthClientID     = "app_EMoamEEZ73f0CkXaXp7hrann"
@@ -46,7 +72,7 @@ type pkceSession struct {
 var oauthSessions sync.Map
 
 // StartOAuth 发起 OAuth 授权
-func (g *OpenAIGateway) StartOAuth(ctx context.Context, req *sdk.OAuthStartRequest) (*sdk.OAuthStartResponse, error) {
+func (g *OpenAIGateway) StartOAuth(ctx context.Context, req *OAuthStartRequest) (*OAuthStartResponse, error) {
 	cleanExpiredSessions()
 
 	// 生成 PKCE
@@ -86,14 +112,14 @@ func (g *OpenAIGateway) StartOAuth(ctx context.Context, req *sdk.OAuthStartReque
 
 	g.logger.Info("OAuth 授权发起", "authorize_url", authorizeURL)
 
-	return &sdk.OAuthStartResponse{
+	return &OAuthStartResponse{
 		AuthorizeURL: authorizeURL,
 		State:        state,
 	}, nil
 }
 
 // HandleOAuthCallback 处理 OAuth 回调，完成 token 交换
-func (g *OpenAIGateway) HandleOAuthCallback(ctx context.Context, req *sdk.OAuthCallbackRequest) (*sdk.OAuthResult, error) {
+func (g *OpenAIGateway) HandleOAuthCallback(ctx context.Context, req *OAuthCallbackRequest) (*OAuthResult, error) {
 	val, ok := oauthSessions.LoadAndDelete(req.State)
 	if !ok {
 		return nil, fmt.Errorf("无效或已过期的 state")
@@ -123,7 +149,7 @@ func (g *OpenAIGateway) HandleOAuthCallback(ctx context.Context, req *sdk.OAuthC
 
 	g.logger.Info("OAuth 授权成功", "account_name", accountName, "account_id", accountID)
 
-	return &sdk.OAuthResult{
+	return &OAuthResult{
 		AccountType: "oauth",
 		Credentials: credentials,
 		AccountName: accountName,

@@ -1,4 +1,4 @@
-package gateway
+package model
 
 import (
 	"sort"
@@ -9,14 +9,11 @@ import (
 
 // ──────────────────────────────────────────────────────
 // 集中模型注册表
-// 新增模型只需在 modelRegistry 中加一行，所有引用点自动生效：
-// - gateway.go Models()       → SDK 模型列表
-// - request.go /v1/models     → context_window / max_output_tokens
-// - request.go contextGuard   → 上下文预算估算
+// 新增模型只需在 registry 中加一行，所有引用点自动生效
 // ──────────────────────────────────────────────────────
 
-// modelSpec 单个模型的完整元数据
-type modelSpec struct {
+// Spec 单个模型的完整元数据
+type Spec struct {
 	Name            string  // 展示名称
 	ContextWindow   int     // 上下文窗口（tokens）
 	MaxOutputTokens int     // 最大输出 tokens
@@ -24,9 +21,9 @@ type modelSpec struct {
 	OutputPrice     float64 // 输出价格（$/1M tokens）
 }
 
-// modelRegistry 全局模型注册表（按模型 ID 索引）
+// registry 全局模型注册表（按模型 ID 索引）
 // ─── 新增模型只需在此处加一行 ───
-var modelRegistry = map[string]modelSpec{
+var registry = map[string]Spec{
 	// ── GPT-5.4 ──
 	"gpt-5.4":     {"GPT 5.4", 1050000, 128000, 2.5, 15.0},
 	"gpt-5.4-pro": {"GPT 5.4 Pro", 1050000, 128000, 30.0, 180.0},
@@ -68,26 +65,26 @@ var modelRegistry = map[string]modelSpec{
 	"gpt-image-1": {"GPT Image 1", 0, 0, 5.0, 40.0},
 }
 
-// defaultModelSpec 未注册模型的兜底值
-var defaultModelSpec = modelSpec{
+// DefaultSpec 未注册模型的兜底值
+var DefaultSpec = Spec{
 	Name:            "Unknown",
 	ContextWindow:   200000,
 	MaxOutputTokens: 128000,
 }
 
-// lookupModelSpec 查询模型元数据，未找到返回默认值
-func lookupModelSpec(modelID string) modelSpec {
+// Lookup 查询模型元数据，未找到返回默认值
+func Lookup(modelID string) Spec {
 	id := strings.ToLower(strings.TrimSpace(modelID))
-	if spec, ok := modelRegistry[id]; ok {
+	if spec, ok := registry[id]; ok {
 		return spec
 	}
-	return defaultModelSpec
+	return DefaultSpec
 }
 
-// allModelSpecs 返回所有注册模型的 SDK ModelInfo 列表（按 ID 排序）
-func allModelSpecs() []sdk.ModelInfo {
-	models := make([]sdk.ModelInfo, 0, len(modelRegistry))
-	for id, spec := range modelRegistry {
+// AllSpecs 返回所有注册模型的 SDK ModelInfo 列表（按 ID 排序）
+func AllSpecs() []sdk.ModelInfo {
+	models := make([]sdk.ModelInfo, 0, len(registry))
+	for id, spec := range registry {
 		models = append(models, sdk.ModelInfo{
 			ID:          id,
 			Name:        spec.Name,

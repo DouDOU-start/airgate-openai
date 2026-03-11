@@ -7,12 +7,12 @@ import (
 	"log"
 	"net/http"
 
-	sdk "github.com/DouDOU-start/airgate-sdk"
+	"github.com/DouDOU-start/airgate-openai/backend/internal/gateway"
 )
 
 // OAuthDevHandler 处理 devserver 的 OAuth 路由
 type OAuthDevHandler struct {
-	gateway sdk.SimpleGatewayPlugin
+	gateway *gateway.OpenAIGateway
 	store   *AccountStore
 }
 
@@ -23,13 +23,7 @@ func (h *OAuthDevHandler) HandleStart(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	oauthHandler, ok := h.gateway.(sdk.OAuthHandler)
-	if !ok {
-		http.Error(w, `{"error":"插件不支持 OAuth 授权"}`, http.StatusNotImplemented)
-		return
-	}
-
-	resp, err := oauthHandler.StartOAuth(context.Background(), &sdk.OAuthStartRequest{})
+	resp, err := h.gateway.StartOAuth(context.Background(), &gateway.OAuthStartRequest{})
 	if err != nil {
 		log.Printf("StartOAuth 失败: %v", err)
 		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusInternalServerError)
@@ -53,12 +47,6 @@ func (h *OAuthDevHandler) HandleCallback(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	oauthHandler, ok := h.gateway.(sdk.OAuthHandler)
-	if !ok {
-		http.Error(w, `{"error":"插件不支持 OAuth 授权"}`, http.StatusNotImplemented)
-		return
-	}
-
 	var body struct {
 		Code  string `json:"code"`
 		State string `json:"state"`
@@ -68,7 +56,7 @@ func (h *OAuthDevHandler) HandleCallback(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	result, err := oauthHandler.HandleOAuthCallback(context.Background(), &sdk.OAuthCallbackRequest{
+	result, err := h.gateway.HandleOAuthCallback(context.Background(), &gateway.OAuthCallbackRequest{
 		Code:  body.Code,
 		State: body.State,
 	})

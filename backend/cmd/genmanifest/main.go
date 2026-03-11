@@ -107,7 +107,6 @@ func renderManifest() ([]byte, error) {
 		Type:           string(info.Type),
 		MinCoreVersion: gateway.PluginMinCoreVersion,
 		Dependencies:   gateway.PluginDependencies(),
-		Config:         convertConfigFields(info.ConfigFields),
 		Gateway: &gatewayManifest{
 			Platform:     plugin.Platform(),
 			Mode:         gateway.PluginMode,
@@ -195,16 +194,3 @@ func convertCredentialFields(fields []sdk.CredentialField) []credentialField {
 	return items
 }
 
-func convertConfigFields(fields []sdk.ConfigField) []configField {
-	items := make([]configField, 0, len(fields))
-	for _, field := range fields {
-		items = append(items, configField{
-			Key:         field.Key,
-			Type:        field.Type,
-			Default:     field.Default,
-			Description: field.Description,
-			Required:    field.Required,
-		})
-	}
-	return items
-}

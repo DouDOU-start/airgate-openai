@@ -8,12 +8,6 @@ author: airgate
 type: gateway
 min_core_version: 1.0.0
 dependencies: []
-config:
-  - key: default_timeout
-    type: duration
-    default: 300s
-    description: 默认请求超时
-    required: false
 gateway:
   platform: openai
   mode: simple

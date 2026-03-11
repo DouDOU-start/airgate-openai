@@ -102,7 +102,7 @@ func convertResponsesEventToAnthropic(rawLine []byte, originalRequest []byte, st
 
 			// 还原工具短名（懒初始化缓存）
 			if state.reverseNameMap == nil {
-				state.reverseNameMap = buildReverseMapFromAnthropicOriginalShortToOriginal(originalRequest)
+				state.reverseNameMap = buildReverseToolNameMap(originalRequest)
 			}
 			name := item.Get("name").String()
 			if orig, ok := state.reverseNameMap[name]; ok {
@@ -259,7 +259,7 @@ func convertResponsesCompletedToAnthropicJSON(completedJSON, originalRequest []b
 		return ""
 	}
 
-	revNames := buildReverseMapFromAnthropicOriginalShortToOriginal(originalRequest)
+	revNames := buildReverseToolNameMap(originalRequest)
 
 	out := `{"id":"","type":"message","role":"assistant","model":"","content":[],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":0,"output_tokens":0}}`
 	out, _ = sjson.Set(out, "id", responseData.Get("id").String())

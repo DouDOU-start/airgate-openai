@@ -113,8 +113,7 @@ func (g *OpenAIGateway) forwardAnthropicMessage(ctx context.Context, req *sdk.Fo
 		fallbackModel = mapping.FallbackModel
 	}
 
-	result, err := g.doAnthropicForward(ctx, req, responsesBody, originalModel, fallbackModel, start)
-	return result, err
+	return g.doAnthropicForward(ctx, req, responsesBody, originalModel, fallbackModel, start)
 }
 
 // doAnthropicForward 执行 Anthropic 转发，支持模型降级重试
@@ -126,26 +125,17 @@ func (g *OpenAIGateway) doAnthropicForward(
 	fallbackModel string,
 	start time.Time,
 ) (*sdk.ForwardResult, error) {
-	account := req.Account
-
-	// 选择转发方式
-	isOAuth := account.Credentials["access_token"] != ""
-
-	// 始终传真实 writer（流式响应必须直接写入客户端）
-	// 当有 fallback 时，仅抑制错误响应写入（存入 FallbackErrBody 供降级判断）
 	hasFallback := fallbackModel != ""
 
-	var result *sdk.ForwardResult
-	var err error
-	if isOAuth {
-		result, err = g.forwardAnthropicViaOAuthResponses(ctx, req, responsesBody, originalModel, start, req.Writer, hasFallback)
-	} else {
-		result, err = g.forwardAnthropicViaAPIKeyResponses(ctx, req, responsesBody, originalModel, start, req.Writer, hasFallback)
+	// 第一次转发（有 fallback 时抑制错误写入客户端）
+	result, errBody, err := g.forwardAnthropicResponses(ctx, req, responsesBody, originalModel, start, req.Writer, hasFallback)
+	if err != nil {
+		return result, err
 	}
 
 	// 检查是否需要模型降级
-	if fallbackModel != "" && result != nil && result.FallbackErrBody != nil {
-		if isModelNotFoundError(result.StatusCode, result.FallbackErrBody) {
+	if hasFallback && errBody != nil {
+		if isModelNotFoundError(result.StatusCode, errBody) {
 			g.logger.Info("模型降级重试",
 				"primary", gjson.GetBytes(responsesBody, "model").String(),
 				"fallback", fallbackModel,
@@ -154,22 +144,25 @@ func (g *OpenAIGateway) doAnthropicForward(
 			// 替换模型后重试，不再降级
 			responsesBody, _ = sjson.SetBytes(responsesBody, "model", fallbackModel)
 			fallbackStart := time.Now()
-			if isOAuth {
-				return g.forwardAnthropicViaOAuthResponses(ctx, req, responsesBody, originalModel, fallbackStart, req.Writer, false)
-			}
-			return g.forwardAnthropicViaAPIKeyResponses(ctx, req, responsesBody, originalModel, fallbackStart, req.Writer, false)
+			result, _, err = g.forwardAnthropicResponses(ctx, req, responsesBody, originalModel, fallbackStart, req.Writer, false)
+			return result, err
 		}
 
 		// 非模型错误，写回原始错误
-		return g.writeAnthropicUpstreamError(req.Writer, result.StatusCode, result.FallbackErrBody, start)
+		return g.writeAnthropicUpstreamError(req.Writer, result.StatusCode, errBody, start)
 	}
 
-	return result, err
+	return result, nil
 }
 
-// forwardAnthropicViaOAuthResponses OAuth 模式：Responses API SSE → Anthropic SSE
-// suppressErrorWrite: 当 true 时，上游错误不写入客户端，存入 FallbackErrBody 供降级判断
-func (g *OpenAIGateway) forwardAnthropicViaOAuthResponses(
+// ──────────────────────────────────────────────────────
+// 统一的 Anthropic → Responses API 转发（合并 OAuth/APIKey 路径）
+// ──────────────────────────────────────────────────────
+
+// forwardAnthropicResponses 统一的 Anthropic 转发函数
+// suppressErrorWrite: true 时上游错误不写入客户端，通过 errBody 返回供降级判断
+// 返回值: result, errBody（仅 suppress 时非 nil）, error
+func (g *OpenAIGateway) forwardAnthropicResponses(
 	ctx context.Context,
 	req *sdk.ForwardRequest,
 	responsesBody []byte,
@@ -177,109 +170,104 @@ func (g *OpenAIGateway) forwardAnthropicViaOAuthResponses(
 	start time.Time,
 	w http.ResponseWriter,
 	suppressErrorWrite bool,
-) (*sdk.ForwardResult, error) {
+) (*sdk.ForwardResult, []byte, error) {
 	account := req.Account
 
-	upstreamReq, err := http.NewRequestWithContext(ctx, http.MethodPost, ChatGPTSSEURL, bytes.NewReader(responsesBody))
+	// 构建上游 HTTP 请求（OAuth/APIKey 差异化处理）
+	upstreamReq, responsesBody, err := g.buildAnthropicUpstreamRequest(ctx, req, account, responsesBody)
 	if err != nil {
-		return nil, fmt.Errorf("构建上游请求失败: %w", err)
-	}
-	upstreamReq.Header.Set("Content-Type", "application/json")
-	upstreamReq.Header.Set("Accept", "text/event-stream")
-	upstreamReq.Header.Set("Authorization", "Bearer "+account.Credentials["access_token"])
-	upstreamReq.Header.Set("OpenAI-Beta", SSEBetaHeader)
-	if aid := account.Credentials["chatgpt_account_id"]; aid != "" {
-		upstreamReq.Header.Set("ChatGPT-Account-ID", aid)
+		return nil, nil, fmt.Errorf("构建上游请求失败: %w", err)
 	}
 
+	// 发送请求
 	client := g.buildHTTPClient(account)
 	resp, err := client.Do(upstreamReq)
 	if err != nil {
-		return nil, fmt.Errorf("请求上游失败: %w", err)
+		return nil, nil, fmt.Errorf("请求上游失败: %w", err)
 	}
 	defer resp.Body.Close()
 
+	// 错误处理
 	if resp.StatusCode >= 400 {
-		errWriter := w
+		body, _ := io.ReadAll(resp.Body)
+		g.logger.Error("上游返回错误", "status", resp.StatusCode, "body", truncate(string(body), 300))
+
 		if suppressErrorWrite {
-			errWriter = nil // fallback 模式：不写入客户端，存入 FallbackErrBody
+			// fallback 模式：不写入客户端，返回错误体供调用方判断
+			return &sdk.ForwardResult{
+				StatusCode:    resp.StatusCode,
+				Duration:      time.Since(start),
+				AccountStatus: accountStatusFromCode(resp.StatusCode),
+				RetryAfter:    extractRetryAfterHeader(resp.Header),
+			}, body, nil
 		}
-		return g.handleAnthropicUpstreamErrorWithFallback(resp, errWriter, start)
+		result, err := g.writeAnthropicUpstreamError(w, resp.StatusCode, body, start)
+		return result, nil, err
 	}
 
+	// 流式 / 非流式响应处理
 	isStream := gjson.GetBytes(req.Body, "stream").Bool()
 	if isStream && w != nil {
-		return translateResponsesSSEToAnthropicSSE(ctx, resp, w, originalModel, req.Body, start)
+		result, err := translateResponsesSSEToAnthropicSSE(ctx, resp, w, originalModel, req.Body, start)
+		return result, nil, err
 	}
 
-	// 非流式：聚合 Responses SSE，用 response.completed 做完整回译
-	return g.handleAnthropicNonStreamFromResponses(resp, w, originalModel, req.Body, start)
+	// 非流式：聚合 Responses SSE → Anthropic JSON
+	result, err := g.handleAnthropicNonStreamFromResponses(resp, w, originalModel, req.Body, start)
+	return result, nil, err
 }
 
-// forwardAnthropicViaAPIKeyResponses API Key 模式：也统一走 Responses API
-// suppressErrorWrite: 当 true 时，上游错误不写入客户端，存入 FallbackErrBody 供降级判断
-func (g *OpenAIGateway) forwardAnthropicViaAPIKeyResponses(
+// buildAnthropicUpstreamRequest 构建 Anthropic 转发的上游 HTTP 请求
+// 根据 OAuth/APIKey 设置不同的 URL、认证头和特殊处理
+func (g *OpenAIGateway) buildAnthropicUpstreamRequest(
 	ctx context.Context,
 	req *sdk.ForwardRequest,
+	account *sdk.Account,
 	responsesBody []byte,
-	originalModel string,
-	start time.Time,
-	w http.ResponseWriter,
-	suppressErrorWrite bool,
-) (*sdk.ForwardResult, error) {
-	account := req.Account
+) (*http.Request, []byte, error) {
+	isOAuth := account.Credentials["access_token"] != ""
 
-	targetURL := buildAPIKeyURL(account, "/v1/responses")
+	// 确定目标 URL
+	var targetURL string
+	if isOAuth {
+		targetURL = ChatGPTSSEURL
+	} else {
+		targetURL = buildAPIKeyURL(account, "/v1/responses")
+	}
+
 	upstreamReq, err := http.NewRequestWithContext(ctx, http.MethodPost, targetURL, bytes.NewReader(responsesBody))
 	if err != nil {
-		return nil, fmt.Errorf("构建上游请求失败: %w", err)
+		return nil, responsesBody, err
 	}
 
-	setAuthHeaders(upstreamReq, account)
+	// 公共头
 	upstreamReq.Header.Set("Content-Type", "application/json")
 	upstreamReq.Header.Set("Accept", "text/event-stream")
-	passHeaders(req.Headers, upstreamReq.Header)
-	if isSub2APIAccount(account) {
-		// sub2api 仅走 /v1/responses，清理仅官方链路使用的透传头
-		upstreamReq.Header.Del("OpenAI-Beta")
-		upstreamReq.Header.Del("ChatGPT-Account-ID")
-		// 模拟 Codex CLI 身份，让 sub2api 跳过 instructions 注入和非 Codex 转换
-		setCodexClientHeaders(upstreamReq)
-		// 注入 session 缓存标识（如客户端未提供），让 sub2api 实现 sticky session 路由
-		if upstreamReq.Header.Get("Session_id") == "" {
-			modelName := gjson.GetBytes(responsesBody, "model").String()
-			sessionID := deriveSessionID(req.Body, account, modelName)
-			responsesBody, _ = sjson.SetBytes(responsesBody, "prompt_cache_key", sessionID)
-			upstreamReq.Header.Set("Session_id", sessionID)
-			upstreamReq.Header.Set("Conversation_id", sessionID)
-			// 用注入后的 body 重建请求体
-			upstreamReq.Body = io.NopCloser(bytes.NewReader(responsesBody))
-			upstreamReq.ContentLength = int64(len(responsesBody))
+
+	if isOAuth {
+		// OAuth 模式：手动设置认证头
+		upstreamReq.Header.Set("Authorization", "Bearer "+account.Credentials["access_token"])
+		upstreamReq.Header.Set("OpenAI-Beta", SSEBetaHeader)
+		if aid := account.Credentials["chatgpt_account_id"]; aid != "" {
+			upstreamReq.Header.Set("ChatGPT-Account-ID", aid)
+		}
+	} else {
+		// API Key 模式
+		setAuthHeaders(upstreamReq, account)
+		passHeaders(req.Headers, upstreamReq.Header)
+
+		// sub2api 特殊处理
+		if isSub2APIAccount(account) {
+			upstreamReq.Header.Del("OpenAI-Beta")
+			upstreamReq.Header.Del("ChatGPT-Account-ID")
+			setCodexClientHeaders(upstreamReq)
+
+			// 注入 session 缓存标识
+			responsesBody = injectSub2APISession(upstreamReq, responsesBody, account)
 		}
 	}
 
-	client := g.buildHTTPClient(account)
-	resp, err := client.Do(upstreamReq)
-	if err != nil {
-		return nil, fmt.Errorf("请求上游失败: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode >= 400 {
-		errWriter := w
-		if suppressErrorWrite {
-			errWriter = nil // fallback 模式：不写入客户端，存入 FallbackErrBody
-		}
-		return g.handleAnthropicUpstreamErrorWithFallback(resp, errWriter, start)
-	}
-
-	isStream := gjson.GetBytes(req.Body, "stream").Bool()
-	if isStream && w != nil {
-		return translateResponsesSSEToAnthropicSSE(ctx, resp, w, originalModel, req.Body, start)
-	}
-
-	// 非流式
-	return g.handleAnthropicNonStreamFromResponses(resp, w, originalModel, req.Body, start)
+	return upstreamReq, responsesBody, nil
 }
 
 // handleAnthropicNonStreamFromResponses 非流式：聚合 Responses SSE → Anthropic JSON
@@ -319,30 +307,9 @@ func (g *OpenAIGateway) handleAnthropicNonStreamFromResponses(
 	}, nil
 }
 
-// handleAnthropicUpstreamErrorWithFallback 处理上游错误
-// 当 w 为 nil 时（fallback 模式），将错误体存入 FallbackErrBody 供调用方判断是否需要降级
-// 当 w 不为 nil 时，直接写入 Anthropic 错误格式
-func (g *OpenAIGateway) handleAnthropicUpstreamErrorWithFallback(
-	resp *http.Response,
-	w http.ResponseWriter,
-	start time.Time,
-) (*sdk.ForwardResult, error) {
-	body, _ := io.ReadAll(resp.Body)
-	statusCode := resp.StatusCode
-
-	g.logger.Error("上游返回错误", "status", statusCode, "body", truncate(string(body), 300))
-
-	// fallback 模式：不写入客户端，保存错误体让调用方决定
-	if w == nil {
-		return &sdk.ForwardResult{
-			StatusCode:     statusCode,
-			Duration:       time.Since(start),
-			FallbackErrBody: body,
-		}, nil
-	}
-
-	return g.writeAnthropicUpstreamError(w, statusCode, body, start)
-}
+// ──────────────────────────────────────────────────────
+// 错误处理
+// ──────────────────────────────────────────────────────
 
 // writeAnthropicUpstreamError 将上游错误写入客户端（Anthropic 格式）
 func (g *OpenAIGateway) writeAnthropicUpstreamError(
@@ -363,11 +330,15 @@ func (g *OpenAIGateway) writeAnthropicUpstreamError(
 	}
 
 	result := &sdk.ForwardResult{
-		StatusCode: statusCode,
-		Duration:   time.Since(start),
+		StatusCode:    statusCode,
+		Duration:      time.Since(start),
+		AccountStatus: accountStatusFromCode(statusCode),
 	}
 
 	if statusCode >= 500 || statusCode == 429 {
+		if statusCode == 429 {
+			result.RetryAfter = parseRetryDelay(errMsg)
+		}
 		return result, fmt.Errorf("上游返回 %d: %s", statusCode, errMsg)
 	}
 
@@ -381,3 +352,4 @@ func extractOpenAIErrorMessage(body []byte) string {
 	}
 	return ""
 }
+

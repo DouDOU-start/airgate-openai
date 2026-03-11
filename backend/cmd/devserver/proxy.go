@@ -10,11 +10,13 @@ import (
 
 	sdk "github.com/DouDOU-start/airgate-sdk"
 	"github.com/gorilla/websocket"
+
+	"github.com/DouDOU-start/airgate-openai/backend/internal/gateway"
 )
 
 // ProxyHandler 将 /v1/* 请求代理给插件
 type ProxyHandler struct {
-	gateway sdk.SimpleGatewayPlugin
+	gateway *gateway.OpenAIGateway
 	store   *AccountStore
 }
 
@@ -87,13 +89,6 @@ func (p *ProxyHandler) handleHTTP(w http.ResponseWriter, r *http.Request) {
 
 // handleWebSocket 处理 WebSocket 请求
 func (p *ProxyHandler) handleWebSocket(w http.ResponseWriter, r *http.Request) {
-	// 检查插件是否支持 WebSocket
-	wsHandler, ok := p.gateway.(sdk.WebSocketHandler)
-	if !ok {
-		http.Error(w, `{"error":"plugin does not support websocket"}`, http.StatusNotImplemented)
-		return
-	}
-
 	account := p.selectAccount()
 	if account == nil {
 		http.Error(w, `{"error":"no accounts configured"}`, http.StatusServiceUnavailable)
@@ -129,7 +124,7 @@ func (p *ProxyHandler) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 
 	log.Printf("WebSocket 连接建立: %s, account=%d", r.URL.Path, account.ID)
 
-	if err := wsHandler.HandleWebSocket(context.Background(), conn); err != nil {
+	if _, err := p.gateway.HandleWebSocket(context.Background(), conn); err != nil {
 		log.Printf("WebSocket 处理结束: %v", err)
 	}
 }

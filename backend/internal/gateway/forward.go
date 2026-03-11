@@ -16,7 +16,26 @@ import (
 	sdk "github.com/DouDOU-start/airgate-sdk"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
+
+	"github.com/DouDOU-start/airgate-openai/backend/internal/session"
 )
+
+// injectSub2APISession 为 sub2api 账号注入 session 缓存标识（sticky session 路由）
+// 返回可能修改后的 body 和是否注入了 session
+func injectSub2APISession(req *http.Request, body []byte, account *sdk.Account) []byte {
+	if !isSub2APIAccount(account) || req.Header.Get("Session_id") != "" {
+		return body
+	}
+	modelName := gjson.GetBytes(body, "model").String()
+	sessionID := session.DeriveID(body, account, modelName)
+	body, _ = sjson.SetBytes(body, "prompt_cache_key", sessionID)
+	req.Header.Set("Session_id", sessionID)
+	req.Header.Set("Conversation_id", sessionID)
+	// 用注入后的 body 重建请求体
+	req.Body = io.NopCloser(bytes.NewReader(body))
+	req.ContentLength = int64(len(body))
+	return body
+}
 
 // ──────────────────────────────────────────────────────
 // 转发入口（三模式分发）
@@ -83,18 +102,9 @@ func (g *OpenAIGateway) forwardAPIKey(ctx context.Context, req *sdk.ForwardReque
 		setCodexClientHeaders(upstreamReq)
 	}
 
-	// sub2api 账号：注入 session 缓存标识（如客户端未提供），让 sub2api 实现 sticky session 路由
-	if isSub2APIAccount(account) && upstreamReq.Header.Get("Session_id") == "" {
-		modelName := gjson.GetBytes(body, "model").String()
-		sessionID := deriveSessionID(body, account, modelName)
-		body, _ = sjson.SetBytes(body, "prompt_cache_key", sessionID)
-		upstreamReq.Header.Set("Session_id", sessionID)
-		upstreamReq.Header.Set("Conversation_id", sessionID)
-		// 用注入后的 body 重建请求体
-		if methodAllowsBody(reqMethod) && len(body) > 0 {
-			upstreamReq.Body = io.NopCloser(bytes.NewReader(body))
-			upstreamReq.ContentLength = int64(len(body))
-		}
+	// sub2api 账号：注入 session 缓存标识
+	if methodAllowsBody(reqMethod) {
+		body = injectSub2APISession(upstreamReq, body, account)
 	}
 
 	// 发送请求
@@ -106,11 +116,13 @@ func (g *OpenAIGateway) forwardAPIKey(ctx context.Context, req *sdk.ForwardReque
 	defer resp.Body.Close()
 
 	// 上游返回错误时，返回 error 让核心决定是否 failover
-	if resp.StatusCode >= 500 || resp.StatusCode == 429 {
+	if resp.StatusCode >= 500 || resp.StatusCode == 429 || resp.StatusCode == 401 || resp.StatusCode == 403 {
 		respBody, _ := io.ReadAll(resp.Body)
 		return &sdk.ForwardResult{
-			StatusCode: resp.StatusCode,
-			Duration:   time.Since(start),
+			StatusCode:    resp.StatusCode,
+			Duration:      time.Since(start),
+			AccountStatus: accountStatusFromCode(resp.StatusCode),
+			RetryAfter:    extractRetryAfterHeader(resp.Header),
 		}, fmt.Errorf("上游返回 %d: %s", resp.StatusCode, truncate(string(respBody), 200))
 	}
 
@@ -352,11 +364,4 @@ func isSub2APIAccount(account *sdk.Account) bool {
 	}
 	provider := strings.ToLower(strings.TrimSpace(account.Credentials["provider"]))
 	return provider == "sub2api"
-}
-
-func truncate(s string, maxLen int) string {
-	if len(s) <= maxLen {
-		return s
-	}
-	return s[:maxLen] + "..."
 }

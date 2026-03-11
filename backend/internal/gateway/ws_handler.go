@@ -3,35 +3,46 @@ package gateway
 import (
 	"context"
 	"fmt"
+	"net/http"
+	"time"
 
 	sdk "github.com/DouDOU-start/airgate-sdk"
 	"github.com/gorilla/websocket"
 )
 
-// HandleWebSocket 处理入站 WebSocket 连接（实现 sdk.WebSocketHandler）
+// HandleWebSocket 处理入站 WebSocket 连接（实现 sdk.GatewayPlugin）
 // 流程：客户端 WS <-> gRPC 双向流 <-> 插件 <-> 上游 WS
-func (g *OpenAIGateway) HandleWebSocket(ctx context.Context, conn sdk.WebSocketConn) error {
+func (g *OpenAIGateway) HandleWebSocket(ctx context.Context, conn sdk.WebSocketConn) (*sdk.ForwardResult, error) {
+	start := time.Now()
 	info := conn.ConnectInfo()
 	if info.Account == nil {
-		return fmt.Errorf("未提供账户信息")
+		return nil, fmt.Errorf("未提供账户信息")
 	}
 
 	account := info.Account
 
 	// 根据凭证类型选择上游连接方式
+	var err error
 	if account.Credentials["access_token"] != "" {
-		return g.handleWSWithOAuth(ctx, conn, account)
-	}
-	if account.Credentials["api_key"] != "" {
-		return g.handleWSWithAPIKey(ctx, conn, account)
+		err = g.handleWSWithOAuth(ctx, conn, account)
+	} else if account.Credentials["api_key"] != "" {
+		err = g.handleWSWithAPIKey(ctx, conn, account)
+	} else {
+		return nil, fmt.Errorf("账号缺少 api_key 或 access_token")
 	}
 
-	return fmt.Errorf("账号缺少 api_key 或 access_token")
+	result := &sdk.ForwardResult{
+		StatusCode: http.StatusOK,
+		Duration:   time.Since(start),
+	}
+	if err != nil {
+		result.StatusCode = http.StatusBadGateway
+	}
+	return result, err
 }
 
 // handleWSWithOAuth 使用上游 WebSocket 直通（端到端 WS 桥接）
 func (g *OpenAIGateway) handleWSWithOAuth(ctx context.Context, clientConn sdk.WebSocketConn, account *sdk.Account) error {
-	// 连接上游 WS
 	cfg := WSConfig{
 		Token:     account.Credentials["access_token"],
 		AccountID: account.Credentials["chatgpt_account_id"],
@@ -49,9 +60,7 @@ func (g *OpenAIGateway) handleWSWithOAuth(ctx context.Context, clientConn sdk.We
 }
 
 // handleWSWithAPIKey API Key 模式下的 WS 桥接
-// OpenAI API 原生支持 WebSocket（Responses API with websockets beta）
 func (g *OpenAIGateway) handleWSWithAPIKey(ctx context.Context, clientConn sdk.WebSocketConn, account *sdk.Account) error {
-	// API Key 模式：使用 OpenAI 的 WebSocket 端点
 	cfg := WSConfig{
 		Token:    account.Credentials["api_key"],
 		ProxyURL: account.ProxyURL,
@@ -114,7 +123,6 @@ func bridgeWebSocket(ctx context.Context, clientConn sdk.WebSocketConn, upstream
 	case <-ctx.Done():
 		return ctx.Err()
 	case err := <-errCh:
-		// WebSocket 正常关闭不算错误
 		if websocket.IsCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway) {
 			return nil
 		}

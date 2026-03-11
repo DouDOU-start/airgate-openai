@@ -164,13 +164,7 @@ func ParseSSEStream(reader io.Reader, handler WSEventHandler) WSResult {
 			if resp, ok := ev["response"].(map[string]any); ok {
 				mergeResponseMetadata(&result, resp)
 				result.StopReason = jsonString(resp["stop_reason"])
-				if usage, ok := resp["usage"].(map[string]any); ok {
-					result.InputTokens = JsonInt(usage, "input_tokens")
-					result.OutputTokens = JsonInt(usage, "output_tokens")
-					if details, ok := usage["input_tokens_details"].(map[string]any); ok {
-						result.CacheTokens = JsonInt(details, "cached_tokens")
-					}
-				}
+				extractUsageFromResponseMap(&result, resp)
 			}
 			finalizeWSResult(&result, &textBuilder, &reasoningBuilder, start)
 			return result

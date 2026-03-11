@@ -3,7 +3,6 @@ package gateway
 import (
 	"crypto/rand"
 	"encoding/hex"
-	"net/http"
 	"strconv"
 	"strings"
 
@@ -65,11 +64,6 @@ func thinkingBudgetToReasoningEffort(budget int64) string {
 	}
 }
 
-// convertFinishReasonToAnthropic 将 OpenAI finish_reason 转为 Anthropic stop_reason
-func convertFinishReasonToAnthropic(reason string) string {
-	return normalizeAnthropicStopReason(reason)
-}
-
 // normalizeAnthropicStopReason 归一化 OpenAI/Responses stop_reason，输出 Anthropic 兼容值。
 func normalizeAnthropicStopReason(reason string) string {
 	switch normalized := strings.ToLower(strings.TrimSpace(reason)); normalized {
@@ -86,37 +80,6 @@ func normalizeAnthropicStopReason(reason string) string {
 	}
 }
 
-// anthropicErrorType 根据 HTTP 状态码返回 Anthropic 错误类型
-func anthropicErrorType(statusCode int) string {
-	switch statusCode {
-	case 400:
-		return "invalid_request_error"
-	case 401:
-		return "authentication_error"
-	case 403:
-		return "permission_error"
-	case 404:
-		return "not_found_error"
-	case 422:
-		return "invalid_model_error"
-	case 429:
-		return "rate_limit_error"
-	case 529:
-		return "overloaded_error"
-	default:
-		return "api_error"
-	}
-}
-
-// writeAnthropicErrorJSON 纯 sjson 构建并写入 Anthropic 格式错误响应
-func writeAnthropicErrorJSON(w http.ResponseWriter, statusCode int, errType, message string) {
-	out := `{"type":"error","error":{"type":"","message":""}}`
-	out, _ = sjson.Set(out, "error.type", errType)
-	out, _ = sjson.Set(out, "error.message", message)
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(statusCode)
-	_, _ = w.Write([]byte(out))
-}
 
 // ──────────────────────────────────────────────────────
 // 工具名缩短
@@ -213,16 +176,10 @@ func buildToolShortNameMapFromJSON(body []byte) map[string]string {
 	return buildShortNameMap(names)
 }
 
-// buildReverseMapFromAnthropicOriginalToShort 基于原始 Anthropic tools 构建 original->short 映射
-func buildReverseMapFromAnthropicOriginalToShort(original []byte) map[string]string {
-	return buildToolShortNameMapFromJSON(original)
-}
-
-// buildReverseMapFromAnthropicOriginalShortToOriginal 基于原始 Anthropic tools 构建 short->original 映射
-func buildReverseMapFromAnthropicOriginalShortToOriginal(original []byte) map[string]string {
+// buildReverseToolNameMap 基于原始 Anthropic tools 构建 short->original 映射
+func buildReverseToolNameMap(original []byte) map[string]string {
 	rev := map[string]string{}
-	m := buildReverseMapFromAnthropicOriginalToShort(original)
-	for orig, short := range m {
+	for orig, short := range buildToolShortNameMapFromJSON(original) {
 		rev[short] = orig
 	}
 	return rev
