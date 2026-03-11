@@ -22,6 +22,5 @@ backend/internal/gateway/webdist/*
 # 编译产物
 bin/
 
-# Go workspace（本地联调用，不提交）
-go.work
+# Go workspace
 go.work.sum
