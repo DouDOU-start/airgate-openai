@@ -19,6 +19,11 @@ build-backend: ## 构建后端（自动复制前端产物）
 	cp -r web/dist backend/internal/gateway/webdist
 	cd backend && $(GO) build -o ../bin/gateway-openai .
 
+# ===================== 开发 =====================
+
+dev: ## 启动开发服务器
+	cd backend && $(GO) run ./cmd/devserver
+
 # ===================== 质量检查 =====================
 
 lint: ## 代码检查
