@@ -23,7 +23,7 @@ type anthropicModelMapping struct {
 var (
 	defaultClaudeTargetModel = normalizeMappedModelID(
 		firstNonEmptyEnv("AIRGATE_DEFAULT_CLAUDE_MODEL"),
-		"gpt-5.3-codex",
+		"gpt-5.4",
 	)
 	opusTargetModel = resolveRoleTargetModel(
 		defaultClaudeTargetModel,
@@ -40,10 +40,25 @@ var (
 		"AIRGATE_MODEL_HAIKU",
 		"ANTHROPIC_DEFAULT_HAIKU_MODEL",
 	)
-	// haikuFallbackModel Haiku 降级模型：当 spark 不可用时回退到 codex
+	// haikuFallbackModel Haiku 降级模型：当主模型不可用时回退
 	haikuFallbackModel = resolveRoleTargetModel(
-		defaultClaudeTargetModel,
+		"gpt-5-mini",
 		"AIRGATE_MODEL_HAIKU_FALLBACK",
+	)
+	// opusFallbackModel Opus 降级模型：普通账号不支持 gpt-5.4 时回退
+	opusFallbackModel = resolveRoleTargetModel(
+		"gpt-5.2",
+		"AIRGATE_MODEL_OPUS_FALLBACK",
+	)
+	// sonnetFallbackModel Sonnet 降级模型
+	sonnetFallbackModel = resolveRoleTargetModel(
+		"gpt-5.2",
+		"AIRGATE_MODEL_SONNET_FALLBACK",
+	)
+	// defaultFallbackModel 兜底降级模型
+	defaultFallbackModel = resolveRoleTargetModel(
+		"gpt-5.2",
+		"AIRGATE_MODEL_DEFAULT_FALLBACK",
 	)
 	// sparkTargetModel 简单操作加速模型（Read/Grep/Glob 结果处理时自动路由）
 	// 空字符串表示禁用 Spark 路由
@@ -56,15 +71,15 @@ var (
 // anthropicModelMappings Claude 模型名 → OpenAI 模型映射表
 // 精确匹配优先，通配符匹配其次
 var anthropicModelMappings = map[string]anthropicModelMapping{
-	// Opus → 最高推理（默认 xhigh，客户端 thinking 可覆盖）
-	"claude-opus-4-6": {OpenAIModel: opusTargetModel, ReasoningEffort: "xhigh"},
-	"claude-opus-4-5": {OpenAIModel: opusTargetModel, ReasoningEffort: "xhigh"},
+	// Opus → 最高推理，普通账号降级到 gpt-5.2
+	"claude-opus-4-6": {OpenAIModel: opusTargetModel, FallbackModel: opusFallbackModel, ReasoningEffort: "xhigh"},
+	"claude-opus-4-5": {OpenAIModel: opusTargetModel, FallbackModel: opusFallbackModel, ReasoningEffort: "xhigh"},
 
-	// Sonnet → 高推理
-	"claude-sonnet-4-6": {OpenAIModel: sonnetTargetModel, ReasoningEffort: "high"},
-	"claude-sonnet-4-5": {OpenAIModel: sonnetTargetModel, ReasoningEffort: "high"},
+	// Sonnet → 高推理，普通账号降级到 gpt-5.2
+	"claude-sonnet-4-6": {OpenAIModel: sonnetTargetModel, FallbackModel: sonnetFallbackModel, ReasoningEffort: "high"},
+	"claude-sonnet-4-5": {OpenAIModel: sonnetTargetModel, FallbackModel: sonnetFallbackModel, ReasoningEffort: "high"},
 
-	// Haiku → Spark 快速模型，低推理，不可用时降级到 codex
+	// Haiku → 快速模型，不可用时降级到 gpt-5.3-codex-spark
 	"claude-haiku-4-6": {OpenAIModel: haikuTargetModel, FallbackModel: haikuFallbackModel, ReasoningEffort: "low"},
 	"claude-haiku-4-5": {OpenAIModel: haikuTargetModel, FallbackModel: haikuFallbackModel, ReasoningEffort: "low"},
 }
@@ -79,19 +94,19 @@ var anthropicWildcardMappings = []struct {
 	// claude-haiku-4-5-* 所有变体（如 claude-haiku-4-5-20251001）
 	{"claude-haiku-4-5", anthropicModelMapping{OpenAIModel: haikuTargetModel, FallbackModel: haikuFallbackModel, ReasoningEffort: "low"}},
 	// claude-sonnet-4- 所有变体
-	{"claude-sonnet-4-", anthropicModelMapping{OpenAIModel: sonnetTargetModel, ReasoningEffort: "high"}},
+	{"claude-sonnet-4-", anthropicModelMapping{OpenAIModel: sonnetTargetModel, FallbackModel: sonnetFallbackModel, ReasoningEffort: "high"}},
 	// claude-opus-4- 所有变体
-	{"claude-opus-4-", anthropicModelMapping{OpenAIModel: opusTargetModel, ReasoningEffort: "xhigh"}},
+	{"claude-opus-4-", anthropicModelMapping{OpenAIModel: opusTargetModel, FallbackModel: opusFallbackModel, ReasoningEffort: "xhigh"}},
 	// claude-haiku- 所有变体
 	{"claude-haiku-", anthropicModelMapping{OpenAIModel: haikuTargetModel, FallbackModel: haikuFallbackModel, ReasoningEffort: "low"}},
 	// claude-3.5/3 系列兜底
-	{"claude-3", anthropicModelMapping{OpenAIModel: defaultClaudeTargetModel, ReasoningEffort: ""}},
+	{"claude-3", anthropicModelMapping{OpenAIModel: defaultClaudeTargetModel, FallbackModel: defaultFallbackModel, ReasoningEffort: ""}},
 	// 兜底：所有 claude- 前缀
-	{"claude-", anthropicModelMapping{OpenAIModel: defaultClaudeTargetModel, ReasoningEffort: ""}},
+	{"claude-", anthropicModelMapping{OpenAIModel: defaultClaudeTargetModel, FallbackModel: defaultFallbackModel, ReasoningEffort: ""}},
 }
 
-// defaultModelMapping 兜底映射：不认识的模型统一用 gpt-5.3-codex
-var defaultModelMapping = anthropicModelMapping{OpenAIModel: defaultClaudeTargetModel, ReasoningEffort: ""}
+// defaultModelMapping 兜底映射：不认识的模型统一用 gpt-5.4，普通账号降级到 gpt-5.2
+var defaultModelMapping = anthropicModelMapping{OpenAIModel: defaultClaudeTargetModel, FallbackModel: defaultFallbackModel, ReasoningEffort: ""}
 
 func resolveRoleTargetModel(fallback string, keys ...string) string {
 	return normalizeMappedModelID(firstNonEmptyEnv(keys...), fallback)
