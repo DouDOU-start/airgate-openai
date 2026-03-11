@@ -15,16 +15,17 @@ import (
 const generatedComment = "# 本文件由 backend/cmd/genmanifest 自动生成，请勿手工修改。\n\n"
 
 type manifest struct {
-	ID             string           `yaml:"id"`
-	Name           string           `yaml:"name"`
-	Version        string           `yaml:"version"`
-	Description    string           `yaml:"description"`
-	Author         string           `yaml:"author"`
-	Type           string           `yaml:"type"`
-	MinCoreVersion string           `yaml:"min_core_version"`
-	Dependencies   []string         `yaml:"dependencies"`
-	Config         []configField    `yaml:"config,omitempty"`
-	Gateway        *gatewayManifest `yaml:"gateway,omitempty"`
+	ID              string            `yaml:"id"`
+	Name            string            `yaml:"name"`
+	Version         string            `yaml:"version"`
+	Description     string            `yaml:"description"`
+	Author          string            `yaml:"author"`
+	Type            string            `yaml:"type"`
+	MinCoreVersion  string            `yaml:"min_core_version"`
+	Dependencies    []string          `yaml:"dependencies"`
+	Config          []configField     `yaml:"config,omitempty"`
+	FrontendWidgets []frontendWidget  `yaml:"frontend_widgets,omitempty"`
+	Gateway         *gatewayManifest  `yaml:"gateway,omitempty"`
 }
 
 type gatewayManifest struct {
@@ -73,6 +74,12 @@ type configField struct {
 	Required    bool   `yaml:"required"`
 }
 
+type frontendWidget struct {
+	Slot      string `yaml:"slot"`
+	EntryFile string `yaml:"entry_file"`
+	Title     string `yaml:"title"`
+}
+
 func main() {
 	content, err := renderManifest()
 	if err != nil {
@@ -99,14 +106,15 @@ func renderManifest() ([]byte, error) {
 	info := plugin.Info()
 
 	doc := manifest{
-		ID:             info.ID,
-		Name:           info.Name,
-		Version:        info.Version,
-		Description:    info.Description,
-		Author:         info.Author,
-		Type:           string(info.Type),
-		MinCoreVersion: gateway.PluginMinCoreVersion,
-		Dependencies:   gateway.PluginDependencies(),
+		ID:              info.ID,
+		Name:            info.Name,
+		Version:         info.Version,
+		Description:     info.Description,
+		Author:          info.Author,
+		Type:            string(info.Type),
+		MinCoreVersion:  gateway.PluginMinCoreVersion,
+		Dependencies:    gateway.PluginDependencies(),
+		FrontendWidgets: convertFrontendWidgets(info.FrontendWidgets),
 		Gateway: &gatewayManifest{
 			Platform:     plugin.Platform(),
 			Mode:         gateway.PluginMode,
@@ -175,6 +183,18 @@ func convertAccountTypes(types []sdk.AccountType) []accountType {
 			Label:       item.Label,
 			Description: item.Description,
 			Fields:      convertCredentialFields(item.Fields),
+		})
+	}
+	return items
+}
+
+func convertFrontendWidgets(widgets []sdk.FrontendWidget) []frontendWidget {
+	items := make([]frontendWidget, 0, len(widgets))
+	for _, w := range widgets {
+		items = append(items, frontendWidget{
+			Slot:      w.Slot,
+			EntryFile: w.EntryFile,
+			Title:     w.Title,
 		})
 	}
 	return items

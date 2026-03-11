@@ -8,6 +8,10 @@ author: airgate
 type: gateway
 min_core_version: 1.0.0
 dependencies: []
+frontend_widgets:
+  - slot: account-form
+    entry_file: index.js
+    title: 账号表单
 gateway:
   platform: openai
   mode: simple

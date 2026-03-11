@@ -1,4 +1,4 @@
-package main
+package gateway
 
 import (
 	"context"
@@ -7,23 +7,29 @@ import (
 	"log"
 	"net/http"
 
-	"github.com/DouDOU-start/airgate-openai/backend/internal/gateway"
+	"github.com/DouDOU-start/airgate-sdk/devserver"
 )
 
-// OAuthDevHandler 处理 devserver 的 OAuth 路由
+// OAuthDevHandler devserver 的 OAuth HTTP handler
 type OAuthDevHandler struct {
-	gateway *gateway.OpenAIGateway
-	store   *AccountStore
+	Gateway *OpenAIGateway
+	Store   *devserver.AccountStore
 }
 
-// HandleStart 处理 POST /api/oauth/start，返回授权链接
-func (h *OAuthDevHandler) HandleStart(w http.ResponseWriter, r *http.Request) {
+// RegisterRoutes 注册 OAuth 路由到 mux
+func (h *OAuthDevHandler) RegisterRoutes(mux *http.ServeMux) {
+	mux.HandleFunc("/api/oauth/start", h.handleStart)
+	mux.HandleFunc("/api/oauth/callback", h.handleCallback)
+}
+
+// handleStart 处理 POST /api/oauth/start，返回授权链接
+func (h *OAuthDevHandler) handleStart(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
 		return
 	}
 
-	resp, err := h.gateway.StartOAuth(context.Background(), &gateway.OAuthStartRequest{})
+	resp, err := h.Gateway.StartOAuth(context.Background(), &OAuthStartRequest{})
 	if err != nil {
 		log.Printf("StartOAuth 失败: %v", err)
 		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusInternalServerError)
@@ -37,11 +43,8 @@ func (h *OAuthDevHandler) HandleStart(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// HandleCallback 处理 POST /api/oauth/callback
-// 用户授权后浏览器会跳转到 localhost:1455/auth/callback?code=xxx&state=yyy
-// 由于没有监听 1455，页面会报错，但用户可以从地址栏复制完整 URL
-// 前端解析 URL 中的 code 和 state 提交到此接口完成 token 交换
-func (h *OAuthDevHandler) HandleCallback(w http.ResponseWriter, r *http.Request) {
+// handleCallback 处理 POST /api/oauth/callback
+func (h *OAuthDevHandler) handleCallback(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
 		return
@@ -56,7 +59,7 @@ func (h *OAuthDevHandler) HandleCallback(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	result, err := h.gateway.HandleOAuthCallback(context.Background(), &gateway.OAuthCallbackRequest{
+	result, err := h.Gateway.HandleOAuthCallback(context.Background(), &OAuthCallbackRequest{
 		Code:  body.Code,
 		State: body.State,
 	})
@@ -66,12 +69,11 @@ func (h *OAuthDevHandler) HandleCallback(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	// 自动创建账号
 	name := result.AccountName
 	if name == "" {
 		name = "OAuth 账号"
 	}
-	account := h.store.Create(DevAccount{
+	account := h.Store.Create(devserver.DevAccount{
 		Name:        name,
 		AccountType: result.AccountType,
 		Credentials: result.Credentials,
