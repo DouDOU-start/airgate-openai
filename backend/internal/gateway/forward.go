@@ -105,6 +105,11 @@ func (g *OpenAIGateway) forwardAPIKey(ctx context.Context, req *sdk.ForwardReque
 		resp = enrichModelsResponse(resp)
 	}
 
+	// 捕获上游 Codex 用量头
+	if snapshot := parseCodexUsageFromHeaders(resp.Header); snapshot != nil {
+		StoreCodexUsage(account.ID, snapshot)
+	}
+
 	// 流式 / 非流式响应处理
 	if req.Stream && req.Writer != nil {
 		return handleStreamResponse(resp, req.Writer, start)
@@ -221,7 +226,7 @@ func (g *OpenAIGateway) forwardOAuth(ctx context.Context, req *sdk.ForwardReques
 	}
 
 	// 读取 WS 消息，转为 SSE 写回客户端
-	handler := &sseEventWriter{w: w}
+	handler := &sseEventWriter{w: w, accountID: account.ID}
 	if f, ok := w.(http.Flusher); ok {
 		handler.flusher = f
 	}
@@ -255,21 +260,34 @@ func (g *OpenAIGateway) forwardOAuth(ctx context.Context, req *sdk.ForwardReques
 
 // sseEventWriter 将 WS 事件转为 SSE 格式写入 http.ResponseWriter
 type sseEventWriter struct {
-	w       http.ResponseWriter
-	flusher http.Flusher
+	w         http.ResponseWriter
+	flusher   http.Flusher
+	accountID int64 // 用于存储 Codex 用量快照
 }
 
 func (s *sseEventWriter) OnTextDelta(string)      {}
 func (s *sseEventWriter) OnReasoningDelta(string) {}
-func (s *sseEventWriter) OnRateLimits(float64)    {}
+func (s *sseEventWriter) OnRateLimits(used float64) {
+	if s.accountID > 0 {
+		StoreCodexUsage(s.accountID, &CodexUsageSnapshot{
+			PrimaryUsedPercent: used,
+			CapturedAt:         time.Now(),
+		})
+	}
+}
 
 func (s *sseEventWriter) OnRawEvent(eventType string, data []byte) {
 	if s.w == nil || eventType == "" {
 		return
 	}
-	// 过滤不需要转发给客户端的内部事件
+	// 过滤不需要转发给客户端的内部事件，并捕获用量
 	switch eventType {
 	case "codex.rate_limits":
+		if s.accountID > 0 {
+			if snapshot := parseCodexUsageFromSSEEvent(data); snapshot != nil {
+				StoreCodexUsage(s.accountID, snapshot)
+			}
+		}
 		return
 	}
 	if _, err := fmt.Fprintf(s.w, "event: %s\ndata: %s\n\n", eventType, strings.ReplaceAll(string(data), "\n", "")); err != nil {

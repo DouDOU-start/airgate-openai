@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"strconv"
+	"strings"
 
 	"github.com/DouDOU-start/airgate-sdk/devserver"
 )
@@ -20,6 +22,8 @@ type OAuthDevHandler struct {
 func (h *OAuthDevHandler) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/api/oauth/start", h.handleStart)
 	mux.HandleFunc("/api/oauth/callback", h.handleCallback)
+	mux.HandleFunc("/api/accounts/quota/", h.handleQuota)
+	mux.HandleFunc("/api/accounts/usage/", h.handleUsage)
 }
 
 // handleStart 处理 POST /api/oauth/start，返回授权链接
@@ -90,4 +94,109 @@ func (h *OAuthDevHandler) handleCallback(w http.ResponseWriter, r *http.Request)
 	}); err != nil {
 		log.Printf("编码 OAuth callback 响应失败: %v", err)
 	}
+}
+
+// handleQuota 处理 GET /api/accounts/quota/{id}，查询账号订阅信息
+func (h *OAuthDevHandler) handleQuota(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
+		return
+	}
+
+	// 从路径提取账号 ID
+	idStr := strings.TrimPrefix(r.URL.Path, "/api/accounts/quota/")
+	id, err := strconv.ParseInt(idStr, 10, 64)
+	if err != nil {
+		http.Error(w, `{"error":"invalid account id"}`, http.StatusBadRequest)
+		return
+	}
+
+	account := h.Store.Get(id)
+	if account == nil {
+		http.Error(w, `{"error":"account not found"}`, http.StatusNotFound)
+		return
+	}
+
+	// 优先尝试实时查询（通过刷新 token）
+	quota, queryErr := h.Gateway.QueryQuota(context.Background(), account.Credentials)
+	if queryErr == nil && quota != nil {
+		// 查询成功，更新存储中的凭证（token 可能已刷新）
+		updated := false
+		if newAT := quota.Extra["access_token"]; newAT != "" && newAT != account.Credentials["access_token"] {
+			account.Credentials["access_token"] = newAT
+			updated = true
+		}
+		if newRT := quota.Extra["refresh_token"]; newRT != "" && newRT != account.Credentials["refresh_token"] {
+			account.Credentials["refresh_token"] = newRT
+			updated = true
+		}
+		if pt := quota.Extra["plan_type"]; pt != "" {
+			account.Credentials["plan_type"] = pt
+			updated = true
+		}
+		if quota.ExpiresAt != "" {
+			account.Credentials["subscription_active_until"] = quota.ExpiresAt
+			updated = true
+		}
+		if updated {
+			h.Store.Update(id, *account)
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"plan_type":                 quota.Extra["plan_type"],
+			"subscription_active_until": quota.ExpiresAt,
+			"source":                    "realtime",
+		})
+		return
+	}
+
+	// 实时查询失败，回退到 credentials 中的缓存值
+	log.Printf("实时查询额度失败 (id=%d): %v，使用缓存值", id, queryErr)
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		"plan_type":                 account.Credentials["plan_type"],
+		"subscription_active_until": account.Credentials["subscription_active_until"],
+		"source":                    "cached",
+	})
+}
+
+// handleUsage 处理 GET /api/accounts/usage/{id}，返回 Codex 用量快照
+// 如果内存中没有缓存，主动发一个轻量探测请求来获取用量头
+func (h *OAuthDevHandler) handleUsage(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
+		return
+	}
+
+	idStr := strings.TrimPrefix(r.URL.Path, "/api/accounts/usage/")
+	id, err := strconv.ParseInt(idStr, 10, 64)
+	if err != nil {
+		http.Error(w, `{"error":"invalid account id"}`, http.StatusBadRequest)
+		return
+	}
+
+	account := h.Store.Get(id)
+	if account == nil {
+		http.Error(w, `{"error":"account not found"}`, http.StatusNotFound)
+		return
+	}
+
+	// 先检查缓存，无缓存时主动探测
+	snapshot := GetCodexUsage(id)
+	if snapshot == nil {
+		snapshot = h.Gateway.ProbeUsage(r.Context(), id, account.Credentials)
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	if snapshot == nil {
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"available": false,
+		})
+		return
+	}
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		"available": true,
+		"usage":     snapshot,
+	})
 }

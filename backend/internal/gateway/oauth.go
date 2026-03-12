@@ -136,23 +136,33 @@ func (g *OpenAIGateway) HandleOAuthCallback(ctx context.Context, req *OAuthCallb
 		return nil, fmt.Errorf("token 交换失败: %w", err)
 	}
 
-	// 解析 id_token JWT payload 提取用户信息
-	accountID, accountName := parseIDToken(tokens.IDToken)
+	// 解析 id_token JWT payload 提取用户信息和订阅状态
+	info := parseIDToken(tokens.IDToken)
 
 	credentials := map[string]string{
 		"access_token":  tokens.AccessToken,
 		"refresh_token": tokens.RefreshToken,
 	}
-	if accountID != "" {
-		credentials["chatgpt_account_id"] = accountID
+	if info.AccountID != "" {
+		credentials["chatgpt_account_id"] = info.AccountID
+	}
+	if info.PlanType != "" {
+		credentials["plan_type"] = info.PlanType
+	}
+	if info.SubscriptionActiveUntil != "" {
+		credentials["subscription_active_until"] = info.SubscriptionActiveUntil
 	}
 
-	g.logger.Info("OAuth 授权成功", "account_name", accountName, "account_id", accountID)
+	g.logger.Info("OAuth 授权成功",
+		"account_name", info.AccountName,
+		"account_id", info.AccountID,
+		"plan_type", info.PlanType,
+	)
 
 	return &OAuthResult{
 		AccountType: "oauth",
 		Credentials: credentials,
-		AccountName: accountName,
+		AccountName: info.AccountName,
 	}, nil
 }
 
@@ -219,15 +229,24 @@ func (g *OpenAIGateway) exchangeCodeForTokens(ctx context.Context, callbackURL, 
 	return &tokens, nil
 }
 
-// parseIDToken 解码 JWT payload（不验签），提取 chatgpt_account_id 和用户名
-func parseIDToken(idToken string) (accountID, accountName string) {
+// idTokenInfo 从 id_token 中解析出的用户和订阅信息
+type idTokenInfo struct {
+	AccountID               string
+	AccountName             string
+	PlanType                string // free / plus / pro / team
+	SubscriptionActiveUntil string // ISO 8601 格式
+}
+
+// parseIDToken 解码 JWT payload（不验签），提取账号信息和订阅状态
+func parseIDToken(idToken string) *idTokenInfo {
+	info := &idTokenInfo{}
 	if idToken == "" {
-		return "", ""
+		return info
 	}
 
 	parts := strings.Split(idToken, ".")
 	if len(parts) != 3 {
-		return "", ""
+		return info
 	}
 
 	// 解码 payload（base64url，可能缺 padding）
@@ -237,34 +256,87 @@ func parseIDToken(idToken string) (accountID, accountName string) {
 	}
 	data, err := base64.URLEncoding.DecodeString(payload)
 	if err != nil {
-		return "", ""
+		return info
 	}
 
 	var claims map[string]interface{}
 	if err := json.Unmarshal(data, &claims); err != nil {
-		return "", ""
+		return info
 	}
 
 	// 直接取 chatgpt_account_id
 	if id, ok := claims["chatgpt_account_id"].(string); ok {
-		accountID = id
+		info.AccountID = id
 	}
 
 	// 尝试从嵌套的 auth claims 中取
 	if authClaims, ok := claims["https://api.openai.com/auth"].(map[string]interface{}); ok {
-		if id, ok := authClaims["chatgpt_account_id"].(string); ok && accountID == "" {
-			accountID = id
+		if id, ok := authClaims["chatgpt_account_id"].(string); ok && info.AccountID == "" {
+			info.AccountID = id
+		}
+		if pt, ok := authClaims["chatgpt_plan_type"].(string); ok {
+			info.PlanType = pt
+		}
+		if until := authClaims["chatgpt_subscription_active_until"]; until != nil {
+			info.SubscriptionActiveUntil = fmt.Sprintf("%v", until)
 		}
 	}
 
 	// 用户名：优先 name，其次 email
 	if name, ok := claims["name"].(string); ok && name != "" {
-		accountName = name
+		info.AccountName = name
 	} else if email, ok := claims["email"].(string); ok && email != "" {
-		accountName = email
+		info.AccountName = email
 	}
 
-	return accountID, accountName
+	return info
+}
+
+// refreshTokens 使用 refresh_token 刷新获取新的 token 组
+func (g *OpenAIGateway) refreshTokens(ctx context.Context, refreshToken, proxyURL string) (*tokenResponse, error) {
+	form := url.Values{}
+	form.Set("grant_type", "refresh_token")
+	form.Set("refresh_token", refreshToken)
+	form.Set("client_id", oauthClientID)
+
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost,
+		oauthTokenURL, strings.NewReader(form.Encode()))
+	if err != nil {
+		return nil, err
+	}
+	httpReq.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+
+	client := g.buildHTTPClient(&sdk.Account{ProxyURL: proxyURL})
+	resp, err := client.Do(httpReq)
+	if err != nil {
+		return nil, fmt.Errorf("请求 token 端点失败: %w", err)
+	}
+	defer func() {
+		_ = resp.Body.Close()
+	}()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("读取响应失败: %w", err)
+	}
+
+	var tokens tokenResponse
+	if err := json.Unmarshal(body, &tokens); err != nil {
+		return nil, fmt.Errorf("解析 token 响应失败: %w", err)
+	}
+
+	if resp.StatusCode >= 400 {
+		msg := tokens.Description
+		if msg == "" {
+			msg = tokens.Error
+		}
+		if msg == "" {
+			msg = fmt.Sprintf("刷新 token 失败: %d", resp.StatusCode)
+		}
+		return nil, fmt.Errorf("%s", msg)
+	}
+
+	return &tokens, nil
 }
 
 // generatePKCE 生成 PKCE code_verifier 和 code_challenge (S256)
