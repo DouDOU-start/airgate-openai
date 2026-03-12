@@ -1,4 +1,5 @@
 import { useState, useCallback } from 'react';
+import { cssVar } from '@airgate/theme';
 
 /** 账号表单 Props（由核心 AccountsPage 注入） */
 export interface AccountFormProps {
@@ -18,15 +19,23 @@ export interface AccountFormProps {
   };
 }
 
+/** 订阅计划显示名称和颜色映射 */
+const planDisplayMap: Record<string, { label: string; color: string; bg: string }> = {
+  free: { label: 'Free', color: '#6b7280', bg: '#f3f4f6' },
+  plus: { label: 'Plus', color: '#059669', bg: '#d1fae5' },
+  pro: { label: 'Pro', color: '#7c3aed', bg: '#ede9fe' },
+  team: { label: 'Team', color: '#2563eb', bg: '#dbeafe' },
+};
+
 const inputStyle: React.CSSProperties = {
   display: 'block',
   width: '100%',
-  borderRadius: 'var(--ag-radius-md, 0.5rem)',
-  border: '1px solid var(--ag-glass-border, #2a3050)',
-  backgroundColor: 'var(--ag-bg-surface, #1c2237)',
+  borderRadius: cssVar('radiusMd'),
+  border: `1px solid ${cssVar('glassBorder')}`,
+  backgroundColor: cssVar('bgSurface'),
   padding: '0.5rem 0.75rem',
   fontSize: '0.875rem',
-  color: 'var(--ag-text, #e8ecf4)',
+  color: cssVar('text'),
   outline: 'none',
   transition: 'border-color 0.2s, box-shadow 0.2s',
 };
@@ -35,15 +44,15 @@ const labelStyle: React.CSSProperties = {
   display: 'block',
   fontSize: '0.75rem',
   fontWeight: 500,
-  color: 'var(--ag-text-secondary, #8892a8)',
+  color: cssVar('textSecondary'),
   textTransform: 'uppercase',
   letterSpacing: '0.05em',
   marginBottom: '0.375rem',
 };
 
 const cardStyle: React.CSSProperties = {
-  border: '1px solid var(--ag-glass-border, #2a3050)',
-  borderRadius: 'var(--ag-radius-lg, 0.75rem)',
+  border: `1px solid ${cssVar('glassBorder')}`,
+  borderRadius: cssVar('radiusLg'),
   padding: '1rem',
   cursor: 'pointer',
   transition: 'border-color 0.2s, background-color 0.2s',
@@ -51,13 +60,13 @@ const cardStyle: React.CSSProperties = {
 
 const cardActiveStyle: React.CSSProperties = {
   ...cardStyle,
-  borderColor: 'var(--ag-primary, #3b82f6)',
-  backgroundColor: 'var(--ag-primary-subtle, rgba(59,130,246,0.08))',
+  borderColor: cssVar('primary'),
+  backgroundColor: cssVar('primarySubtle'),
 };
 
 const descStyle: React.CSSProperties = {
   fontSize: '0.75rem',
-  color: 'var(--ag-text-tertiary, #5a637a)',
+  color: cssVar('textTertiary'),
   marginTop: '0.25rem',
 };
 
@@ -67,6 +76,24 @@ function detectType(credentials: Record<string, string>): AccountType | '' {
   if (credentials.api_key) return 'apikey';
   if (credentials.access_token) return 'oauth';
   return '';
+}
+
+/** 从 JWT access_token 中解析订阅信息（不验签） */
+function parseJWTSubscription(token: string): { planType: string; subscriptionUntil: string } {
+  try {
+    const parts = token.split('.');
+    if (parts.length !== 3) return { planType: '', subscriptionUntil: '' };
+    const payload = JSON.parse(atob(parts[1].replace(/-/g, '+').replace(/_/g, '/')));
+    const auth = payload['https://api.openai.com/auth'] || {};
+    return {
+      planType: auth.chatgpt_plan_type || '',
+      subscriptionUntil: auth.chatgpt_subscription_active_until
+        ? String(auth.chatgpt_subscription_active_until)
+        : '',
+    };
+  } catch {
+    return { planType: '', subscriptionUntil: '' };
+  }
 }
 
 export function AccountForm({
@@ -86,6 +113,13 @@ export function AccountForm({
   const [oauthLoading, setOAuthLoading] = useState(false);
   const [oauthStatus, setOAuthStatus] = useState<{ type: 'info' | 'success' | 'error'; text: string } | null>(null);
   const accountType = (propType as AccountType | undefined) ?? localType;
+
+  // 从 credentials 中读取订阅信息，没有则从 access_token JWT 解析
+  const jwtInfo = (!credentials.plan_type && credentials.access_token)
+    ? parseJWTSubscription(credentials.access_token)
+    : null;
+  const planType = credentials.plan_type || jwtInfo?.planType || '';
+  const subscriptionUntil = credentials.subscription_active_until || jwtInfo?.subscriptionUntil || '';
 
   const updateField = useCallback(
     (key: string, value: string) => {
@@ -168,11 +202,11 @@ export function AccountForm({
         <span style={labelStyle}>账号类型 *</span>
         <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '0.75rem' }}>
           <div style={accountType === 'apikey' ? cardActiveStyle : cardStyle} onClick={() => handleTypeChange('apikey')}>
-            <div style={{ fontSize: '0.875rem', fontWeight: 500, color: 'var(--ag-text, #e8ecf4)' }}>API Key</div>
+            <div style={{ fontSize: '0.875rem', fontWeight: 500, color: cssVar('text') }}>API Key</div>
             <div style={descStyle}>支持所有 Responses 标准接口</div>
           </div>
           <div style={accountType === 'oauth' ? cardActiveStyle : cardStyle} onClick={() => handleTypeChange('oauth')}>
-            <div style={{ fontSize: '0.875rem', fontWeight: 500, color: 'var(--ag-text, #e8ecf4)' }}>OAuth 登录</div>
+            <div style={{ fontSize: '0.875rem', fontWeight: 500, color: cssVar('text') }}>OAuth 登录</div>
             <div style={descStyle}>通过浏览器授权登录</div>
           </div>
         </div>
@@ -182,7 +216,7 @@ export function AccountForm({
         <>
           <div>
             <label style={labelStyle}>
-              API Key <span style={{ color: 'var(--ag-danger, #ef4444)' }}>*</span>
+              API Key <span style={{ color: cssVar('danger') }}>*</span>
             </label>
             <input
               type="password"
@@ -210,9 +244,48 @@ export function AccountForm({
 
       {accountType === 'oauth' && (
         <>
+          {/* 订阅信息展示 */}
+          {(planType || subscriptionUntil) && (
+            <div style={{
+              border: `1px solid ${cssVar('glassBorder')}`,
+              borderRadius: cssVar('radiusLg'),
+              padding: '0.875rem 1rem',
+              backgroundColor: cssVar('bgSurface'),
+              display: 'flex',
+              alignItems: 'center',
+              gap: '0.75rem',
+              flexWrap: 'wrap',
+            }}>
+              <div style={{ fontSize: '0.75rem', fontWeight: 500, color: cssVar('textSecondary'), textTransform: 'uppercase', letterSpacing: '0.05em' }}>
+                订阅
+              </div>
+              {planType && (() => {
+                const plan = planDisplayMap[planType] || { label: planType, color: cssVar('text'), bg: cssVar('bgSurface') };
+                return (
+                  <span style={{
+                    display: 'inline-block',
+                    padding: '0.125rem 0.5rem',
+                    borderRadius: '9999px',
+                    fontSize: '0.75rem',
+                    fontWeight: 600,
+                    color: plan.color,
+                    backgroundColor: plan.bg,
+                  }}>
+                    {plan.label}
+                  </span>
+                );
+              })()}
+              {subscriptionUntil && (
+                <span style={{ fontSize: '0.75rem', color: cssVar('textTertiary') }}>
+                  有效期至 {subscriptionUntil}
+                </span>
+              )}
+            </div>
+          )}
+
           {oauth && (
-            <div style={{ border: '1px solid var(--ag-glass-border, #2a3050)', borderRadius: 'var(--ag-radius-lg, 0.75rem)', padding: '1rem', backgroundColor: 'var(--ag-bg-surface, #1c2237)' }}>
-              <div style={{ fontSize: '0.875rem', fontWeight: 600, color: 'var(--ag-text, #e8ecf4)', marginBottom: '0.25rem' }}>
+            <div style={{ border: `1px solid ${cssVar('glassBorder')}`, borderRadius: cssVar('radiusLg'), padding: '1rem', backgroundColor: cssVar('bgSurface') }}>
+              <div style={{ fontSize: '0.875rem', fontWeight: 600, color: cssVar('text'), marginBottom: '0.25rem' }}>
                 OAuth 授权辅助
               </div>
               <div style={{ ...descStyle, marginTop: 0, marginBottom: '0.75rem' }}>
@@ -226,7 +299,7 @@ export function AccountForm({
                   style={{
                     ...inputStyle,
                     cursor: oauthLoading ? 'not-allowed' : 'pointer',
-                    backgroundColor: 'var(--ag-primary, #3b82f6)',
+                    backgroundColor: cssVar('primary'),
                     color: 'white',
                     border: 'none',
                     fontWeight: 500,
@@ -244,7 +317,7 @@ export function AccountForm({
                     ...inputStyle,
                     cursor: !authorizeURL || oauthLoading ? 'not-allowed' : 'pointer',
                     backgroundColor: 'transparent',
-                    color: 'var(--ag-text, #e8ecf4)',
+                    color: cssVar('text'),
                     width: 'auto',
                     opacity: !authorizeURL || oauthLoading ? 0.6 : 1,
                   }}
@@ -257,7 +330,7 @@ export function AccountForm({
                 <textarea
                   style={{ ...inputStyle, minHeight: '76px', resize: 'vertical' }}
                   readOnly
-                  placeholder="点击“生成授权链接”后，这里会显示完整授权地址"
+                  placeholder='点击"生成授权链接"后，这里会显示完整授权地址'
                   value={authorizeURL}
                 />
               </div>
@@ -279,8 +352,8 @@ export function AccountForm({
                     ...inputStyle,
                     cursor: !callbackURL.trim() || oauthLoading ? 'not-allowed' : 'pointer',
                     backgroundColor: 'transparent',
-                    color: 'var(--ag-primary, #3b82f6)',
-                    border: '1px solid var(--ag-primary, #3b82f6)',
+                    color: cssVar('primary'),
+                    border: `1px solid ${cssVar('primary')}`,
                     width: 'auto',
                     opacity: !callbackURL.trim() || oauthLoading ? 0.6 : 1,
                   }}
@@ -293,10 +366,10 @@ export function AccountForm({
                       fontSize: '0.75rem',
                       color:
                         oauthStatus.type === 'error'
-                          ? 'var(--ag-danger, #ef4444)'
+                          ? cssVar('danger')
                           : oauthStatus.type === 'success'
-                            ? '#4ade80'
-                            : 'var(--ag-text-secondary, #8892a8)',
+                            ? cssVar('success')
+                            : cssVar('textSecondary'),
                     }}
                   >
                     {oauthStatus.text}
@@ -308,7 +381,7 @@ export function AccountForm({
 
           <div>
             <label style={labelStyle}>
-              Access Token {!oauth && <span style={{ color: 'var(--ag-danger, #ef4444)' }}>*</span>}
+              Access Token {!oauth && <span style={{ color: cssVar('danger') }}>*</span>}
             </label>
             <input
               type="password"
