@@ -114,22 +114,24 @@ func (g *OpenAIGateway) forwardAnthropicMessage(ctx context.Context, req *sdk.Fo
 		fallbackModel = mapping.FallbackModel
 	}
 
-	return g.doAnthropicForward(ctx, req, responsesBody, originalModel, fallbackModel, start)
+	return g.doAnthropicForward(ctx, req, responsesBody, originalModel, modelName, fallbackModel, start)
 }
 
 // doAnthropicForward 执行 Anthropic 转发，支持模型降级重试
+// mappedModel: 映射后的 GPT 模型名，用于 Core 计费（写入 result.Model）
 func (g *OpenAIGateway) doAnthropicForward(
 	ctx context.Context,
 	req *sdk.ForwardRequest,
 	responsesBody []byte,
 	originalModel string,
+	mappedModel string,
 	fallbackModel string,
 	start time.Time,
 ) (*sdk.ForwardResult, error) {
 	hasFallback := fallbackModel != ""
 
 	// 第一次转发（有 fallback 时抑制错误写入客户端）
-	result, errBody, err := g.forwardAnthropicResponses(ctx, req, responsesBody, originalModel, start, req.Writer, hasFallback)
+	result, errBody, err := g.forwardAnthropicResponses(ctx, req, responsesBody, originalModel, mappedModel, start, req.Writer, hasFallback)
 	if err != nil {
 		return result, err
 	}
@@ -142,10 +144,10 @@ func (g *OpenAIGateway) doAnthropicForward(
 				"fallback", fallbackModel,
 				"status", result.StatusCode)
 
-			// 替换模型后重试，不再降级
+			// 替换模型后重试，降级模型同时作为计费模型
 			responsesBody, _ = sjson.SetBytes(responsesBody, "model", fallbackModel)
 			fallbackStart := time.Now()
-			result, _, err = g.forwardAnthropicResponses(ctx, req, responsesBody, originalModel, fallbackStart, req.Writer, false)
+			result, _, err = g.forwardAnthropicResponses(ctx, req, responsesBody, originalModel, fallbackModel, fallbackStart, req.Writer, false)
 			return result, err
 		}
 
@@ -161,6 +163,7 @@ func (g *OpenAIGateway) doAnthropicForward(
 // ──────────────────────────────────────────────────────
 
 // forwardAnthropicResponses 统一的 Anthropic 转发函数
+// mappedModel: 映射后的 GPT 模型名，用于 Core 计费（写入 result.Model）
 // suppressErrorWrite: true 时上游错误不写入客户端，通过 errBody 返回供降级判断
 // 返回值: result, errBody（仅 suppress 时非 nil）, error
 func (g *OpenAIGateway) forwardAnthropicResponses(
@@ -168,6 +171,7 @@ func (g *OpenAIGateway) forwardAnthropicResponses(
 	req *sdk.ForwardRequest,
 	responsesBody []byte,
 	originalModel string,
+	mappedModel string,
 	start time.Time,
 	w http.ResponseWriter,
 	suppressErrorWrite bool,
@@ -211,12 +215,12 @@ func (g *OpenAIGateway) forwardAnthropicResponses(
 	// 流式 / 非流式响应处理
 	isStream := gjson.GetBytes(req.Body, "stream").Bool()
 	if isStream && w != nil {
-		result, err := translateResponsesSSEToAnthropicSSE(ctx, resp, w, originalModel, req.Body, start)
+		result, err := translateResponsesSSEToAnthropicSSE(ctx, resp, w, originalModel, mappedModel, req.Body, start)
 		return result, nil, err
 	}
 
 	// 非流式：聚合 Responses SSE → Anthropic JSON
-	result, err := g.handleAnthropicNonStreamFromResponses(resp, w, originalModel, req.Body, start)
+	result, err := g.handleAnthropicNonStreamFromResponses(resp, w, originalModel, mappedModel, req.Body, start)
 	return result, nil, err
 }
 
@@ -263,10 +267,12 @@ func (g *OpenAIGateway) buildAnthropicUpstreamRequest(
 }
 
 // handleAnthropicNonStreamFromResponses 非流式：聚合 Responses SSE → Anthropic JSON
+// mappedModel: 映射后的 GPT 模型名，用于 Core 计费（写入 result.Model）
 func (g *OpenAIGateway) handleAnthropicNonStreamFromResponses(
 	resp *http.Response,
 	w http.ResponseWriter,
 	model string,
+	mappedModel string,
 	originalRequest []byte,
 	start time.Time,
 ) (*sdk.ForwardResult, error) {
@@ -278,6 +284,7 @@ func (g *OpenAIGateway) handleAnthropicNonStreamFromResponses(
 		return nil, fmt.Errorf("未收到 response.completed 事件")
 	}
 
+	// 客户端响应体使用原始 Claude 模型名（model）
 	anthropicJSON := convertResponsesCompletedToAnthropicJSON(wsResult.CompletedEventRaw, originalRequest, model)
 	if anthropicJSON == "" {
 		return nil, fmt.Errorf("responses 非流回译失败")
@@ -289,9 +296,15 @@ func (g *OpenAIGateway) handleAnthropicNonStreamFromResponses(
 		_, _ = w.Write([]byte(anthropicJSON))
 	}
 
+	// result.Model 使用映射后的 GPT 模型名供 Core 计费
+	billingModel := mappedModel
+	if billingModel == "" {
+		billingModel = gjson.Get(anthropicJSON, "model").String()
+	}
+
 	return &sdk.ForwardResult{
 		StatusCode:   http.StatusOK,
-		Model:        gjson.Get(anthropicJSON, "model").String(),
+		Model:        billingModel,
 		InputTokens:  wsResult.InputTokens,
 		OutputTokens: wsResult.OutputTokens,
 		CacheTokens:  wsResult.CacheTokens,

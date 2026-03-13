@@ -379,11 +379,14 @@ func collectReasoningText(item gjson.Result) string {
 // ──────────────────────────────────────────────────────
 
 // translateResponsesSSEToAnthropicSSE 读取上游 Responses API SSE 并翻译为 Anthropic SSE 写回客户端
+// model: 原始 Claude 模型名（写入客户端响应体）
+// mappedModel: 映射后的 GPT 模型名（写入 result.Model 供 Core 计费）
 func translateResponsesSSEToAnthropicSSE(
 	ctx context.Context,
 	resp *http.Response,
 	w http.ResponseWriter,
 	model string,
+	mappedModel string,
 	originalRequest []byte,
 	start time.Time,
 ) (*sdk.ForwardResult, error) {
@@ -395,7 +398,8 @@ func translateResponsesSSEToAnthropicSSE(
 
 	flusher, _ := w.(http.Flusher)
 	state := &anthropicStreamState{}
-	responseModel := model
+	// billingModel 用于 Core 计费，优先使用映射后的 GPT 模型名
+	billingModel := mappedModel
 
 	scanner := bufio.NewScanner(resp.Body)
 	scanner.Buffer(make([]byte, 64*1024), 1024*1024)
@@ -424,9 +428,9 @@ func translateResponsesSSEToAnthropicSSE(
 				slog.Debug("[上游SSE]", "type", eventType, "data", truncate(data, 300))
 			}
 
-			// 捕获模型名
+			// 捕获上游实际模型名（用于计费）
 			if rm := gjson.Get(data, "response.model").String(); rm != "" {
-				responseModel = rm
+				billingModel = rm
 			}
 
 			// 检查错误事件 —— 先让 convertResponsesEventToAnthropic 输出错误事件再终止
@@ -467,7 +471,7 @@ done:
 		InputTokens:  state.InputTokens,
 		OutputTokens: state.OutputTokens,
 		CacheTokens:  state.CacheTokens,
-		Model:        responseModel,
+		Model:        billingModel,
 		Duration:     time.Since(start),
 	}
 	if streamErr != nil {
