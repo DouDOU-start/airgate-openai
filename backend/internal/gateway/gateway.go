@@ -3,6 +3,7 @@ package gateway
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log"
@@ -243,6 +244,49 @@ func (g *OpenAIGateway) probeOAuthUsage(ctx context.Context, accountID int64, cr
 	}
 
 	return GetCodexUsage(accountID)
+}
+
+// HandleRequest 处理 Core 透传的自定义请求（实现 sdk.RequestHandler 接口）
+func (g *OpenAIGateway) HandleRequest(_ context.Context, _, path, _ string, _ http.Header, body []byte) (int, http.Header, []byte, error) {
+	switch path {
+	case "oauth/start":
+		resp, err := g.StartOAuth(context.Background(), &OAuthStartRequest{})
+		if err != nil {
+			return http.StatusInternalServerError, nil, jsonError(err.Error()), nil
+		}
+		return http.StatusOK, nil, jsonMarshal(map[string]string{
+			"authorize_url": resp.AuthorizeURL,
+			"state":         resp.State,
+		}), nil
+
+	case "oauth/exchange":
+		var req OAuthCallbackRequest
+		if err := json.Unmarshal(body, &req); err != nil {
+			return http.StatusBadRequest, nil, jsonError("请求体解析失败"), nil
+		}
+		result, err := g.HandleOAuthCallback(context.Background(), &req)
+		if err != nil {
+			return http.StatusInternalServerError, nil, jsonError(err.Error()), nil
+		}
+		return http.StatusOK, nil, jsonMarshal(map[string]interface{}{
+			"account_type": result.AccountType,
+			"credentials":  result.Credentials,
+			"account_name": result.AccountName,
+		}), nil
+
+	default:
+		return http.StatusNotFound, nil, jsonError("未知的操作: " + path), nil
+	}
+}
+
+func jsonError(msg string) []byte {
+	b, _ := json.Marshal(map[string]string{"error": msg})
+	return b
+}
+
+func jsonMarshal(v interface{}) []byte {
+	b, _ := json.Marshal(v)
+	return b
 }
 
 // splitSSELines 从 SSE chunk 中提取 data: 行的内容
