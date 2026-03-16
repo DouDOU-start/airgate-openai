@@ -134,6 +134,10 @@ func (h *OAuthDevHandler) handleQuota(w http.ResponseWriter, r *http.Request) {
 			account.Credentials["plan_type"] = pt
 			updated = true
 		}
+		if email := quota.Extra["email"]; email != "" && account.Credentials["email"] == "" {
+			account.Credentials["email"] = email
+			updated = true
+		}
 		if quota.ExpiresAt != "" {
 			account.Credentials["subscription_active_until"] = quota.ExpiresAt
 			updated = true

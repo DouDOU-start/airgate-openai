@@ -146,6 +146,9 @@ func (g *OpenAIGateway) HandleOAuthCallback(ctx context.Context, req *OAuthCallb
 	if info.AccountID != "" {
 		credentials["chatgpt_account_id"] = info.AccountID
 	}
+	if info.Email != "" {
+		credentials["email"] = info.Email
+	}
 	if info.PlanType != "" {
 		credentials["plan_type"] = info.PlanType
 	}
@@ -233,6 +236,7 @@ func (g *OpenAIGateway) exchangeCodeForTokens(ctx context.Context, callbackURL, 
 type idTokenInfo struct {
 	AccountID               string
 	AccountName             string
+	Email                   string
 	PlanType                string // free / plus / pro / team
 	SubscriptionActiveUntil string // ISO 8601 格式
 }
@@ -282,11 +286,16 @@ func parseIDToken(idToken string) *idTokenInfo {
 		}
 	}
 
+	// 邮箱
+	if email, ok := claims["email"].(string); ok && email != "" {
+		info.Email = email
+	}
+
 	// 用户名：优先 name，其次 email
 	if name, ok := claims["name"].(string); ok && name != "" {
 		info.AccountName = name
-	} else if email, ok := claims["email"].(string); ok && email != "" {
-		info.AccountName = email
+	} else if info.Email != "" {
+		info.AccountName = info.Email
 	}
 
 	return info

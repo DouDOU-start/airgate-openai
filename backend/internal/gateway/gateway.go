@@ -136,6 +136,9 @@ func (g *OpenAIGateway) QueryQuota(ctx context.Context, credentials map[string]s
 	if info.AccountName != "" {
 		extra["account_name"] = info.AccountName
 	}
+	if info.Email != "" {
+		extra["email"] = info.Email
+	}
 	// 将刷新后的 token 也放入 extra，供调用方更新存储
 	if tokens.AccessToken != "" {
 		extra["access_token"] = tokens.AccessToken

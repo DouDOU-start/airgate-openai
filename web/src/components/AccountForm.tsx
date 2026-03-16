@@ -40,6 +40,14 @@ const inputStyle: React.CSSProperties = {
   transition: 'border-color 0.2s, box-shadow 0.2s',
 };
 
+/** 密码字段样式：用 CSS 遮蔽代替 type="password"，避免浏览器自动填充 */
+const passwordInputStyle: React.CSSProperties = {
+  ...inputStyle,
+  WebkitTextSecurity: 'disc',
+  // @ts-expect-error textSecurity 尚未被所有浏览器标准化
+  textSecurity: 'disc',
+};
+
 const labelStyle: React.CSSProperties = {
   display: 'block',
   fontSize: '0.75rem',
@@ -398,24 +406,28 @@ export function AccountForm({
                 Access Token {!oauth && <span style={{ color: cssVar('danger') }}>*</span>}
               </label>
               <input
-                type="password"
-                style={inputStyle}
+                type="text"
+                autoComplete="off"
+                style={passwordInputStyle}
                 placeholder={oauth ? '授权后自动填充，或手动输入' : 'eyJhbG...'}
                 value={credentials.access_token ?? ''}
                 onChange={(e) => updateField('access_token', e.target.value)}
               />
             </div>
           )}
-          <div>
-            <label style={labelStyle}>Refresh Token</label>
-            <input
-              type="password"
-              style={inputStyle}
-              placeholder={mode === 'edit' ? '输入新的 Refresh Token 以更新' : '授权后自动填充'}
-              value={credentials.refresh_token ?? ''}
-              onChange={(e) => updateField('refresh_token', e.target.value)}
-            />
-          </div>
+          {mode === 'create' && (
+            <div>
+              <label style={labelStyle}>Refresh Token</label>
+              <input
+                type="text"
+                autoComplete="off"
+                style={passwordInputStyle}
+                placeholder="授权后自动填充"
+                value={credentials.refresh_token ?? ''}
+                onChange={(e) => updateField('refresh_token', e.target.value)}
+              />
+            </div>
+          )}
           {mode === 'create' && (
             <div>
               <label style={labelStyle}>ChatGPT Account ID</label>
