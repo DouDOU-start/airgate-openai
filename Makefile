@@ -2,7 +2,7 @@
 
 GO := GOTOOLCHAIN=local go
 
-.PHONY: help install build build-web build-backend dev ci pre-commit lint fmt test vet clean setup-hooks
+.PHONY: help install build build-web build-backend release dev ensure-webdist ci pre-commit lint fmt test vet clean setup-hooks
 
 help: ## 显示帮助信息
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-18s\033[0m %s\n", $$1, $$2}'
@@ -24,6 +24,13 @@ build-backend: ## 构建后端（自动复制前端产物）
 	cp -r web/dist backend/internal/gateway/webdist
 	cd backend && $(GO) build -o ../bin/gateway-openai .
 
+release: build-web ## 编译 Linux 版本（用于上传到 Docker 部署）
+	rm -rf backend/internal/gateway/webdist
+	cp -r web/dist backend/internal/gateway/webdist
+	cd backend && CGO_ENABLED=0 GOOS=linux GOARCH=amd64 $(GO) build -buildvcs=false -trimpath -o ../bin/gateway-openai-linux-amd64 .
+	@echo "构建完成: bin/gateway-openai-linux-amd64"
+	@echo "通过 AirGate 管理界面 → 插件管理 → 安装插件 → 上传安装"
+
 # ===================== 开发 =====================
 
 dev: ## 启动开发服务器（自动安装依赖、构建前端）
@@ -39,9 +46,18 @@ dev: ## 启动开发服务器（自动安装依赖、构建前端）
 
 # ===================== 质量检查 =====================
 
-ci: lint test vet build-backend ## 本地运行与 CI 完全一致的检查
+ensure-webdist: ## 确保 webdist 非空（go:embed 要求至少一个文件）
+	@if [ -d web/dist ] && [ "$$(ls -A web/dist 2>/dev/null)" ]; then \
+		rm -rf backend/internal/gateway/webdist; \
+		cp -r web/dist backend/internal/gateway/webdist; \
+	elif [ ! "$$(ls -A backend/internal/gateway/webdist 2>/dev/null)" ]; then \
+		mkdir -p backend/internal/gateway/webdist; \
+		echo "placeholder" > backend/internal/gateway/webdist/.gitkeep; \
+	fi
 
-pre-commit: lint vet ## pre-commit hook 调用（跳过耗时的测试和构建）
+ci: ensure-webdist lint test vet build-backend ## 本地运行与 CI 完全一致的检查
+
+pre-commit: ensure-webdist lint vet ## pre-commit hook 调用（跳过耗时的测试和构建）
 
 lint: ## 代码检查（需要安装 golangci-lint）
 	@if ! command -v golangci-lint > /dev/null 2>&1; then \
