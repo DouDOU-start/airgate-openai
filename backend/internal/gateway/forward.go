@@ -52,7 +52,6 @@ func (g *OpenAIGateway) forwardAPIKey(ctx context.Context, req *sdk.ForwardReque
 	// 解析上游请求方法与路径
 	reqMethod, reqPath := resolveAPIKeyRoute(req)
 	targetURL := buildAPIKeyURL(account, reqPath)
-
 	// 预处理请求体（含 model 同步与上下文预算守卫）
 	body := req.Body
 	if methodAllowsBody(reqMethod) {

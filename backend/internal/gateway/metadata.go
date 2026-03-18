@@ -61,5 +61,11 @@ func PluginRouteDefinitions() []sdk.RouteDefinition {
 		{Method: "POST", Path: "/v1/messages", Description: "Anthropic Messages API（协议翻译）"},
 		{Method: "GET", Path: "/v1/models", Description: "模型列表"},
 		{Method: "WS", Path: "/v1/responses", Description: "Responses API（WebSocket）"},
+		// 不带 /v1 前缀的别名路由，方便用户配置时直接使用站点根地址
+		{Method: "POST", Path: "/responses", Description: "Responses API（无 /v1 前缀）"},
+		{Method: "POST", Path: "/chat/completions", Description: "Chat Completions API（无 /v1 前缀）"},
+		{Method: "POST", Path: "/messages", Description: "Anthropic Messages API（无 /v1 前缀）"},
+		{Method: "GET", Path: "/models", Description: "模型列表（无 /v1 前缀）"},
+		{Method: "WS", Path: "/responses", Description: "Responses API WebSocket（无 /v1 前缀）"},
 	}
 }

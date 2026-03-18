@@ -96,6 +96,12 @@ func resolveAPIKeyRoute(req *sdk.ForwardRequest) (string, string) {
 	if !strings.HasPrefix(reqPath, "/") {
 		reqPath = "/" + reqPath
 	}
+
+	// 兼容不带 /v1 前缀的路径，自动补全
+	if !strings.HasPrefix(reqPath, "/v1/") && reqPath != "/v1" {
+		reqPath = "/v1" + reqPath
+	}
+
 	return reqMethod, reqPath
 }
 
