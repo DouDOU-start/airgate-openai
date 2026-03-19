@@ -267,7 +267,11 @@ func convertAnthropicRequestToResponses(rawJSON []byte, modelName, mappingEffort
 		case "none":
 			template, _ = sjson.Set(template, "tool_choice", "none")
 		case "any":
-			template, _ = sjson.Set(template, "tool_choice", "required")
+			if hasAnthropicToolLoop(rawJSON) {
+				template, _ = sjson.Set(template, "tool_choice", "required")
+			} else {
+				template, _ = sjson.Set(template, "tool_choice", "auto")
+			}
 		case "tool":
 			name := tc.Get("name").String()
 			if name == "web_search" || name == "web_search_20250305" {

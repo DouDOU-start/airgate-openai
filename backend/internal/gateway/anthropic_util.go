@@ -274,6 +274,30 @@ func isSparkEligibleToolTurn(rawJSON []byte) bool {
 	return isToolTurnMatching(rawJSON, isSparkEligibleTool)
 }
 
+// hasAnthropicToolLoop 检查 Anthropic 消息历史中是否已进入工具循环。
+// 只要历史中出现过 assistant.tool_use 或 user.tool_result，就认为后续轮次应继续强制工具调用。
+func hasAnthropicToolLoop(rawJSON []byte) bool {
+	messages := gjson.GetBytes(rawJSON, "messages")
+	if !messages.IsArray() {
+		return false
+	}
+
+	for _, msg := range messages.Array() {
+		content := msg.Get("content")
+		if !content.IsArray() {
+			continue
+		}
+		for _, block := range content.Array() {
+			switch block.Get("type").String() {
+			case "tool_use", "tool_result":
+				return true
+			}
+		}
+	}
+
+	return false
+}
+
 // isSparkEligibleTool 判断工具是否适合 Spark 快速模型处理
 // 仅搜索/索引类工具（结果是路径列表或匹配行，决策简单）
 // Read/Fetch 返回完整内容需要深度分析，不走 Spark
