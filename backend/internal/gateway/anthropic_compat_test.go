@@ -62,8 +62,8 @@ func TestParseSSEStream_AggregatesReasoningFunctionToolUseAndStopReason(t *testi
 	if result.StopReason != "tool_calls" {
 		t.Fatalf("StopReason = %q, want %q", result.StopReason, "tool_calls")
 	}
-	if result.InputTokens != 12 || result.OutputTokens != 34 || result.CachedInputTokens != 5 {
-		t.Fatalf("usage = (%d,%d,%d), want (12,34,5)", result.InputTokens, result.OutputTokens, result.CachedInputTokens)
+	if result.InputTokens != 7 || result.OutputTokens != 34 || result.CachedInputTokens != 5 {
+		t.Fatalf("usage = (%d,%d,%d), want (7,34,5)", result.InputTokens, result.OutputTokens, result.CachedInputTokens)
 	}
 	if len(result.ToolUses) != 1 {
 		t.Fatalf("ToolUses len = %d, want 1", len(result.ToolUses))

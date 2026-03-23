@@ -57,7 +57,7 @@ ensure-webdist: ## 确保 webdist 非空（go:embed 要求至少一个文件）
 
 ci: ensure-webdist lint test vet build-backend ## 本地运行与 CI 完全一致的检查
 
-pre-commit: ensure-webdist lint vet ## pre-commit hook 调用（跳过耗时的测试和构建）
+pre-commit: ensure-webdist lint test vet ## pre-commit hook 调用
 
 lint: ## 代码检查（需要安装 golangci-lint）
 	@if ! command -v golangci-lint > /dev/null 2>&1; then \
