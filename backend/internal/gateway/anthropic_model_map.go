@@ -66,6 +66,7 @@ var (
 		"gpt-5.3-codex-spark",
 		"AIRGATE_MODEL_SPARK",
 	)
+	enableAnthropicContinuation = strings.EqualFold(firstNonEmptyEnv("AIRGATE_ENABLE_ANTHROPIC_CONTINUATION"), "true")
 )
 
 // anthropicModelMappings Claude 模型名 → OpenAI 模型映射表

@@ -3,6 +3,7 @@ package gateway
 import (
 	"bufio"
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -391,6 +392,7 @@ func translateResponsesSSEToAnthropicSSE(
 	mappedModel string,
 	originalRequest []byte,
 	start time.Time,
+	session openAISessionResolution,
 ) (*sdk.ForwardResult, error) {
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
@@ -407,8 +409,10 @@ func translateResponsesSSEToAnthropicSSE(
 	scanner.Buffer(make([]byte, 64*1024), 1024*1024)
 
 	var streamErr error
+	skipCurrentOutput := false
 
 	for scanner.Scan() {
+		skipCurrentOutput = false
 		select {
 		case <-ctx.Done():
 			streamErr = ctx.Err()
@@ -434,14 +438,46 @@ func translateResponsesSSEToAnthropicSSE(
 			if rm := gjson.Get(data, "response.model").String(); rm != "" {
 				billingModel = rm
 			}
+			if session.SessionKey != "" {
+				if responseID := gjson.Get(data, "response.id").String(); strings.TrimSpace(responseID) != "" {
+					updateSessionStateResponseID(session.SessionKey, responseID)
+				}
+			}
+			if eventType == "response.completed" || eventType == "response.done" {
+				usageNode := gjson.Get(data, "response.usage")
+				slog.Info("[Anthropic←Responses] 上游 usage",
+					"session", session.SessionKey,
+					"response_id", gjson.Get(data, "response.id").String(),
+					"usage_raw", usageNode.Raw,
+					"input_tokens", usageNode.Get("input_tokens").Int(),
+					"cached_tokens", usageNode.Get("input_tokens_details.cached_tokens").Int(),
+					"output_tokens", usageNode.Get("output_tokens").Int(),
+					"response_model", gjson.Get(data, "response.model").String(),
+				)
+				appendCacheDebugLog(
+					"anthropic_usage",
+					"session", session.SessionKey,
+					"response_id", gjson.Get(data, "response.id").String(),
+					"response_model", gjson.Get(data, "response.model").String(),
+					"input_tokens", usageNode.Get("input_tokens").Int(),
+					"cached_tokens", usageNode.Get("input_tokens_details.cached_tokens").Int(),
+					"output_tokens", usageNode.Get("output_tokens").Int(),
+					"usage_raw", usageNode.Raw,
+				)
+			}
 
 			// 检查错误事件 —— 先让 convertResponsesEventToAnthropic 输出错误事件再终止
 			if eventType == "response.failed" {
-				errMsg := gjson.Get(data, "response.error.message").String()
-				if errMsg == "" {
-					errMsg = "上游返回 response.failed"
+				if failure := classifyResponsesFailure([]byte(data)); failure != nil {
+					streamErr = failure
+					skipCurrentOutput = failure.isContinuationAnchorError()
+				} else {
+					errMsg := gjson.Get(data, "response.error.message").String()
+					if errMsg == "" {
+						errMsg = "上游返回 response.failed"
+					}
+					streamErr = fmt.Errorf("上游错误: %s", errMsg)
 				}
-				streamErr = fmt.Errorf("上游错误: %s", errMsg)
 			}
 			if eventType == "response.incomplete" {
 				reason := gjson.Get(data, "response.incomplete_details.reason").String()
@@ -449,7 +485,10 @@ func translateResponsesSSEToAnthropicSSE(
 			}
 		}
 
-		output := convertResponsesEventToAnthropic(line, originalRequest, state, model)
+		output := ""
+		if !skipCurrentOutput {
+			output = convertResponsesEventToAnthropic(line, originalRequest, state, model)
+		}
 		if output != "" {
 			_, _ = fmt.Fprint(w, output)
 			if flusher != nil {
@@ -478,6 +517,17 @@ done:
 		Duration:              time.Since(start),
 	}
 	if streamErr != nil {
+		var failure *responsesFailureError
+		if errors.As(streamErr, &failure) {
+			result.StatusCode = failure.StatusCode
+			result.AccountStatus = failure.AccountStatus
+			result.ErrorMessage = failure.Message
+			result.RetryAfter = failure.RetryAfter
+			if failure.shouldReturnClientError() {
+				return result, nil
+			}
+			return result, streamErr
+		}
 		result.StatusCode = http.StatusBadGateway
 		return result, streamErr
 	}

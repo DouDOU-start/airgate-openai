@@ -57,6 +57,11 @@ func isAnthropicRequest(req *sdk.ForwardRequest) bool {
 	return false
 }
 
+func isAnthropicCountTokensRequest(req *sdk.ForwardRequest) bool {
+	path := extractForwardedPath(req.Headers)
+	return strings.Contains(path, "/messages/count_tokens")
+}
+
 // ──────────────────────────────────────────────────────
 // URL 构建与路由
 // ──────────────────────────────────────────────────────
@@ -207,19 +212,20 @@ func getModelMetadataByID(modelID string) map[string]any {
 // ──────────────────────────────────────────────────────
 
 // buildWSRequest 构建 WebSocket response.create 消息
-func (g *OpenAIGateway) buildWSRequest(req *sdk.ForwardRequest) ([]byte, error) {
+func (g *OpenAIGateway) buildWSRequest(req *sdk.ForwardRequest, session openAISessionResolution) ([]byte, error) {
 	if isCodexCLI(req.Headers) {
-		return buildCodexWSRequest(req.Body, req.Model)
+		return buildCodexWSRequest(req.Body, req.Model, session)
 	}
-	return buildSimulatedWSRequest(req.Body, req.Model)
+	return buildSimulatedWSRequest(req.Body, req.Model, session)
 }
 
 // buildCodexWSRequest Codex CLI 透传模式
-func buildCodexWSRequest(body []byte, model string) ([]byte, error) {
+func buildCodexWSRequest(body []byte, model string, session openAISessionResolution) ([]byte, error) {
 	var reqData map[string]any
 	if err := json.Unmarshal(body, &reqData); err != nil {
 		return nil, fmt.Errorf("解析请求体失败: %w", err)
 	}
+	reqData = applyContinuationState(reqData, session)
 
 	// 如果已有 type=response.create，直接使用
 	if t, _ := reqData["type"].(string); t == "response.create" {
@@ -228,15 +234,16 @@ func buildCodexWSRequest(body []byte, model string) ([]byte, error) {
 		}
 		reqData["store"] = false
 		reqData["stream"] = true
+		reqData = applySessionFields(reqData, session)
 		return json.Marshal(reqData)
 	}
 
 	// 否则包装为 response.create
-	return wrapResponseCreate(reqData, model)
+	return wrapResponseCreate(reqData, model, session)
 }
 
 // buildSimulatedWSRequest 模拟客户端模式
-func buildSimulatedWSRequest(body []byte, model string) ([]byte, error) {
+func buildSimulatedWSRequest(body []byte, model string, session openAISessionResolution) ([]byte, error) {
 	wrapped, err := wrapAsResponsesAPI(body, model)
 	if err != nil {
 		return nil, err
@@ -246,12 +253,13 @@ func buildSimulatedWSRequest(body []byte, model string) ([]byte, error) {
 	if err := json.Unmarshal(wrapped, &reqData); err != nil {
 		return nil, fmt.Errorf("解析包装后请求体失败: %w", err)
 	}
+	reqData = applyContinuationState(reqData, session)
 
-	return wrapResponseCreate(reqData, model)
+	return wrapResponseCreate(reqData, model, session)
 }
 
 // wrapResponseCreate 将请求数据包装为 response.create WS 消息
-func wrapResponseCreate(data map[string]any, model string) ([]byte, error) {
+func wrapResponseCreate(data map[string]any, model string, session openAISessionResolution) ([]byte, error) {
 	createReq := map[string]any{
 		"type":   "response.create",
 		"stream": true,
@@ -265,5 +273,44 @@ func wrapResponseCreate(data map[string]any, model string) ([]byte, error) {
 	if model != "" {
 		createReq["model"] = model
 	}
+	createReq = applySessionFields(createReq, session)
 	return json.Marshal(createReq)
+}
+
+func applySessionFields(reqData map[string]any, session openAISessionResolution) map[string]any {
+	if reqData == nil {
+		return reqData
+	}
+	if session.PromptCacheKey != "" {
+		reqData["prompt_cache_key"] = session.PromptCacheKey
+	}
+	return reqData
+}
+
+func applyContinuationState(reqData map[string]any, session openAISessionResolution) map[string]any {
+	if reqData == nil {
+		return reqData
+	}
+
+	previousResponseID := strings.TrimSpace(gjson.GetBytes(mustJSON(reqData), "previous_response_id").String())
+	if previousResponseID == "" && session.PreviousRespID != "" && hasFunctionCallOutput(reqData) {
+		reqData["previous_response_id"] = session.PreviousRespID
+	}
+	return reqData
+}
+
+func dropPreviousResponseIDFromJSON(body []byte) ([]byte, bool) {
+	if len(body) == 0 || !gjson.GetBytes(body, "previous_response_id").Exists() {
+		return body, false
+	}
+	next, err := sjson.DeleteBytes(body, "previous_response_id")
+	if err != nil {
+		return body, false
+	}
+	return next, true
+}
+
+func mustJSON(v any) []byte {
+	data, _ := json.Marshal(v)
+	return data
 }

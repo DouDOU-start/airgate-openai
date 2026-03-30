@@ -5,6 +5,7 @@ go 1.25.7
 require (
 	github.com/DouDOU-start/airgate-sdk v0.0.1
 	github.com/gorilla/websocket v1.5.3
+	github.com/lib/pq v1.10.9
 	github.com/tidwall/gjson v1.18.0
 	github.com/tidwall/sjson v1.2.5
 	gopkg.in/yaml.v3 v3.0.1
@@ -28,3 +29,5 @@ require (
 	google.golang.org/grpc v1.79.2 // indirect
 	google.golang.org/protobuf v1.36.11 // indirect
 )
+
+replace github.com/DouDOU-start/airgate-sdk => ../../airgate-sdk

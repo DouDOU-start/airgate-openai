@@ -25,6 +25,9 @@ gateway:
     - method: POST
       path: /v1/messages
       description: Anthropic Messages API（协议翻译）
+    - method: POST
+      path: /v1/messages/count_tokens
+      description: Anthropic Count Tokens（兼容回退）
     - method: GET
       path: /v1/models
       description: 模型列表
@@ -40,6 +43,9 @@ gateway:
     - method: POST
       path: /messages
       description: Anthropic Messages API（无 /v1 前缀）
+    - method: POST
+      path: /messages/count_tokens
+      description: Anthropic Count Tokens（无 /v1 前缀）
     - method: GET
       path: /models
       description: 模型列表（无 /v1 前缀）

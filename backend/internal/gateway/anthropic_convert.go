@@ -334,6 +334,51 @@ func convertAnthropicRequestToResponses(rawJSON []byte, modelName, mappingEffort
 	return []byte(template)
 }
 
+// convertAnthropicRequestToResponsesContinuation 将 Anthropic 请求压缩为 continuation 形式：
+// 仅保留最后一条消息作为增量输入，并挂上 previous_response_id。
+// 适用于已存在稳定会话锚点的 Claude Code / Messages 多轮请求。
+func convertAnthropicRequestToResponsesContinuation(rawJSON []byte, modelName, mappingEffort, previousResponseID string) ([]byte, bool) {
+	if strings.TrimSpace(previousResponseID) == "" {
+		return nil, false
+	}
+
+	root := gjson.ParseBytes(rawJSON)
+	messages := root.Get("messages")
+	if !messages.IsArray() || messages.Get("#").Int() == 0 {
+		return nil, false
+	}
+
+	items := messages.Array()
+	last := items[len(items)-1]
+	if last.Get("role").String() == "" {
+		return nil, false
+	}
+
+	trimmed := `{"model":"","messages":[]}`
+	trimmed, _ = sjson.Set(trimmed, "model", root.Get("model").String())
+	trimmed, _ = sjson.Set(trimmed, "stream", root.Get("stream").Bool())
+	if mt := root.Get("max_tokens"); mt.Exists() {
+		trimmed, _ = sjson.Set(trimmed, "max_tokens", mt.Int())
+	}
+	if thinking := root.Get("thinking"); thinking.Exists() {
+		trimmed, _ = sjson.SetRaw(trimmed, "thinking", thinking.Raw)
+	}
+	if outputConfig := root.Get("output_config"); outputConfig.Exists() {
+		trimmed, _ = sjson.SetRaw(trimmed, "output_config", outputConfig.Raw)
+	}
+	if toolChoice := root.Get("tool_choice"); toolChoice.Exists() {
+		trimmed, _ = sjson.SetRaw(trimmed, "tool_choice", toolChoice.Raw)
+	}
+	if tools := root.Get("tools"); tools.Exists() {
+		trimmed, _ = sjson.SetRaw(trimmed, "tools", tools.Raw)
+	}
+	trimmed, _ = sjson.SetRaw(trimmed, "messages.0", last.Raw)
+
+	responsesBody := convertAnthropicRequestToResponses([]byte(trimmed), modelName, mappingEffort)
+	responsesBody, _ = sjson.SetBytes(responsesBody, "previous_response_id", previousResponseID)
+	return responsesBody, true
+}
+
 // ──────────────────────────────────────────────────────
 // 请求验证（纯 gjson，不依赖 struct）
 // ──────────────────────────────────────────────────────

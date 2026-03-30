@@ -28,12 +28,16 @@ const (
 
 // WSConfig WebSocket 连接配置
 type WSConfig struct {
-	Token      string
-	AccountID  string
-	ProxyURL   string
-	SessionID  string // prompt 缓存 key，同 SSE 的 session_id
-	TurnState  string // 粘性路由令牌，从上次握手响应获取
-	Originator string // 客户端标识，如 "codex_cli_rs"
+	URL            string
+	Token          string
+	AccountID      string
+	ProxyURL       string
+	SessionID      string // prompt 缓存 key，同 SSE 的 session_id
+	ConversationID string
+	TurnState      string // 粘性路由令牌，从上次握手响应获取
+	Originator     string // 客户端标识，如 "codex_cli_rs"
+	UserAgent      string
+	Headers        http.Header
 }
 
 // WSResult 事件解析结果
@@ -49,6 +53,7 @@ type WSResult struct {
 	CachedInputTokens     int
 	ReasoningOutputTokens int
 	CompletedEventRaw     []byte
+	FailedEventRaw        []byte
 	Duration              time.Duration
 	Err                   error
 }
@@ -71,6 +76,44 @@ type WSEventHandler interface {
 
 // DialWebSocket 建立到上游的 WebSocket 连接
 func DialWebSocket(cfg WSConfig) (*websocket.Conn, *http.Response, error) {
+	targetURL := cfg.URL
+	if strings.TrimSpace(targetURL) == "" {
+		targetURL = ChatGPTWSURL
+	}
+
+	headers := cloneHTTPHeader(cfg.Headers)
+	if headers == nil {
+		headers = http.Header{}
+	}
+	if cfg.Token != "" {
+		headers.Set("Authorization", "Bearer "+cfg.Token)
+	}
+	if headers.Get("OpenAI-Beta") == "" {
+		headers.Set("OpenAI-Beta", WSBetaHeader)
+	}
+	if cfg.AccountID != "" && headers.Get("ChatGPT-Account-ID") == "" {
+		headers.Set("ChatGPT-Account-ID", cfg.AccountID)
+	}
+	if cfg.SessionID != "" && headers.Get("session_id") == "" {
+		headers.Set("session_id", cfg.SessionID)
+	}
+	if cfg.ConversationID != "" && headers.Get("conversation_id") == "" {
+		headers.Set("conversation_id", cfg.ConversationID)
+	}
+	if cfg.TurnState != "" && headers.Get("x-codex-turn-state") == "" {
+		headers.Set("x-codex-turn-state", cfg.TurnState)
+	}
+	if cfg.Originator != "" && headers.Get("originator") == "" {
+		headers.Set("originator", cfg.Originator)
+	}
+	if cfg.UserAgent != "" && headers.Get("User-Agent") == "" {
+		headers.Set("User-Agent", cfg.UserAgent)
+	}
+
+	return dialWebSocket(targetURL, cfg.ProxyURL, headers)
+}
+
+func dialWebSocket(targetURL, proxyURL string, headers http.Header) (*websocket.Conn, *http.Response, error) {
 	dialer := &websocket.Dialer{
 		TLSClientConfig:  &tls.Config{MinVersion: tls.VersionTLS12},
 		HandshakeTimeout: 30 * time.Second,
@@ -81,67 +124,67 @@ func DialWebSocket(cfg WSConfig) (*websocket.Conn, *http.Response, error) {
 		EnableCompression: true,
 	}
 
-	if cfg.ProxyURL != "" {
-		if u, err := url.Parse(cfg.ProxyURL); err == nil {
+	if proxyURL != "" {
+		if u, err := url.Parse(proxyURL); err == nil {
 			dialer.Proxy = http.ProxyURL(u)
 		}
 	}
 
-	headers := http.Header{}
-	headers.Set("Authorization", "Bearer "+cfg.Token)
-	headers.Set("OpenAI-Beta", WSBetaHeader)
-	if cfg.AccountID != "" {
-		headers.Set("ChatGPT-Account-ID", cfg.AccountID)
-	}
-	if cfg.SessionID != "" {
-		headers.Set("session_id", cfg.SessionID)
-	}
-	if cfg.TurnState != "" {
-		headers.Set("x-codex-turn-state", cfg.TurnState)
-	}
-	if cfg.Originator != "" {
-		headers.Set("originator", cfg.Originator)
-	}
-
-	conn, resp, err := dialer.Dial(ChatGPTWSURL, headers)
+	conn, resp, err := dialer.Dial(targetURL, headers)
 	if err != nil {
-		if resp != nil {
-			// 尝试读取上游响应体中的错误详情
-			upstreamMsg := ""
-			if resp.Body != nil {
-				if body, readErr := io.ReadAll(resp.Body); readErr == nil && len(body) > 0 {
-					// 尝试提取 JSON 中的 error.message
-					if msg := gjson.GetBytes(body, "error.message").String(); msg != "" {
-						upstreamMsg = msg
-					} else {
-						upstreamMsg = truncate(string(body), 200)
-					}
-				}
-			}
-			hint := ""
-			switch resp.StatusCode {
-			case 401:
-				hint = "认证失败，access_token 已过期或账号已被停用"
-			case 403:
-				hint = "访问被拒绝，账号可能已被禁用或无权限"
-			case 429:
-				hint = "请求过于频繁，请稍后重试"
-			}
-			if hint != "" {
-				if upstreamMsg != "" {
-					return nil, resp, fmt.Errorf("%s: %s (HTTP %d)", hint, upstreamMsg, resp.StatusCode)
-				}
-				return nil, resp, fmt.Errorf("%s (HTTP %d)", hint, resp.StatusCode)
-			}
-			if upstreamMsg != "" {
-				return nil, resp, fmt.Errorf("WebSocket 握手失败: %s (HTTP %d)", upstreamMsg, resp.StatusCode)
-			}
-			return nil, resp, fmt.Errorf("WebSocket 握手失败 (HTTP %d): %w", resp.StatusCode, err)
-		}
-		return nil, nil, fmt.Errorf("WebSocket 连接失败: %w", err)
+		return nil, resp, formatWebSocketDialError(resp, err)
 	}
 
 	return conn, resp, nil
+}
+
+func formatWebSocketDialError(resp *http.Response, err error) error {
+	if resp != nil {
+		// 尝试读取上游响应体中的错误详情
+		upstreamMsg := ""
+		if resp.Body != nil {
+			if body, readErr := io.ReadAll(resp.Body); readErr == nil && len(body) > 0 {
+				// 尝试提取 JSON 中的 error.message
+				if msg := gjson.GetBytes(body, "error.message").String(); msg != "" {
+					upstreamMsg = msg
+				} else {
+					upstreamMsg = truncate(string(body), 200)
+				}
+			}
+		}
+		hint := ""
+		switch resp.StatusCode {
+		case 401:
+			hint = "认证失败，access_token 已过期或账号已被停用"
+		case 403:
+			hint = "访问被拒绝，账号可能已被禁用或无权限"
+		case 429:
+			hint = "请求过于频繁，请稍后重试"
+		}
+		if hint != "" {
+			if upstreamMsg != "" {
+				return fmt.Errorf("%s: %s (HTTP %d)", hint, upstreamMsg, resp.StatusCode)
+			}
+			return fmt.Errorf("%s (HTTP %d)", hint, resp.StatusCode)
+		}
+		if upstreamMsg != "" {
+			return fmt.Errorf("WebSocket 握手失败: %s (HTTP %d)", upstreamMsg, resp.StatusCode)
+		}
+		return fmt.Errorf("WebSocket 握手失败 (HTTP %d): %w", resp.StatusCode, err)
+	}
+	return fmt.Errorf("WebSocket 连接失败: %w", err)
+}
+
+func cloneHTTPHeader(headers http.Header) http.Header {
+	if headers == nil {
+		return nil
+	}
+	cloned := make(http.Header, len(headers))
+	for k, values := range headers {
+		copied := append([]string(nil), values...)
+		cloned[k] = copied
+	}
+	return cloned
 }
 
 // ReceiveWSResponse 从 WebSocket 读取完整响应，通过 handler 回调输出
@@ -222,15 +265,12 @@ func ReceiveWSResponse(ctx context.Context, conn *websocket.Conn, handler WSEven
 			return result
 
 		case "response.failed":
-			errMsg := string(msg)
-			if resp, ok := ev["response"].(map[string]any); ok {
-				if errObj, ok := resp["error"].(map[string]any); ok {
-					if m, ok := errObj["message"].(string); ok {
-						errMsg = m
-					}
-				}
+			result.FailedEventRaw = append([]byte(nil), msg...)
+			if failure := classifyResponsesFailure(msg); failure != nil {
+				result.Err = failure
+			} else {
+				result.Err = fmt.Errorf("上游错误: %s", string(msg))
 			}
-			result.Err = fmt.Errorf("上游错误: %s", errMsg)
 			finalizeWSResult(&result, &textBuilder, &reasoningBuilder, start)
 			return result
 

@@ -3,6 +3,7 @@ package gateway
 import (
 	"bufio"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -68,6 +69,17 @@ func handleStreamResponse(resp *http.Response, w http.ResponseWriter, start time
 
 	result.Duration = time.Since(start)
 	if streamErr != nil {
+		var failure *responsesFailureError
+		if errors.As(streamErr, &failure) {
+			result.StatusCode = failure.StatusCode
+			result.AccountStatus = failure.AccountStatus
+			result.ErrorMessage = failure.Message
+			result.RetryAfter = failure.RetryAfter
+			if failure.shouldReturnClientError() {
+				return result, nil
+			}
+			return result, streamErr
+		}
 		if result.StatusCode < http.StatusBadRequest {
 			result.StatusCode = http.StatusBadGateway
 		}
@@ -172,15 +184,12 @@ func ParseSSEStream(reader io.Reader, handler WSEventHandler) WSResult {
 			return result
 
 		case "response.failed":
-			errMsg := data
-			if resp, ok := ev["response"].(map[string]any); ok {
-				if errObj, ok := resp["error"].(map[string]any); ok {
-					if m, ok := errObj["message"].(string); ok {
-						errMsg = m
-					}
-				}
+			result.FailedEventRaw = append([]byte(nil), []byte(data)...)
+			if failure := classifyResponsesFailure([]byte(data)); failure != nil {
+				result.Err = failure
+			} else {
+				result.Err = fmt.Errorf("上游错误: %s", data)
 			}
-			result.Err = fmt.Errorf("上游错误: %s", errMsg)
 			finalizeWSResult(&result, &textBuilder, &reasoningBuilder, start)
 			return result
 
@@ -272,6 +281,9 @@ func parseSSEUsage(data []byte, result *sdk.ForwardResult) {
 
 // parseSSEFailureEvent 解析 Responses API 的失败事件并映射为错误
 func parseSSEFailureEvent(data []byte) error {
+	if failure := classifyResponsesFailure(data); failure != nil {
+		return failure
+	}
 	eventType := gjson.GetBytes(data, "type").String()
 	switch eventType {
 	case "response.failed":
@@ -284,6 +296,8 @@ func parseSSEFailureEvent(data []byte) error {
 		errCode := strings.ToLower(errNode.Get("code").String())
 
 		switch {
+		case containsAny(errType, errCode, msg, "previous_response_not_found", "previous response", "response not found"):
+			return fmt.Errorf("上游续链锚点失效: %s", msg)
 		case containsAny(errType, errCode, msg, "context_length", "context window", "max_tokens", "max_input_tokens", "max_output_tokens", "token limit", "too many tokens"):
 			return fmt.Errorf("上游上下文窗口超限: %s", msg)
 		case containsAny(errType, errCode, msg, "quota", "insufficient_quota"):

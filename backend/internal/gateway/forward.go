@@ -25,6 +25,10 @@ import (
 
 // forwardHTTP 根据账号凭证类型分发到不同转发模式
 func (g *OpenAIGateway) forwardHTTP(ctx context.Context, req *sdk.ForwardRequest) (*sdk.ForwardResult, error) {
+	if isAnthropicCountTokensRequest(req) {
+		return g.forwardAnthropicCountTokens(ctx, req)
+	}
+
 	// 检测 Anthropic Messages API 请求，走协议翻译
 	if isAnthropicRequest(req) {
 		return g.forwardAnthropicMessage(ctx, req)
@@ -76,7 +80,7 @@ func (g *OpenAIGateway) forwardAPIKey(ctx context.Context, req *sdk.ForwardReque
 	}
 
 	// 透传白名单头
-	passHeaders(req.Headers, upstreamReq.Header)
+	passHeadersForAccount(req.Headers, upstreamReq.Header, account)
 
 	// 发送请求
 	client := g.buildHTTPClient(account)
@@ -193,15 +197,18 @@ func enrichModelsResponse(resp *http.Response) *http.Response {
 func (g *OpenAIGateway) forwardOAuth(ctx context.Context, req *sdk.ForwardRequest) (*sdk.ForwardResult, error) {
 	start := time.Now()
 	account := req.Account
+	session := resolveOpenAISession(req.Headers, req.Body)
+	updateSessionStateFromRequest(session)
 
 	// 建立 WebSocket 连接，透传客户端的缓存与路由相关头
 	cfg := WSConfig{
-		Token:      account.Credentials["access_token"],
-		AccountID:  account.Credentials["chatgpt_account_id"],
-		ProxyURL:   account.ProxyURL,
-		SessionID:  req.Headers.Get("session_id"),
-		TurnState:  req.Headers.Get("x-codex-turn-state"),
-		Originator: req.Headers.Get("originator"),
+		Token:          account.Credentials["access_token"],
+		AccountID:      account.Credentials["chatgpt_account_id"],
+		ProxyURL:       account.ProxyURL,
+		SessionID:      session.SessionID,
+		ConversationID: session.ConversationID,
+		TurnState:      session.LastTurnState,
+		Originator:     req.Headers.Get("originator"),
 	}
 	conn, wsResp, err := DialWebSocket(cfg)
 	if err != nil {
@@ -219,16 +226,27 @@ func (g *OpenAIGateway) forwardOAuth(ctx context.Context, req *sdk.ForwardReques
 	defer func() {
 		_ = conn.Close()
 	}()
+	if wsResp != nil {
+		if turnState := decodeTurnStateHeader(wsResp.Header); turnState != "" {
+			updateSessionStateTurnState(session.SessionKey, turnState)
+		}
+	}
 
 	// 构建 response.create 消息
-	createMsg, err := g.buildWSRequest(req)
+	createMsg, err := g.buildWSRequest(req, session)
 	if err != nil {
 		return nil, fmt.Errorf("构建 WebSocket 请求失败: %w", err)
 	}
 
-	// 发送请求
-	if err := conn.WriteJSON(json.RawMessage(createMsg)); err != nil {
-		return nil, fmt.Errorf("发送 WebSocket 消息失败: %w", err)
+	runAttempt := func(msg []byte, w http.ResponseWriter) (WSResult, error) {
+		if err := conn.WriteJSON(json.RawMessage(msg)); err != nil {
+			return WSResult{}, fmt.Errorf("发送 WebSocket 消息失败: %w", err)
+		}
+		handler := &sseEventWriter{w: w, accountID: account.ID, sessionKey: session.SessionKey}
+		if f, ok := w.(http.Flusher); ok {
+			handler.flusher = f
+		}
+		return ReceiveWSResponse(ctx, conn, handler), nil
 	}
 
 	// 设置 SSE 响应头
@@ -241,17 +259,31 @@ func (g *OpenAIGateway) forwardOAuth(ctx context.Context, req *sdk.ForwardReques
 		w.WriteHeader(http.StatusOK)
 	}
 
-	// 读取 WS 消息，转为 SSE 写回客户端
-	handler := &sseEventWriter{w: w, accountID: account.ID}
-	if f, ok := w.(http.Flusher); ok {
-		handler.flusher = f
+	result, err := runAttempt(createMsg, w)
+	if err != nil {
+		return nil, err
 	}
-	result := ReceiveWSResponse(ctx, conn, handler)
+	if result.Err != nil && strings.Contains(result.Err.Error(), "上游续链锚点失效") {
+		if retried, changed := dropPreviousResponseIDFromJSON(createMsg); changed {
+			g.logger.Warn("检测到 previous_response_id 失效，降级为 full create 重试一次", "session", session.SessionKey)
+			result, err = runAttempt(retried, w)
+			if err != nil {
+				return nil, err
+			}
+		}
+	}
+	if session.SessionKey != "" {
+		if result.ResponseID != "" {
+			updateSessionStateResponseID(session.SessionKey, result.ResponseID)
+		}
+	}
 
 	// 发送 SSE 结束标记
 	if w != nil {
-		if _, err := fmt.Fprint(w, "data: [DONE]\n\n"); err == nil && handler.flusher != nil {
-			handler.flusher.Flush()
+		if _, err := fmt.Fprint(w, "data: [DONE]\n\n"); err == nil {
+			if flusher, ok := w.(http.Flusher); ok {
+				flusher.Flush()
+			}
 		}
 	}
 
@@ -278,9 +310,10 @@ func (g *OpenAIGateway) forwardOAuth(ctx context.Context, req *sdk.ForwardReques
 
 // sseEventWriter 将 WS 事件转为 SSE 格式写入 http.ResponseWriter
 type sseEventWriter struct {
-	w         http.ResponseWriter
-	flusher   http.Flusher
-	accountID int64 // 用于存储 Codex 用量快照
+	w          http.ResponseWriter
+	flusher    http.Flusher
+	accountID  int64 // 用于存储 Codex 用量快照
+	sessionKey string
 }
 
 func (s *sseEventWriter) OnTextDelta(string)      {}
@@ -307,6 +340,12 @@ func (s *sseEventWriter) OnRawEvent(eventType string, data []byte) {
 			}
 		}
 		return
+	case "response.created", "response.completed", "response.done":
+		if s.sessionKey != "" {
+			if responseID := gjson.GetBytes(data, "response.id").String(); strings.TrimSpace(responseID) != "" {
+				updateSessionStateResponseID(s.sessionKey, responseID)
+			}
+		}
 	}
 	if _, err := fmt.Fprintf(s.w, "event: %s\ndata: %s\n\n", eventType, strings.ReplaceAll(string(data), "\n", "")); err != nil {
 		return

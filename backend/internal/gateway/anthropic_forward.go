@@ -3,9 +3,11 @@ package gateway
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/tidwall/gjson"
@@ -23,6 +25,23 @@ import (
 func (g *OpenAIGateway) forwardAnthropicMessage(ctx context.Context, req *sdk.ForwardRequest) (*sdk.ForwardResult, error) {
 	start := time.Now()
 	body := req.Body
+	strategy := resolveAnthropicUpstreamStrategy(req.Account)
+	session := resolveOpenAISession(req.Headers, req.Body)
+	session.DigestChain = buildAnthropicDigestChain(body)
+	if session.SessionKey == "" {
+		if reusedSessionID, matchedChain, ok := findAnthropicDigestSession(req.Account.ID, session.DigestChain); ok {
+			session.SessionID = reusedSessionID
+			session.SessionKey = sessionStateKeyFromValues(reusedSessionID, "", "")
+			session.MatchedDigest = matchedChain
+			session.FromStoredState = true
+			session.SessionSource = "anthropic_digest_match"
+		} else if session.DigestChain != "" {
+			session.SessionID = deterministicUUIDFromSeed(fmt.Sprintf("anthropic:%d:%d:%s", req.Account.ID, time.Now().UnixNano(), session.DigestChain))
+			session.SessionKey = sessionStateKeyFromValues(session.SessionID, "", "")
+			session.SessionSource = "anthropic_digest_new"
+		}
+	}
+	updateSessionStateFromRequest(session)
 
 	g.logger.Info("[客户端→Anthropic] 收到请求",
 		"model", gjson.GetBytes(body, "model").String(),
@@ -58,8 +77,8 @@ func (g *OpenAIGateway) forwardAnthropicMessage(ctx context.Context, req *sdk.Fo
 			"to", mapping.OpenAIModel,
 			"fallback", mapping.FallbackModel,
 			"reasoning_effort", mapping.ReasoningEffort)
-		body, _ = sjson.SetBytes(body, "model", mapping.OpenAIModel)
 		mappingEffort = mapping.ReasoningEffort
+		body, _ = sjson.SetBytes(body, "model", mapping.OpenAIModel)
 	}
 	modelName := gjson.GetBytes(body, "model").String()
 
@@ -84,20 +103,34 @@ func (g *OpenAIGateway) forwardAnthropicMessage(ctx context.Context, req *sdk.Fo
 	// 4. 一步直转为 Responses API JSON
 	// 注: Anthropic 的 cache_control 在转换为 Responses API 后不再适用，
 	// Responses API 使用 session_id + include 机制实现缓存，无需预处理断点
-	responsesBody := convertAnthropicRequestToResponses(body, modelName, mappingEffort)
-	if tier := normalizeOpenAIServiceTier(req.Headers.Get("X-Airgate-Service-Tier")); tier != "" {
-		responsesBody, _ = sjson.SetBytes(responsesBody, "service_tier", tier)
+	replaySourceBody, replayTrimmed := applyAnthropicFullReplayGuard(body)
+	fullResponsesBody := convertAnthropicRequestToResponses(replaySourceBody, modelName, mappingEffort)
+	responsesBody := fullResponsesBody
+	requestMode := "full_replay"
+	requestReason := "no_session_anchor"
+	if session.SessionKey != "" {
+		requestReason = "session_anchor_present"
+	}
+	if strategy.allowsContinuation() {
+		if continuationBody, ok := convertAnthropicRequestToResponsesContinuation(body, modelName, mappingEffort, session.PreviousRespID); ok {
+			responsesBody = continuationBody
+			requestMode = "continuation"
+			requestReason = "previous_response_id_available"
+		} else if session.PreviousRespID != "" {
+			requestReason = "previous_response_id_unusable"
+		}
+	} else if session.PreviousRespID != "" {
+		requestReason = "continuation_disabled"
+	}
+	if requestMode == "full_replay" && replayTrimmed {
+		requestReason = "history_trimmed"
 	}
 
 	// 5. 按需注入 web_search 工具
-	if hasWebSearchTool(body) {
-		responsesBody = injectWebSearchToolJSON(responsesBody)
-	}
-
-	// 5.5 Spark 路由覆盖 verbosity（搜索结果只需简短决策）
-	if sparkOverride {
-		responsesBody, _ = sjson.SetBytes(responsesBody, "text.verbosity", "low")
-	}
+	responsesBody = finalizeAnthropicResponsesBody(responsesBody, body, req.Headers.Get("X-Airgate-Service-Tier"), sparkOverride)
+	fullResponsesBody = finalizeAnthropicResponsesBody(fullResponsesBody, body, req.Headers.Get("X-Airgate-Service-Tier"), sparkOverride)
+	responsesBody = injectAnthropicPromptCacheKey(responsesBody, strategy, session)
+	fullResponsesBody = injectAnthropicPromptCacheKey(fullResponsesBody, strategy, session)
 
 	g.logger.Info("[Anthropic→Responses] 转换完成",
 		"model", gjson.GetBytes(responsesBody, "model").String(),
@@ -106,6 +139,46 @@ func (g *OpenAIGateway) forwardAnthropicMessage(ctx context.Context, req *sdk.Fo
 		"reasoning_effort", gjson.GetBytes(responsesBody, "reasoning.effort").String(),
 		"verbosity", gjson.GetBytes(responsesBody, "text.verbosity").String(),
 		"spark_override", sparkOverride,
+		"request_mode", requestMode,
+		"request_reason", requestReason,
+		"session_key", session.SessionKey,
+		"session_present", session.SessionID != "" || session.ConversationID != "" || session.PromptCacheKey != "",
+		"session_source", session.SessionSource,
+		"previous_response_id", session.PreviousRespID,
+		"history_trimmed", replayTrimmed,
+		"prompt_cache_key", session.PromptCacheKey,
+		"request_body_bytes", len(body),
+		"responses_body_bytes", len(responsesBody),
+		"messages_hash", shortHashBytes([]byte(gjson.GetBytes(body, "messages").Raw)),
+		"system_hash", shortHashBytes([]byte(gjson.GetBytes(body, "system").Raw)),
+		"responses_input_hash", shortHashBytes([]byte(gjson.GetBytes(responsesBody, "input").Raw)),
+		"tool_choice_hash", shortHashBytes([]byte(gjson.GetBytes(responsesBody, "tool_choice").Raw)),
+		"tools_hash", shortHashBytes([]byte(gjson.GetBytes(responsesBody, "tools").Raw)),
+		"body_has_prompt_cache_key", gjson.GetBytes(responsesBody, "prompt_cache_key").Exists(),
+		"digest_chain", session.DigestChain,
+		"digest_matched", session.MatchedDigest,
+	)
+	appendCacheDebugLog(
+		"anthropic_request",
+		"model", gjson.GetBytes(responsesBody, "model").String(),
+		"request_mode", requestMode,
+		"request_reason", requestReason,
+		"session_key", session.SessionKey,
+		"session_source", session.SessionSource,
+		"prompt_cache_key", session.PromptCacheKey,
+		"previous_response_id", session.PreviousRespID,
+		"history_trimmed", replayTrimmed,
+		"messages_hash", shortHashBytes([]byte(gjson.GetBytes(body, "messages").Raw)),
+		"system_hash", shortHashBytes([]byte(gjson.GetBytes(body, "system").Raw)),
+		"responses_input_hash", shortHashBytes([]byte(gjson.GetBytes(responsesBody, "input").Raw)),
+		"tool_choice_hash", shortHashBytes([]byte(gjson.GetBytes(responsesBody, "tool_choice").Raw)),
+		"tools_hash", shortHashBytes([]byte(gjson.GetBytes(responsesBody, "tools").Raw)),
+		"body_has_prompt_cache_key", gjson.GetBytes(responsesBody, "prompt_cache_key").Exists(),
+		"request_body_bytes", len(body),
+		"responses_body_bytes", len(responsesBody),
+		"input_items", gjson.GetBytes(responsesBody, "input.#").Int(),
+		"tools", gjson.GetBytes(responsesBody, "tools.#").Int(),
+		"input_prefix", summarizeResponsesInputPrefix(responsesBody, 16),
 	)
 
 	// 6. 转发上游（含模型降级重试）
@@ -117,7 +190,12 @@ func (g *OpenAIGateway) forwardAnthropicMessage(ctx context.Context, req *sdk.Fo
 		fallbackModel = mapping.FallbackModel
 	}
 
-	return g.doAnthropicForward(ctx, req, responsesBody, originalModel, modelName, fallbackModel, start)
+	replayBody := []byte(nil)
+	if requestMode == "continuation" {
+		replayBody = fullResponsesBody
+	}
+
+	return g.doAnthropicForward(ctx, req, responsesBody, replayBody, originalModel, modelName, fallbackModel, start, session)
 }
 
 // doAnthropicForward 执行 Anthropic 转发，支持模型降级重试
@@ -126,20 +204,36 @@ func (g *OpenAIGateway) doAnthropicForward(
 	ctx context.Context,
 	req *sdk.ForwardRequest,
 	responsesBody []byte,
+	replayBody []byte,
 	originalModel string,
 	mappedModel string,
 	fallbackModel string,
 	start time.Time,
+	session openAISessionResolution,
 ) (*sdk.ForwardResult, error) {
 	hasFallback := fallbackModel != ""
 
 	// 第一次转发（有 fallback 时抑制错误写入客户端）
-	result, errBody, err := g.forwardAnthropicResponses(ctx, req, responsesBody, originalModel, mappedModel, start, req.Writer, hasFallback)
+	result, errBody, err := g.forwardAnthropicResponses(ctx, req, responsesBody, originalModel, mappedModel, start, req.Writer, hasFallback, session)
 	if err != nil {
+		if len(replayBody) > 0 {
+			var failure *responsesFailureError
+			if errors.As(err, &failure) && failure.isContinuationAnchorError() {
+				g.logger.Warn("Anthropic continuation 锚点失效，降级为 full replay 重试一次",
+					"session", session.SessionKey,
+					"digest_chain", session.DigestChain)
+				clearSessionStateResponseID(session.SessionKey)
+				result, errBody, err = g.forwardAnthropicResponses(ctx, req, replayBody, originalModel, mappedModel, start, req.Writer, hasFallback, session)
+				if err == nil {
+					goto fallbackCheck
+				}
+			}
+		}
 		return result, err
 	}
 
 	// 检查是否需要模型降级
+fallbackCheck:
 	if hasFallback && errBody != nil {
 		if isModelNotFoundError(result.StatusCode, errBody) {
 			g.logger.Info("模型降级重试",
@@ -150,7 +244,7 @@ func (g *OpenAIGateway) doAnthropicForward(
 			// 替换模型后重试，降级模型同时作为计费模型
 			responsesBody, _ = sjson.SetBytes(responsesBody, "model", fallbackModel)
 			fallbackStart := time.Now()
-			result, _, err = g.forwardAnthropicResponses(ctx, req, responsesBody, originalModel, fallbackModel, fallbackStart, req.Writer, false)
+			result, _, err = g.forwardAnthropicResponses(ctx, req, responsesBody, originalModel, fallbackModel, fallbackStart, req.Writer, false, session)
 			return result, err
 		}
 
@@ -159,6 +253,37 @@ func (g *OpenAIGateway) doAnthropicForward(
 	}
 
 	return result, nil
+}
+
+func finalizeAnthropicResponsesBody(responsesBody []byte, originalBody []byte, serviceTier string, sparkOverride bool) []byte {
+	result := responsesBody
+	if tier := normalizeOpenAIServiceTier(serviceTier); tier != "" {
+		result, _ = sjson.SetBytes(result, "service_tier", tier)
+	}
+	if hasWebSearchTool(originalBody) {
+		result = injectWebSearchToolJSON(result)
+	}
+	if sparkOverride {
+		result, _ = sjson.SetBytes(result, "text.verbosity", "low")
+	}
+	return result
+}
+
+func injectAnthropicPromptCacheKey(responsesBody []byte, strategy anthropicUpstreamStrategy, session openAISessionResolution) []byte {
+	if strategy == anthropicStrategyOAuth {
+		return responsesBody
+	}
+	if strings.TrimSpace(session.PromptCacheKey) == "" {
+		return responsesBody
+	}
+	if gjson.GetBytes(responsesBody, "prompt_cache_key").Exists() {
+		return responsesBody
+	}
+	next, err := sjson.SetBytes(responsesBody, "prompt_cache_key", session.PromptCacheKey)
+	if err != nil {
+		return responsesBody
+	}
+	return next
 }
 
 // ──────────────────────────────────────────────────────
@@ -178,11 +303,12 @@ func (g *OpenAIGateway) forwardAnthropicResponses(
 	start time.Time,
 	w http.ResponseWriter,
 	suppressErrorWrite bool,
+	session openAISessionResolution,
 ) (*sdk.ForwardResult, []byte, error) {
 	account := req.Account
 
 	// 构建上游 HTTP 请求（OAuth/APIKey 差异化处理）
-	upstreamReq, err := g.buildAnthropicUpstreamRequest(ctx, req, account, responsesBody)
+	upstreamReq, err := g.buildAnthropicUpstreamRequest(ctx, req, account, responsesBody, session)
 	if err != nil {
 		return nil, nil, fmt.Errorf("构建上游请求失败: %w", err)
 	}
@@ -218,12 +344,18 @@ func (g *OpenAIGateway) forwardAnthropicResponses(
 	// 流式 / 非流式响应处理
 	isStream := gjson.GetBytes(req.Body, "stream").Bool()
 	if isStream && w != nil {
-		result, err := translateResponsesSSEToAnthropicSSE(ctx, resp, w, originalModel, mappedModel, req.Body, start)
+		if turnState := decodeTurnStateHeader(resp.Header); turnState != "" {
+			updateSessionStateTurnState(session.SessionKey, turnState)
+		}
+		result, err := translateResponsesSSEToAnthropicSSE(ctx, resp, w, originalModel, mappedModel, req.Body, start, session)
 		return result, nil, err
 	}
 
 	// 非流式：聚合 Responses SSE → Anthropic JSON
-	result, err := g.handleAnthropicNonStreamFromResponses(resp, w, originalModel, mappedModel, req.Body, start)
+	if turnState := decodeTurnStateHeader(resp.Header); turnState != "" {
+		updateSessionStateTurnState(session.SessionKey, turnState)
+	}
+	result, err := g.handleAnthropicNonStreamFromResponses(resp, w, originalModel, mappedModel, req.Body, start, session, req.Account.ID)
 	return result, nil, err
 }
 
@@ -234,6 +366,7 @@ func (g *OpenAIGateway) buildAnthropicUpstreamRequest(
 	req *sdk.ForwardRequest,
 	account *sdk.Account,
 	responsesBody []byte,
+	session openAISessionResolution,
 ) (*http.Request, error) {
 	isOAuth := account.Credentials["access_token"] != ""
 
@@ -260,10 +393,19 @@ func (g *OpenAIGateway) buildAnthropicUpstreamRequest(
 		if aid := account.Credentials["chatgpt_account_id"]; aid != "" {
 			upstreamReq.Header.Set("ChatGPT-Account-ID", aid)
 		}
+		if session.SessionID != "" {
+			upstreamReq.Header.Set("session_id", isolateSessionID(session.SessionID))
+		}
+		if session.ConversationID != "" {
+			upstreamReq.Header.Set("conversation_id", isolateSessionID(session.ConversationID))
+		}
+		if session.LastTurnState != "" {
+			upstreamReq.Header.Set("x-codex-turn-state", session.LastTurnState)
+		}
 	} else {
 		// API Key 模式
 		setAuthHeaders(upstreamReq, account)
-		passHeaders(req.Headers, upstreamReq.Header)
+		passHeadersForAccount(req.Headers, upstreamReq.Header, account)
 	}
 
 	return upstreamReq, nil
@@ -278,9 +420,25 @@ func (g *OpenAIGateway) handleAnthropicNonStreamFromResponses(
 	mappedModel string,
 	originalRequest []byte,
 	start time.Time,
+	session openAISessionResolution,
+	accountID int64,
 ) (*sdk.ForwardResult, error) {
 	wsResult := ParseSSEStream(resp.Body, nil)
 	if wsResult.Err != nil {
+		var failure *responsesFailureError
+		if errors.As(wsResult.Err, &failure) && failure.shouldReturnClientError() {
+			if w != nil {
+				writeAnthropicErrorJSON(w, failure.StatusCode, failure.AnthropicErrorType, failure.Message)
+			}
+			return &sdk.ForwardResult{
+				StatusCode:    failure.StatusCode,
+				Model:         mappedModel,
+				Duration:      time.Since(start),
+				AccountStatus: failure.AccountStatus,
+				ErrorMessage:  failure.Message,
+				RetryAfter:    failure.RetryAfter,
+			}, nil
+		}
 		return nil, wsResult.Err
 	}
 	if len(wsResult.CompletedEventRaw) == 0 {
@@ -291,6 +449,12 @@ func (g *OpenAIGateway) handleAnthropicNonStreamFromResponses(
 	anthropicJSON := convertResponsesCompletedToAnthropicJSON(wsResult.CompletedEventRaw, originalRequest, model)
 	if anthropicJSON == "" {
 		return nil, fmt.Errorf("responses 非流回译失败")
+	}
+	if session.SessionKey != "" && wsResult.ResponseID != "" {
+		updateSessionStateResponseID(session.SessionKey, wsResult.ResponseID)
+	}
+	if session.SessionID != "" && session.DigestChain != "" {
+		saveAnthropicDigestSession(accountID, session.DigestChain, session.SessionID, session.MatchedDigest)
 	}
 
 	if w != nil {

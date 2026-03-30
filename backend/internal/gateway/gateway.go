@@ -22,8 +22,9 @@ import (
 // OpenAIGateway OpenAI 网关插件（SimpleGatewayPlugin 实现）
 // 核心自动处理调度、计费、限流、并发控制，插件只负责转发
 type OpenAIGateway struct {
-	logger *slog.Logger
-	ctx    sdk.PluginContext
+	logger        *slog.Logger
+	ctx           sdk.PluginContext
+	snapshotStore *codexUsagePersistenceStore
 }
 
 func (g *OpenAIGateway) Info() sdk.PluginInfo {
@@ -38,6 +39,20 @@ func (g *OpenAIGateway) Init(ctx sdk.PluginContext) error {
 	if g.logger == nil {
 		g.logger = slog.Default()
 	}
+	if ctx != nil && ctx.Config() != nil {
+		if dsn := ctx.Config().GetString("db_dsn"); dsn != "" {
+			store, err := newCodexUsagePersistenceStore(dsn, PluginID, g.logger)
+			if err != nil {
+				g.logger.Warn("初始化 Codex 用量快照持久化失败，将退回内存缓存", "error", err)
+			} else {
+				g.snapshotStore = store
+				setCodexUsagePersistenceStore(store)
+				if err := store.WarmCache(context.Background()); err != nil {
+					g.logger.Warn("预热 Codex 用量快照缓存失败", "error", err)
+				}
+			}
+		}
+	}
 	g.logger.Info("OpenAI 网关插件初始化")
 	return nil
 }
@@ -48,6 +63,13 @@ func (g *OpenAIGateway) Start(_ context.Context) error {
 }
 
 func (g *OpenAIGateway) Stop(_ context.Context) error {
+	if g.snapshotStore != nil {
+		setCodexUsagePersistenceStore(nil)
+		if err := g.snapshotStore.Close(); err != nil {
+			g.logger.Warn("关闭 Codex 用量快照持久化失败", "error", err)
+		}
+		g.snapshotStore = nil
+	}
 	g.logger.Info("OpenAI 网关插件停止")
 	return nil
 }
@@ -80,32 +102,76 @@ func (g *OpenAIGateway) ValidateAccount(ctx context.Context, credentials map[str
 	// API Key 模式：调用 /v1/models 验证
 	if apiKey != "" {
 		account := &sdk.Account{Credentials: credentials}
-		targetURL := buildAPIKeyURL(account, "/v1/models")
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, targetURL, nil)
-		if err != nil {
-			return fmt.Errorf("构建验证请求失败: %w", err)
-		}
-		req.Header.Set("Authorization", "Bearer "+apiKey)
-
-		client := g.buildHTTPClient(account)
-		resp, err := client.Do(req)
-		if err != nil {
-			return fmt.Errorf("验证请求失败: %w", err)
-		}
-		defer func() {
-			_ = resp.Body.Close()
-		}()
-
-		if resp.StatusCode == 401 {
-			return fmt.Errorf("API Key 无效")
-		}
-		if resp.StatusCode >= 400 {
-			return fmt.Errorf("API Key 验证失败: HTTP %d", resp.StatusCode)
+		if err := g.validateAPIKeyViaModels(ctx, account, apiKey); err != nil {
+			g.logger.Warn("OpenAI API Key /v1/models 验证失败，尝试回退 /v1/responses", "error", err)
+			if fallbackErr := g.validateAPIKeyViaResponses(ctx, account, apiKey); fallbackErr != nil {
+				return fmt.Errorf("验证请求失败: models=%v; responses=%v", err, fallbackErr)
+			}
 		}
 		return nil
 	}
 
 	// OAuth 模式：access_token 非空即通过
+	return nil
+}
+
+func (g *OpenAIGateway) validateAPIKeyViaModels(ctx context.Context, account *sdk.Account, apiKey string) error {
+	targetURL := buildAPIKeyURL(account, "/v1/models")
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, targetURL, nil)
+	if err != nil {
+		return fmt.Errorf("构建 /v1/models 验证请求失败: %w", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+apiKey)
+
+	client := g.buildHTTPClient(account)
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode == http.StatusUnauthorized {
+		return fmt.Errorf("API Key 无效")
+	}
+	if resp.StatusCode >= 400 {
+		return fmt.Errorf("/v1/models 返回 HTTP %d", resp.StatusCode)
+	}
+	return nil
+}
+
+func (g *OpenAIGateway) validateAPIKeyViaResponses(ctx context.Context, account *sdk.Account, apiKey string) error {
+	targetURL := buildAPIKeyURL(account, "/v1/responses")
+	body, err := json.Marshal(map[string]any{
+		"model":             "gpt-5.4",
+		"input":             "Reply with just ok.",
+		"max_output_tokens": 8,
+	})
+	if err != nil {
+		return fmt.Errorf("构建 /v1/responses 验证请求体失败: %w", err)
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, targetURL, bytes.NewReader(body))
+	if err != nil {
+		return fmt.Errorf("构建 /v1/responses 验证请求失败: %w", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+apiKey)
+	req.Header.Set("Content-Type", "application/json")
+
+	client := g.buildHTTPClient(account)
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode == http.StatusUnauthorized {
+		return fmt.Errorf("API Key 无效")
+	}
+	if resp.StatusCode == http.StatusNotFound || resp.StatusCode == http.StatusMethodNotAllowed {
+		return fmt.Errorf("/v1/responses 不可用: HTTP %d", resp.StatusCode)
+	}
+	if resp.StatusCode >= 500 {
+		return fmt.Errorf("/v1/responses 返回 HTTP %d", resp.StatusCode)
+	}
 	return nil
 }
 
@@ -271,42 +337,94 @@ func (g *OpenAIGateway) HandleRequest(ctx context.Context, _, path, _ string, _ 
 			return http.StatusBadRequest, nil, jsonError("invalid request body"), nil
 		}
 
-		// 通用窗口行
-		type usageWindow struct {
-			Label        string  `json:"label"`
-			UsedPercent  float64 `json:"used_percent"`
-			ResetSeconds int     `json:"reset_seconds"`
-		}
-		type creditsInfo struct {
-			Balance   float64 `json:"balance"`
-			Unlimited bool    `json:"unlimited"`
-		}
-		type accountUsage struct {
-			Windows []usageWindow `json:"windows"`
-			Credits *creditsInfo  `json:"credits,omitempty"`
-		}
-
-		windowLabel := func(minutes, defaultMinutes int) string {
-			if minutes <= 0 {
-				minutes = defaultMinutes
+		appendNormalizedWindow := func(
+			windows []sdk.AccountUsageWindow,
+			key string,
+			label string,
+			usedPercent *float64,
+			resetAfterSeconds *int,
+			base time.Time,
+			now time.Time,
+		) []sdk.AccountUsageWindow {
+			if usedPercent == nil && resetAfterSeconds == nil {
+				return windows
 			}
-			if minutes >= 1440 {
-				return fmt.Sprintf("%dd", minutes/1440)
+			used := 0.0
+			if usedPercent != nil {
+				used = *usedPercent
 			}
-			return fmt.Sprintf("%dh", minutes/60)
+			var resetAt *time.Time
+			if resetAfterSeconds != nil {
+				resetAt = sdk.ResetAtFromBase(base, *resetAfterSeconds)
+			}
+			return append(windows, sdk.NewAccountUsageWindow(key, label, used, resetAt, now))
 		}
 
-		type accountError struct {
-			ID      int64  `json:"id"`
-			Message string `json:"message"`
+		buildUsageWindows := func(snapshot *CodexUsageSnapshot, limitName string, now time.Time) []sdk.AccountUsageWindow {
+			windows := make([]sdk.AccountUsageWindow, 0, 4)
+			if normalized := snapshot.Normalize(); normalized != nil {
+				windows = appendNormalizedWindow(
+					windows, "5h", "5h", normalized.Used5hPercent, normalized.Reset5hSeconds, snapshot.CapturedAt, now,
+				)
+				windows = appendNormalizedWindow(
+					windows, "7d", "7d", normalized.Used7dPercent, normalized.Reset7dSeconds, snapshot.CapturedAt, now,
+				)
+			}
+
+			hasModelWindows := hasCodexWindowData(
+				snapshot.BengalfoxPrimaryUsedPercent,
+				snapshot.BengalfoxPrimaryResetAfterSeconds,
+				snapshot.BengalfoxPrimaryWindowMinutes,
+			) || hasCodexWindowData(
+				snapshot.BengalfoxSecondaryUsedPercent,
+				snapshot.BengalfoxSecondaryResetAfterSeconds,
+				snapshot.BengalfoxSecondaryWindowMinutes,
+			)
+			if hasModelWindows {
+				if limitName == "" {
+					limitName = "spark"
+				}
+				modelSnapshot := &CodexUsageSnapshot{
+					PrimaryUsedPercent:         snapshot.BengalfoxPrimaryUsedPercent,
+					PrimaryResetAfterSeconds:   snapshot.BengalfoxPrimaryResetAfterSeconds,
+					PrimaryWindowMinutes:       snapshot.BengalfoxPrimaryWindowMinutes,
+					SecondaryUsedPercent:       snapshot.BengalfoxSecondaryUsedPercent,
+					SecondaryResetAfterSeconds: snapshot.BengalfoxSecondaryResetAfterSeconds,
+					SecondaryWindowMinutes:     snapshot.BengalfoxSecondaryWindowMinutes,
+					CapturedAt:                 snapshot.CapturedAt,
+				}
+				if normalized := modelSnapshot.Normalize(); normalized != nil {
+					windows = appendNormalizedWindow(
+						windows,
+						"model:5h:"+limitName,
+						"5h "+limitName,
+						normalized.Used5hPercent,
+						normalized.Reset5hSeconds,
+						snapshot.CapturedAt,
+						now,
+					)
+					windows = appendNormalizedWindow(
+						windows,
+						"model:7d:"+limitName,
+						"7d "+limitName,
+						normalized.Used7dPercent,
+						normalized.Reset7dSeconds,
+						snapshot.CapturedAt,
+						now,
+					)
+				}
+			}
+
+			return windows
 		}
 
-		result := make(map[string]*accountUsage)
-		var probeErrors []accountError
+		result := make(map[string]sdk.AccountUsageInfo)
+		var probeErrors []sdk.AccountUsageError
+		now := time.Now()
 		for _, a := range accounts {
 			// 检查是否有探测时发现的凭证错误
 			if errMsg := GetProbeError(a.ID); errMsg != "" {
-				probeErrors = append(probeErrors, accountError{ID: a.ID, Message: errMsg})
+				probeErrors = append(probeErrors, sdk.AccountUsageError{ID: a.ID, Message: errMsg})
 			}
 			snapshot := GetCodexUsage(a.ID)
 			if snapshot == nil {
@@ -314,57 +432,19 @@ func (g *OpenAIGateway) HandleRequest(ctx context.Context, _, path, _ string, _ 
 			}
 			// 再次检查（ProbeUsage 刚产生的错误）
 			if errMsg := GetProbeError(a.ID); errMsg != "" {
-				probeErrors = append(probeErrors, accountError{ID: a.ID, Message: errMsg})
+				probeErrors = append(probeErrors, sdk.AccountUsageError{ID: a.ID, Message: errMsg})
 			}
 			if snapshot == nil {
 				continue
 			}
 
-			usage := &accountUsage{}
-
-			// Primary 窗口
-			if snapshot.PrimaryUsedPercent > 0 || snapshot.PrimaryWindowMinutes > 0 {
-				usage.Windows = append(usage.Windows, usageWindow{
-					Label:        windowLabel(snapshot.PrimaryWindowMinutes, 300),
-					UsedPercent:  snapshot.PrimaryUsedPercent,
-					ResetSeconds: snapshot.PrimaryResetAfterSeconds,
-				})
-			}
-			// Secondary 窗口
-			if snapshot.SecondaryUsedPercent > 0 || snapshot.SecondaryWindowMinutes > 0 {
-				usage.Windows = append(usage.Windows, usageWindow{
-					Label:        windowLabel(snapshot.SecondaryWindowMinutes, 10080),
-					UsedPercent:  snapshot.SecondaryUsedPercent,
-					ResetSeconds: snapshot.SecondaryResetAfterSeconds,
-				})
-			}
-			// Bengalfox Primary
-			if snapshot.BengalfoxPrimaryUsedPercent > 0 || snapshot.BengalfoxPrimaryWindowMinutes > 0 {
-				name := snapshot.LimitName
-				if name == "" {
-					name = "spark"
-				}
-				usage.Windows = append(usage.Windows, usageWindow{
-					Label:        windowLabel(snapshot.BengalfoxPrimaryWindowMinutes, 300) + " " + name,
-					UsedPercent:  snapshot.BengalfoxPrimaryUsedPercent,
-					ResetSeconds: snapshot.BengalfoxPrimaryResetAfterSeconds,
-				})
-			}
-			// Bengalfox Secondary
-			if snapshot.BengalfoxSecondaryUsedPercent > 0 || snapshot.BengalfoxSecondaryWindowMinutes > 0 {
-				name := snapshot.LimitName
-				if name == "" {
-					name = "spark"
-				}
-				usage.Windows = append(usage.Windows, usageWindow{
-					Label:        windowLabel(snapshot.BengalfoxSecondaryWindowMinutes, 10080) + " " + name,
-					UsedPercent:  snapshot.BengalfoxSecondaryUsedPercent,
-					ResetSeconds: snapshot.BengalfoxSecondaryResetAfterSeconds,
-				})
+			usage := sdk.AccountUsageInfo{
+				UpdatedAt: snapshot.CapturedAt.UTC().Format(time.RFC3339),
+				Windows:   buildUsageWindows(snapshot, snapshot.LimitName, now),
 			}
 			// Credits
 			if snapshot.CreditsHasCredits {
-				usage.Credits = &creditsInfo{
+				usage.Credits = &sdk.AccountUsageCredits{
 					Balance:   snapshot.CreditsBalance,
 					Unlimited: snapshot.CreditsUnlimited,
 				}
@@ -374,11 +454,10 @@ func (g *OpenAIGateway) HandleRequest(ctx context.Context, _, path, _ string, _ 
 				result[strconv.FormatInt(a.ID, 10)] = usage
 			}
 		}
-		resp := map[string]any{"accounts": result}
-		if len(probeErrors) > 0 {
-			resp["errors"] = probeErrors
-		}
-		return http.StatusOK, nil, jsonMarshal(resp), nil
+		return http.StatusOK, nil, jsonMarshal(sdk.AccountUsageAccountsResponse{
+			Accounts: result,
+			Errors:   probeErrors,
+		}), nil
 
 	case "oauth/start":
 		resp, err := g.StartOAuth(context.Background(), &OAuthStartRequest{})

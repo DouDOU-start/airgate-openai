@@ -1,8 +1,10 @@
 package gateway
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"sync"
@@ -36,6 +38,29 @@ func passHeaders(src, dst http.Header) {
 	}
 }
 
+// passHeadersForAccount 按账号上游特性透传头部。
+// 对 sub2api 这类聚合上游，去掉容易触发兼容分支的客户端标识头。
+func passHeadersForAccount(src, dst http.Header, account *sdk.Account) {
+	if !isSub2APIAccount(account) {
+		passHeaders(src, dst)
+		return
+	}
+
+	for key, values := range src {
+		lowerKey := strings.ToLower(key)
+		if !openaiAllowedHeaders[lowerKey] {
+			continue
+		}
+		switch lowerKey {
+		case "user-agent", "originator":
+			continue
+		}
+		for _, v := range values {
+			dst.Add(key, v)
+		}
+	}
+}
+
 // openaiAllowedHeaders 允许透传的请求头白名单
 var openaiAllowedHeaders = map[string]bool{
 	// 标准头
@@ -55,6 +80,22 @@ var openaiAllowedHeaders = map[string]bool{
 	"x-stainless-timeout":         true,
 	"x-stainless-read-timeout":    true,
 	"x-stainless-connect-timeout": true,
+}
+
+func isSub2APIAccount(account *sdk.Account) bool {
+	if account == nil {
+		return false
+	}
+	raw := strings.TrimSpace(account.Credentials["base_url"])
+	if raw == "" {
+		return false
+	}
+	u, err := url.Parse(raw)
+	if err != nil {
+		return strings.Contains(strings.ToLower(raw), "sub2api")
+	}
+	host := strings.ToLower(strings.TrimSpace(u.Hostname()))
+	return strings.Contains(host, "sub2api")
 }
 
 // passCodexRateLimitHeaders 透传上游 Codex 速率限制响应头
@@ -123,6 +164,96 @@ type CodexUsageSnapshot struct {
 	CreditsBalance    float64 `json:"credits_balance"`
 	// 快照时间
 	CapturedAt time.Time `json:"captured_at"`
+}
+
+// NormalizedCodexLimits contains normalized 5h/7d limit data for generic rendering.
+type NormalizedCodexLimits struct {
+	Used5hPercent   *float64
+	Reset5hSeconds  *int
+	Window5hMinutes *int
+	Used7dPercent   *float64
+	Reset7dSeconds  *int
+	Window7dMinutes *int
+}
+
+func hasCodexWindowData(usedPercent float64, resetAfterSeconds int, windowMinutes int) bool {
+	return usedPercent > 0 || resetAfterSeconds > 0 || windowMinutes > 0
+}
+
+func codexWindowPointers(usedPercent float64, resetAfterSeconds int, windowMinutes int) (*float64, *int, *int) {
+	if !hasCodexWindowData(usedPercent, resetAfterSeconds, windowMinutes) {
+		return nil, nil, nil
+	}
+	used := usedPercent
+	reset := resetAfterSeconds
+	minutes := windowMinutes
+	return &used, &reset, &minutes
+}
+
+// Normalize converts primary/secondary fields to canonical 5h/7d fields.
+// Strategy matches sub2api:
+//  1. Prefer window_minutes to determine which window is shorter.
+//  2. When window_minutes are missing, fall back to legacy assumption:
+//     primary=7d, secondary=5h.
+func (s *CodexUsageSnapshot) Normalize() *NormalizedCodexLimits {
+	if s == nil {
+		return nil
+	}
+
+	result := &NormalizedCodexLimits{}
+
+	primaryMins := s.PrimaryWindowMinutes
+	secondaryMins := s.SecondaryWindowMinutes
+	hasPrimaryWindow := primaryMins > 0
+	hasSecondaryWindow := secondaryMins > 0
+
+	use5hFromPrimary := false
+	use7dFromPrimary := false
+
+	switch {
+	case hasPrimaryWindow && hasSecondaryWindow:
+		if primaryMins < secondaryMins {
+			use5hFromPrimary = true
+		} else {
+			use7dFromPrimary = true
+		}
+	case hasPrimaryWindow:
+		if primaryMins <= 360 {
+			use5hFromPrimary = true
+		} else {
+			use7dFromPrimary = true
+		}
+	case hasSecondaryWindow:
+		if secondaryMins <= 360 {
+			use7dFromPrimary = true
+		} else {
+			use5hFromPrimary = true
+		}
+	default:
+		use7dFromPrimary = true
+	}
+
+	if use5hFromPrimary {
+		result.Used5hPercent, result.Reset5hSeconds, result.Window5hMinutes = codexWindowPointers(
+			s.PrimaryUsedPercent, s.PrimaryResetAfterSeconds, s.PrimaryWindowMinutes,
+		)
+		result.Used7dPercent, result.Reset7dSeconds, result.Window7dMinutes = codexWindowPointers(
+			s.SecondaryUsedPercent, s.SecondaryResetAfterSeconds, s.SecondaryWindowMinutes,
+		)
+	} else if use7dFromPrimary {
+		result.Used7dPercent, result.Reset7dSeconds, result.Window7dMinutes = codexWindowPointers(
+			s.PrimaryUsedPercent, s.PrimaryResetAfterSeconds, s.PrimaryWindowMinutes,
+		)
+		result.Used5hPercent, result.Reset5hSeconds, result.Window5hMinutes = codexWindowPointers(
+			s.SecondaryUsedPercent, s.SecondaryResetAfterSeconds, s.SecondaryWindowMinutes,
+		)
+	}
+
+	if result.Used5hPercent == nil && result.Used7dPercent == nil &&
+		result.Reset5hSeconds == nil && result.Reset7dSeconds == nil {
+		return nil
+	}
+	return result
 }
 
 // parseCodexUsageFromHeaders 从响应头中解析 Codex 用量快照
@@ -213,17 +344,28 @@ var usageStore sync.Map
 // StoreCodexUsage 保存某个账号的用量快照
 func StoreCodexUsage(accountID int64, snapshot *CodexUsageSnapshot) {
 	if snapshot != nil {
-		usageStore.Store(accountID, snapshot)
+		cloned := cloneCodexUsageSnapshot(snapshot)
+		usageStore.Store(accountID, cloned)
+		if store := getCodexUsagePersistenceStore(); store != nil {
+			store.SaveAsync(accountID, cloned)
+		}
 	}
 }
 
 // GetCodexUsage 获取某个账号的最新用量快照
 func GetCodexUsage(accountID int64) *CodexUsageSnapshot {
 	val, ok := usageStore.Load(accountID)
-	if !ok {
-		return nil
+	if ok {
+		return val.(*CodexUsageSnapshot)
 	}
-	return val.(*CodexUsageSnapshot)
+	if store := getCodexUsagePersistenceStore(); store != nil {
+		snapshot, err := store.Load(context.Background(), accountID)
+		if err == nil && snapshot != nil {
+			usageStore.Store(accountID, snapshot)
+			return snapshot
+		}
+	}
+	return nil
 }
 
 // probeErrorStore 存储探测过程中发现的凭证错误（accountID → error message）
