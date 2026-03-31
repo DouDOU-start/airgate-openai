@@ -7,6 +7,13 @@ linters:
     - staticcheck
     - unused
     - ineffassign
+    - misspell
+
+  settings:
+    revive:
+      rules:
+        - name: exported
+          disabled: true
 
 formatters:
   enable:

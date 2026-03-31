@@ -65,6 +65,8 @@ lint: ## 代码检查（需要安装 golangci-lint）
 		exit 1; \
 	fi
 	@cd backend && golangci-lint run ./...
+	@cd web && npx tsc --noEmit
+	@cd web && npm run lint
 	@echo "代码检查通过"
 
 fmt: ## 格式化代码

@@ -41,12 +41,11 @@ const inputStyle: React.CSSProperties = {
 };
 
 /** 密码字段样式：用 CSS 遮蔽代替 type="password"，避免浏览器自动填充 */
-const passwordInputStyle: React.CSSProperties = {
+const passwordInputStyle = {
   ...inputStyle,
   WebkitTextSecurity: 'disc',
-  // @ts-expect-error textSecurity 尚未被所有浏览器标准化
   textSecurity: 'disc',
-};
+} as React.CSSProperties;
 
 const labelStyle: React.CSSProperties = {
   display: 'block',
