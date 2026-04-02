@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/tidwall/gjson"
@@ -238,14 +239,16 @@ func (g *OpenAIGateway) forwardOAuth(ctx context.Context, req *sdk.ForwardReques
 		return nil, fmt.Errorf("构建 WebSocket 请求失败: %w", err)
 	}
 
+	var lastHandler *sseEventWriter
 	runAttempt := func(msg []byte, w http.ResponseWriter) (WSResult, error) {
 		if err := conn.WriteJSON(json.RawMessage(msg)); err != nil {
 			return WSResult{}, fmt.Errorf("发送 WebSocket 消息失败: %w", err)
 		}
-		handler := &sseEventWriter{w: w, accountID: account.ID, sessionKey: session.SessionKey}
+		handler := &sseEventWriter{w: w, accountID: account.ID, sessionKey: session.SessionKey, start: start}
 		if f, ok := w.(http.Flusher); ok {
 			handler.flusher = f
 		}
+		lastHandler = handler
 		return ReceiveWSResponse(ctx, conn, handler), nil
 	}
 
@@ -288,6 +291,10 @@ func (g *OpenAIGateway) forwardOAuth(ctx context.Context, req *sdk.ForwardReques
 	}
 
 	elapsed := time.Since(start)
+	firstTokenMs := elapsed.Milliseconds()
+	if lastHandler != nil && lastHandler.firstTokenMs > 0 {
+		firstTokenMs = lastHandler.firstTokenMs
+	}
 	fwdResult := &sdk.ForwardResult{
 		StatusCode:            http.StatusOK,
 		InputTokens:           result.InputTokens,
@@ -297,7 +304,7 @@ func (g *OpenAIGateway) forwardOAuth(ctx context.Context, req *sdk.ForwardReques
 		ServiceTier:           normalizeOpenAIServiceTier(gjson.GetBytes(createMsg, "service_tier").String()),
 		Model:                 result.Model,
 		Duration:              elapsed,
-		FirstTokenMs:          elapsed.Milliseconds(),
+		FirstTokenMs:          firstTokenMs,
 	}
 	if result.Err != nil {
 		fwdResult.StatusCode = http.StatusBadGateway
@@ -313,10 +320,13 @@ func (g *OpenAIGateway) forwardOAuth(ctx context.Context, req *sdk.ForwardReques
 
 // sseEventWriter 将 WS 事件转为 SSE 格式写入 http.ResponseWriter
 type sseEventWriter struct {
-	w          http.ResponseWriter
-	flusher    http.Flusher
-	accountID  int64 // 用于存储 Codex 用量快照
-	sessionKey string
+	w              http.ResponseWriter
+	flusher        http.Flusher
+	accountID      int64 // 用于存储 Codex 用量快照
+	sessionKey     string
+	start          time.Time // 请求开始时间，用于计算首 token 延迟
+	firstTokenMs   int64     // 首 token 到达时间（毫秒）
+	firstTokenOnce sync.Once // 确保只记录一次
 }
 
 func (s *sseEventWriter) OnTextDelta(string)      {}
@@ -334,6 +344,10 @@ func (s *sseEventWriter) OnRawEvent(eventType string, data []byte) {
 	if s.w == nil || eventType == "" {
 		return
 	}
+	// 记录首 token 延迟（第一个有效事件到达客户端的时间）
+	s.firstTokenOnce.Do(func() {
+		s.firstTokenMs = time.Since(s.start).Milliseconds()
+	})
 	// 过滤不需要转发给客户端的内部事件，并捕获用量
 	switch eventType {
 	case "codex.rate_limits":
