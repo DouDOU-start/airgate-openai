@@ -307,6 +307,9 @@ func (g *OpenAIGateway) forwardAnthropicResponses(
 ) (*sdk.ForwardResult, []byte, error) {
 	account := req.Account
 
+	// 强制覆盖 instructions（如果分组配置了）
+	responsesBody = applyForceInstructions(responsesBody, req.Headers)
+
 	// 构建上游 HTTP 请求（OAuth/APIKey 差异化处理）
 	upstreamReq, err := g.buildAnthropicUpstreamRequest(ctx, req, account, responsesBody, session)
 	if err != nil {

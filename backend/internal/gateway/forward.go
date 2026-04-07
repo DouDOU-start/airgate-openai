@@ -61,6 +61,7 @@ func (g *OpenAIGateway) forwardAPIKey(ctx context.Context, req *sdk.ForwardReque
 	body := req.Body
 	if methodAllowsBody(reqMethod) {
 		body = preprocessRequestBody(body, req.Model, reqPath)
+		body = applyForceInstructions(body, req.Headers)
 	}
 
 	var bodyReader io.Reader
