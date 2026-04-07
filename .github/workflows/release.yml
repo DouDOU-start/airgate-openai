@@ -58,8 +58,12 @@ jobs:
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
         run: |
+          # 从 git tag 派生版本号（去掉 v 前缀），通过 ldflags 注入到 PluginVersion
+          VERSION="${GITHUB_REF_NAME#v}"
+          echo "Injecting PluginVersion=${VERSION}"
           mkdir -p bin
           cd backend && go build -buildvcs=false -trimpath \
+            -ldflags "-X 'github.com/DouDOU-start/airgate-openai/backend/internal/gateway.PluginVersion=${VERSION}'" \
             -o ../bin/gateway-openai-${{ matrix.goos }}-${{ matrix.goarch }} .
 
       - name: Generate SHA256

@@ -7,13 +7,21 @@ import sdk "github.com/DouDOU-start/airgate-sdk"
 const (
 	PluginID             = "gateway-openai"
 	PluginDisplayName    = "OpenAI 网关"
-	PluginVersion        = "1.0.0"
 	PluginDescription    = "OpenAI Responses API / Chat Completions 转发"
 	PluginAuthor         = "airgate"
 	PluginPlatform       = "openai"
 	PluginMode           = "simple"
 	PluginMinCoreVersion = "1.0.0"
 )
+
+// PluginVersion 插件版本号。
+//
+// 默认值是开发态版本，正式 release 构建时由 GitHub Actions 通过 ldflags 注入：
+//
+//	go build -ldflags "-X 'github.com/DouDOU-start/airgate-openai/backend/internal/gateway.PluginVersion=0.1.0'"
+//
+// 这样 git tag 即唯一发版来源，无需手动维护 plugin.yaml / metadata.go 里的版本字段。
+var PluginVersion = "0.1.0"
 
 func PluginDependencies() []string {
 	return []string{}

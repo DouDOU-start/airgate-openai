@@ -120,3 +120,21 @@ cd backend && go run ./cmd/genmanifest   # 重新生成 plugin.yaml
 cd backend && go run ./cmd/devserver     # 启动开发服务器
 cd backend && go run ./cmd/chat          # 启动交互式测试
 ```
+
+## 发版
+
+`metadata.go` 中的 `PluginVersion` 是 `var`，默认值用于本地开发。**正式发版只需要打 git tag，不要手工改版本号字段**：
+
+```bash
+git tag v0.2.0
+git push origin v0.2.0
+```
+
+GitHub Actions 的 `release.yml` 工作流会自动：
+
+1. 矩阵构建 4 个平台二进制（linux/darwin × amd64/arm64）
+2. 通过 `-ldflags "-X .../gateway.PluginVersion=${version}"` 把 git tag（去掉 `v` 前缀）注入到二进制
+3. 上传到 GitHub Release，资产命名 `gateway-openai-{os}-{arch}`
+4. airgate-core 插件市场会通过 GitHub API 自动同步新版本（默认 6h，或在控制台市场页点刷新按钮立即同步）
+
+这样 git tag = release 版本 = 已安装 tab 显示的版本，**单一来源、永不偏离**。

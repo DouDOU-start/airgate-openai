@@ -2,7 +2,7 @@
 
 id: gateway-openai
 name: OpenAI 网关
-version: 1.0.0
+version: 0.1.0
 description: OpenAI Responses API / Chat Completions 转发
 author: airgate
 type: gateway
