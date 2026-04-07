@@ -124,6 +124,11 @@ func handleNonStreamResponse(resp *http.Response, w http.ResponseWriter, start t
 		Duration:              elapsed,
 		FirstTokenMs:          elapsed.Milliseconds(),
 	}
+	// Writer 不可用时，通过 Body/Headers 返回给 Core 写响应
+	if w == nil {
+		result.Body = body
+		result.Headers = resp.Header.Clone()
+	}
 	fillCost(result)
 	return result, nil
 }
