@@ -406,7 +406,7 @@ func translateResponsesSSEToAnthropicSSE(
 	billingModel := mappedModel
 
 	scanner := bufio.NewScanner(resp.Body)
-	scanner.Buffer(make([]byte, 64*1024), 1024*1024)
+	scanner.Buffer(make([]byte, 64*1024), upstreamSSEMaxLineBytes)
 
 	var streamErr error
 	var firstTokenMs int64
@@ -435,6 +435,14 @@ func translateResponsesSSEToAnthropicSSE(
 				eventType != "response.reasoning_summary_text.delta" &&
 				eventType != "response.function_call_arguments.delta" {
 				slog.Debug("[上游SSE]", "type", eventType, "data", truncate(data, 300))
+			}
+			// 大事件诊断：上游单行 SSE 超阈值时打印 type 与长度，便于追踪触发 gRPC 上限的源头。
+			if len(line) >= largeSSEEventThreshold {
+				slog.Warn("[上游SSE 大事件]",
+					"type", eventType,
+					"line_bytes", len(line),
+					"response_id", gjson.Get(data, "response.id").String(),
+				)
 			}
 
 			// 捕获上游实际模型名（用于计费）
@@ -497,6 +505,17 @@ func translateResponsesSSEToAnthropicSSE(
 			output = convertResponsesEventToAnthropic(line, originalRequest, state, model)
 		}
 		if output != "" {
+			// 大事件诊断：翻译后的单条输出超阈值时打印源 type 与长度。
+			if len(output) >= largeSSEEventThreshold {
+				srcType := ""
+				if data, ok := extractSSEData(string(line)); ok {
+					srcType = gjson.Get(data, "type").String()
+				}
+				slog.Warn("[Anthropic SSE 大事件]",
+					"src_type", srcType,
+					"output_bytes", len(output),
+				)
+			}
 			// 记录首 token 延迟（首次产生有效输出事件）
 			if !firstTokenRecorded {
 				firstTokenMs = time.Since(start).Milliseconds()

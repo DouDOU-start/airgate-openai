@@ -17,6 +17,15 @@ import (
 	sdk "github.com/DouDOU-start/airgate-sdk"
 )
 
+// upstreamSSEMaxLineBytes 是上游 SSE 单行最大字节数。
+// 上游某些事件（例如 response.output_item.done 携带完整输出 / 大段 reasoning summary）
+// 可能远超 1 MB，过小会触发 bufio.Scanner: token too long 中断流。
+const upstreamSSEMaxLineBytes = 8 * 1024 * 1024
+
+// largeSSEEventThreshold 触发大事件诊断日志的阈值。
+// 超过这个长度的单行/翻译输出会被打印 type 与长度，便于追踪谁在膨胀。
+const largeSSEEventThreshold = 512 * 1024
+
 // handleStreamResponse 处理 SSE 流式响应
 func handleStreamResponse(resp *http.Response, w http.ResponseWriter, start time.Time) (*sdk.ForwardResult, error) {
 	// 设置 SSE 响应头
@@ -35,7 +44,7 @@ func handleStreamResponse(resp *http.Response, w http.ResponseWriter, start time
 	}
 
 	scanner := bufio.NewScanner(resp.Body)
-	scanner.Buffer(make([]byte, 64*1024), 1024*1024)
+	scanner.Buffer(make([]byte, 64*1024), upstreamSSEMaxLineBytes)
 	var streamErr error
 	firstTokenRecorded := false
 
@@ -142,7 +151,7 @@ func ParseSSEStream(reader io.Reader, handler WSEventHandler) WSResult {
 	var reasoningBuilder strings.Builder
 
 	scanner := bufio.NewScanner(reader)
-	scanner.Buffer(make([]byte, 64*1024), 1024*1024)
+	scanner.Buffer(make([]byte, 64*1024), upstreamSSEMaxLineBytes)
 
 	for scanner.Scan() {
 		line := scanner.Text()
