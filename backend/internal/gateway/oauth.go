@@ -170,13 +170,42 @@ func (g *OpenAIGateway) HandleOAuthCallback(ctx context.Context, req *OAuthCallb
 }
 
 // tokenResponse token 交换响应
+// 注意：上游失败时 error 字段可能是 string（"invalid_grant"）也可能是 object
+// （{code, message, ...}），因此用 json.RawMessage 兼容，再用 errorMessage() 提取文本。
 type tokenResponse struct {
-	IDToken      string `json:"id_token"`
-	AccessToken  string `json:"access_token"`
-	RefreshToken string `json:"refresh_token"`
-	ExpiresIn    int    `json:"expires_in"`
-	Error        string `json:"error"`
-	Description  string `json:"error_description"`
+	IDToken      string          `json:"id_token"`
+	AccessToken  string          `json:"access_token"`
+	RefreshToken string          `json:"refresh_token"`
+	ExpiresIn    int             `json:"expires_in"`
+	Error        json.RawMessage `json:"error"`
+	Description  string          `json:"error_description"`
+}
+
+// errorMessage 从 Error 字段中提取可读文本，兼容 string / {message} / {code} / 任意对象。
+func (t *tokenResponse) errorMessage() string {
+	if len(t.Error) == 0 {
+		return ""
+	}
+	// 情况 1：字符串
+	var s string
+	if err := json.Unmarshal(t.Error, &s); err == nil {
+		return s
+	}
+	// 情况 2：对象，尝试常见字段
+	var obj map[string]any
+	if err := json.Unmarshal(t.Error, &obj); err == nil {
+		for _, key := range []string{"message", "error_description", "description", "detail", "code", "type"} {
+			if v, ok := obj[key]; ok {
+				if str, ok := v.(string); ok && str != "" {
+					return str
+				}
+			}
+		}
+		// 退化为整体 JSON
+		return string(t.Error)
+	}
+	// 既不是 string 也不是 object，原样返回
+	return string(t.Error)
 }
 
 // exchangeCodeForTokens 使用授权码交换 token（参考 chatgpt-register）
@@ -217,7 +246,7 @@ func (g *OpenAIGateway) exchangeCodeForTokens(ctx context.Context, callbackURL, 
 	if resp.StatusCode >= 400 {
 		msg := tokens.Description
 		if msg == "" {
-			msg = tokens.Error
+			msg = tokens.errorMessage()
 		}
 		if msg == "" {
 			msg = fmt.Sprintf("token 请求失败: %d", resp.StatusCode)
@@ -337,7 +366,7 @@ func (g *OpenAIGateway) refreshTokens(ctx context.Context, refreshToken, proxyUR
 	if resp.StatusCode >= 400 {
 		msg := tokens.Description
 		if msg == "" {
-			msg = tokens.Error
+			msg = tokens.errorMessage()
 		}
 		if msg == "" {
 			msg = fmt.Sprintf("刷新 token 失败: %d", resp.StatusCode)
