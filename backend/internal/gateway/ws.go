@@ -288,13 +288,18 @@ func ReceiveWSResponse(ctx context.Context, conn *websocket.Conn, handler WSEven
 			return result
 
 		case "error":
-			errMsg := string(msg)
-			if errObj, ok := ev["error"].(map[string]any); ok {
-				if m, ok := errObj["message"].(string); ok {
-					errMsg = m
+			result.FailedEventRaw = append([]byte(nil), msg...)
+			if failure := classifyWSErrorEvent(msg); failure != nil {
+				result.Err = failure
+			} else {
+				errMsg := string(msg)
+				if errObj, ok := ev["error"].(map[string]any); ok {
+					if m, ok := errObj["message"].(string); ok {
+						errMsg = m
+					}
 				}
+				result.Err = fmt.Errorf("WebSocket 错误: %s", errMsg)
 			}
-			result.Err = fmt.Errorf("WebSocket 错误: %s", errMsg)
 			finalizeWSResult(&result, &textBuilder, &reasoningBuilder, start)
 			return result
 

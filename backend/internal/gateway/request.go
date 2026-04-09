@@ -256,9 +256,7 @@ func buildCodexWSRequest(body []byte, model string, session openAISessionResolut
 
 	// 如果已有 type=response.create，直接使用
 	if t, _ := reqData["type"].(string); t == "response.create" {
-		if model != "" {
-			reqData["model"] = model
-		}
+		reqData["model"] = resolveEffectiveModel(model, reqData["model"])
 		reqData["store"] = false
 		reqData["stream"] = true
 		reqData = applySessionFields(reqData, session)
@@ -267,6 +265,21 @@ func buildCodexWSRequest(body []byte, model string, session openAISessionResolut
 
 	// 否则包装为 response.create
 	return wrapResponseCreate(reqData, model, session)
+}
+
+// resolveEffectiveModel 决定最终送到上游的 model 字段。
+// 优先级：显式 reqModel > body 里已有的 model > Codex 兜底默认值。
+// 只要候选值不在 model.registry 里（包括空串、"None"、"null"、或者任何不认识的
+// 模型名），就直接换成 codexDefaultModel —— 避免把"不支持的模型"推到上游账号，
+// 触发 "The 'None' model is not supported..." 这类错误。
+func resolveEffectiveModel(reqModel string, existing any) string {
+	if model.IsKnown(reqModel) {
+		return strings.TrimSpace(reqModel)
+	}
+	if s, ok := existing.(string); ok && model.IsKnown(s) {
+		return strings.TrimSpace(s)
+	}
+	return codexDefaultModel
 }
 
 // buildSimulatedWSRequest 模拟客户端模式
@@ -297,9 +310,7 @@ func wrapResponseCreate(data map[string]any, model string, session openAISession
 			createReq[k] = v
 		}
 	}
-	if model != "" {
-		createReq["model"] = model
-	}
+	createReq["model"] = resolveEffectiveModel(model, createReq["model"])
 	createReq = applySessionFields(createReq, session)
 	return json.Marshal(createReq)
 }

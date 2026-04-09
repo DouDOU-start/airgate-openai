@@ -62,6 +62,18 @@ func Lookup(modelID string) Spec {
 	return DefaultSpec
 }
 
+// IsKnown 判断给定 model ID 是否在注册表内（大小写不敏感、忽略首尾空白）。
+// 用于请求入口的 model 兜底：未注册的 model 会被换成默认值，
+// 避免把"不支持的模型"推到上游账号。
+func IsKnown(modelID string) bool {
+	id := strings.ToLower(strings.TrimSpace(modelID))
+	if id == "" {
+		return false
+	}
+	_, ok := registry[id]
+	return ok
+}
+
 // AllSpecs 返回所有注册模型的 SDK ModelInfo 列表（按 ID 排序）
 func AllSpecs() []sdk.ModelInfo {
 	models := make([]sdk.ModelInfo, 0, len(registry))

@@ -71,6 +71,33 @@ func classifyResponsesFailure(data []byte) *responsesFailureError {
 	errType := strings.ToLower(strings.TrimSpace(errNode.Get("type").String()))
 	errCode := strings.ToLower(strings.TrimSpace(errNode.Get("code").String()))
 
+	return classifyResponsesError(errType, errCode, msg)
+}
+
+// classifyWSErrorEvent 处理 WebSocket "error" 事件（区别于 "response.failed"）。
+// 上游有些校验失败（如 model 不被支持、字段无效）走的是这条事件，错误对象通常长这样：
+//
+//	{"type":"error","error":{"message":"...","type":"invalid_request_error","code":"..."}}
+//
+// 与 response.failed 共用同一套关键词分类，确保客户端侧的错误（unsupported model
+// 等）被识别成 Kind=Client，避免归罪到账号。
+func classifyWSErrorEvent(data []byte) *responsesFailureError {
+	if gjson.GetBytes(data, "type").String() != "error" {
+		return nil
+	}
+	errNode := gjson.GetBytes(data, "error")
+	msg := strings.TrimSpace(errNode.Get("message").String())
+	if msg == "" {
+		msg = strings.TrimSpace(string(data))
+	}
+	errType := strings.ToLower(strings.TrimSpace(errNode.Get("type").String()))
+	errCode := strings.ToLower(strings.TrimSpace(errNode.Get("code").String()))
+	return classifyResponsesError(errType, errCode, msg)
+}
+
+// classifyResponsesError 根据 type/code/message 关键词归类错误。
+// 是 classifyResponsesFailure / classifyWSErrorEvent 的共用实现。
+func classifyResponsesError(errType, errCode, msg string) *responsesFailureError {
 	switch {
 	case containsAny(errType, errCode, msg, "previous_response_not_found", "previous response", "response not found"):
 		return &responsesFailureError{
@@ -86,7 +113,7 @@ func classifyResponsesFailure(data []byte) *responsesFailureError {
 			AnthropicErrorType: "invalid_request_error",
 			Message:            msg,
 		}
-	case containsAny(errType, errCode, msg, "invalid_prompt", "invalid_request", "input_too_long"):
+	case containsAny(errType, errCode, msg, "invalid_prompt", "invalid_request", "input_too_long", "is not supported", "unsupported", "model_not_found", "invalid model", "invalid_model"):
 		return &responsesFailureError{
 			Kind:               responsesFailureKindClient,
 			StatusCode:         http.StatusBadRequest,

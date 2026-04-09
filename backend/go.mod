@@ -3,7 +3,7 @@ module github.com/DouDOU-start/airgate-openai/backend
 go 1.25.7
 
 require (
-	github.com/DouDOU-start/airgate-sdk v0.0.1
+	github.com/DouDOU-start/airgate-sdk v0.0.0-20260409075603-72e675bf678d
 	github.com/gorilla/websocket v1.5.3
 	github.com/lib/pq v1.10.9
 	github.com/tidwall/gjson v1.18.0

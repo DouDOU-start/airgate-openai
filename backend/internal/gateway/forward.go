@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -305,6 +306,16 @@ func (g *OpenAIGateway) forwardOAuth(ctx context.Context, req *sdk.ForwardReques
 		FirstTokenMs:          firstTokenMs,
 	}
 	if result.Err != nil {
+		// 客户端侧错误（如不支持的 model、context 超长、参数无效）：
+		// 这是用户请求本身的问题，与账号无关，不能让 core 把账号惩罚停用。
+		// 显式标记 AccountStatus=OK + 4xx，core 据此既不 failover 也不计入失败。
+		var failure *responsesFailureError
+		if errors.As(result.Err, &failure) && failure.shouldReturnClientError() {
+			fwdResult.StatusCode = failure.StatusCode
+			fwdResult.AccountStatus = sdk.AccountStatusOK
+			fwdResult.ErrorMessage = failure.Message
+			return fwdResult, result.Err
+		}
 		fwdResult.StatusCode = http.StatusBadGateway
 		return fwdResult, result.Err
 	}

@@ -66,6 +66,13 @@ var (
 		"gpt-5.3-codex-spark",
 		"AIRGATE_MODEL_SPARK",
 	)
+	// codexDefaultModel Codex CLI 透传路径的兜底模型。
+	// 当客户端请求体里 model 字段为空、null 或字面量 "None" 时使用这个值，
+	// 避免把无效 model 发到上游触发 "The 'None' model is not supported" 错误。
+	codexDefaultModel = resolveRoleTargetModel(
+		"gpt-5.2",
+		"AIRGATE_CODEX_DEFAULT_MODEL",
+	)
 	enableAnthropicContinuation = strings.EqualFold(firstNonEmptyEnv("AIRGATE_ENABLE_ANTHROPIC_CONTINUATION"), "true")
 )
 
