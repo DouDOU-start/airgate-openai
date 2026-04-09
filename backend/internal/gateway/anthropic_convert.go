@@ -231,6 +231,13 @@ func convertAnthropicRequestToResponses(rawJSON []byte, modelName, mappingEffort
 				continue
 			}
 
+			// Claude Code 的 deferred tool 协议：上游 Responses API 没有对应概念，
+			// 直接丢弃 tool_search 元工具，并在下方剥离 function 工具上的 defer_loading 字段。
+			// 这样所有工具都以普通 function tool 声明给上游，Claude Code 本地仍持有完整 schema。
+			if strings.HasPrefix(toolType, "tool_search") {
+				continue
+			}
+
 			tool := toolResult.Raw
 			tool, _ = sjson.Set(tool, "type", "function")
 
@@ -253,6 +260,7 @@ func convertAnthropicRequestToResponses(rawJSON []byte, modelName, mappingEffort
 
 			// 清理 Anthropic 特有字段
 			tool, _ = sjson.Delete(tool, "cache_control")
+			tool, _ = sjson.Delete(tool, "defer_loading")
 
 			template, _ = sjson.SetRaw(template, "tools.-1", tool)
 		}
