@@ -15,6 +15,7 @@ import (
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 
+	"github.com/DouDOU-start/airgate-openai/backend/internal/model"
 	sdk "github.com/DouDOU-start/airgate-sdk"
 )
 
@@ -33,6 +34,13 @@ func (g *OpenAIGateway) forwardHTTP(ctx context.Context, req *sdk.ForwardRequest
 		return g.forwardAnthropicMessage(ctx, req)
 	}
 
+	// GET /v1/models 直接用插件内置模型清单本地返回，不走账号分发。
+	// OAuth 账号无法转发 /v1/models（上游是 ChatGPT WS responses 端点），
+	// API Key 账号即使上游支持，也没必要为一份静态清单多打一次外网。
+	if isModelsListingRequest(req) {
+		return buildLocalModelsResponse(), nil
+	}
+
 	account := req.Account
 
 	if account.Credentials["api_key"] != "" {
@@ -42,6 +50,57 @@ func (g *OpenAIGateway) forwardHTTP(ctx context.Context, req *sdk.ForwardRequest
 		return g.forwardOAuth(ctx, req)
 	}
 	return nil, fmt.Errorf("账号缺少 api_key 或 access_token")
+}
+
+// isModelsListingRequest 判断当前请求是否为 GET /v1/models。
+//
+// Core 不会透传原始方法和路径，只能用既有线索推断：
+//  1. 优先看 X-Forwarded-Path（如果 core 设置了）
+//  2. 回退到 resolveAPIKeyRoute 的兜底推断（空 body + 非 stream → /v1/models）
+//
+// 这保持了与 resolveAPIKeyRoute 一致的推断逻辑，避免两处判据漂移。
+func isModelsListingRequest(req *sdk.ForwardRequest) bool {
+	if req == nil {
+		return false
+	}
+	method, path := resolveAPIKeyRoute(req)
+	return method == http.MethodGet && (path == "/v1/models" || strings.HasPrefix(path, "/v1/models?"))
+}
+
+// buildLocalModelsResponse 用插件内置模型注册表合成 OpenAI 兼容的 /v1/models 响应。
+func buildLocalModelsResponse() *sdk.ForwardResult {
+	specs := model.AllSpecs()
+	data := make([]map[string]any, 0, len(specs))
+	created := time.Now().Unix()
+	for _, spec := range specs {
+		entry := map[string]any{
+			"id":       spec.ID,
+			"object":   "model",
+			"created":  created,
+			"owned_by": "airgate",
+		}
+		if spec.ContextWindow > 0 {
+			entry["context_window"] = spec.ContextWindow
+			entry["context_length"] = spec.ContextWindow
+			entry["max_input_tokens"] = spec.ContextWindow
+		}
+		if spec.MaxOutputTokens > 0 {
+			entry["max_output_tokens"] = spec.MaxOutputTokens
+		}
+		data = append(data, entry)
+	}
+	body, _ := json.Marshal(map[string]any{
+		"object": "list",
+		"data":   data,
+	})
+	headers := http.Header{}
+	headers.Set("Content-Type", "application/json")
+	return &sdk.ForwardResult{
+		StatusCode:    http.StatusOK,
+		Body:          body,
+		Headers:       headers,
+		AccountStatus: sdk.AccountStatusOK,
+	}
 }
 
 // ──────────────────────────────────────────────────────
