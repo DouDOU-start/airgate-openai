@@ -38,7 +38,7 @@ func BuildPluginInfo() sdk.PluginInfo {
 		Type:        sdk.PluginTypeGateway,
 		// gateway 插件不调用 HostService，不声明任何 capability。
 		// 显式声明空 slice 让 core 不再走 sdk_version 兼容路径，正式进入 0.3.0 capability 模型。
-		Capabilities: []string{},
+		Capabilities: []sdk.Capability{},
 		AccountTypes: []sdk.AccountType{
 			{
 				Key:         "apikey",
