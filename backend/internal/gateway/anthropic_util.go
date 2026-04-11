@@ -12,17 +12,17 @@ import (
 // 工具函数（纯函数，不依赖任何 struct）
 // ──────────────────────────────────────────────────────
 
-// thinkingBudgetToReasoningEffort 将 thinking budget_tokens 映射为 reasoning_effort（与 CLIProxyAPI ConvertBudgetToLevel 对齐）
+// thinkingBudgetToReasoningEffort 将 thinking budget_tokens 映射为 reasoning_effort
+// 返回值为 OpenAI Responses API 合法的 effort 等级（minimal/low/medium/high/xhigh）
+//   - budget < 0  : 返回 "" 表示未指定，调用方应使用兜底策略
+//   - budget == 0 : 客户端显式禁用思考 → "minimal"
+//   - 其余按预算大小档位映射
 func thinkingBudgetToReasoningEffort(budget int64) string {
 	switch {
-	case budget < -1:
+	case budget < 0:
 		return ""
-	case budget == -1:
-		return "auto"
 	case budget == 0:
-		return "none"
-	case budget <= 512:
-		return "low"
+		return "minimal"
 	case budget <= 1024:
 		return "low"
 	case budget <= 8192:
@@ -31,6 +31,26 @@ func thinkingBudgetToReasoningEffort(budget int64) string {
 		return "high"
 	default:
 		return "xhigh"
+	}
+}
+
+// normalizeReasoningEffort 把客户端传入的 effort 字符串归一化到合法集合
+// 合法返回：minimal / low / medium / high / xhigh
+// 无法识别返回 ""，由调用方走兜底逻辑
+func normalizeReasoningEffort(raw string) string {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "minimal", "min", "none", "off", "disabled":
+		return "minimal"
+	case "low":
+		return "low"
+	case "medium", "mid", "normal", "default":
+		return "medium"
+	case "high":
+		return "high"
+	case "xhigh", "very_high", "veryhigh", "max", "maximum", "ultra":
+		return "xhigh"
+	default:
+		return ""
 	}
 }
 

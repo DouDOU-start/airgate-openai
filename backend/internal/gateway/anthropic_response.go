@@ -52,7 +52,10 @@ func convertResponsesEventToAnthropic(rawLine []byte, originalRequest []byte, st
 
 	switch typeStr {
 	case "response.created":
-		template := `{"type":"message_start","message":{"id":"","type":"message","role":"assistant","model":"","stop_sequence":null,"usage":{"input_tokens":0,"output_tokens":0},"content":[],"stop_reason":null}}`
+		// 注：message_start 的 usage 全部填零（Anthropic 标准做法），
+		// 真实 token 数在 message_delta（response.completed）时下发。
+		// 必须包含完整的 4 个字段，否则下游（如 sub2api）按字段是否存在做判断会出现统计偏差。
+		template := `{"type":"message_start","message":{"id":"","type":"message","role":"assistant","model":"","stop_sequence":null,"usage":{"input_tokens":0,"output_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":0},"content":[],"stop_reason":null}}`
 		// 使用原始 Claude 模型名，让 Claude Code 正确识别模型能力（上下文按钮等）
 		modelName := model
 		if modelName == "" {
@@ -166,7 +169,11 @@ func convertResponsesEventToAnthropic(rawLine []byte, originalRequest []byte, st
 		state.ReasoningOutputTokens = int(reasoningTokens)
 
 		// 构建 message_delta
-		template := `{"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"input_tokens":0,"output_tokens":0}}`
+		// usage 字段必须保持 Anthropic 完整 schema（4 个 token 字段都要有），
+		// 否则下游解析器（如 sub2api parseSSEUsagePassthrough）做 Exists() / >0 判断会丢字段。
+		// cache_creation_input_tokens 保持 0：OpenAI Responses API 不区分 cache creation vs read，
+		// 所有命中缓存的 prompt 都归在 cached_tokens（→ cache_read_input_tokens）。
+		template := `{"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"input_tokens":0,"output_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}`
 
 		stopReason := root.Get("response.stop_reason").String()
 		if state.HasToolCall {
@@ -180,9 +187,7 @@ func convertResponsesEventToAnthropic(rawLine []byte, originalRequest []byte, st
 
 		template, _ = sjson.Set(template, "usage.input_tokens", inputTokens)
 		template, _ = sjson.Set(template, "usage.output_tokens", outputTokens)
-		if cachedTokens > 0 {
-			template, _ = sjson.Set(template, "usage.cache_read_input_tokens", cachedTokens)
-		}
+		template, _ = sjson.Set(template, "usage.cache_read_input_tokens", cachedTokens)
 
 		output := "event: message_delta\n" + fmt.Sprintf("data: %s\n\n", template)
 		output += "event: message_stop\n" + "data: {\"type\":\"message_stop\"}\n\n"
@@ -265,7 +270,8 @@ func convertResponsesCompletedToAnthropicJSON(completedJSON, originalRequest []b
 
 	revNames := buildReverseToolNameMap(originalRequest)
 
-	out := `{"id":"","type":"message","role":"assistant","model":"","content":[],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":0,"output_tokens":0}}`
+	// usage 必须包含完整的 4 个 token 字段，避免下游按字段存在性判断时漏字段
+	out := `{"id":"","type":"message","role":"assistant","model":"","content":[],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":0,"output_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}`
 	out, _ = sjson.Set(out, "id", responseData.Get("id").String())
 	// 始终使用原始 Claude 模型名，让 Claude Code 正确识别模型能力
 	out, _ = sjson.Set(out, "model", model)
@@ -273,9 +279,7 @@ func convertResponsesCompletedToAnthropicJSON(completedJSON, originalRequest []b
 	inputTokens, outputTokens, cachedTokens, _ := extractResponsesUsage(responseData.Get("usage"))
 	out, _ = sjson.Set(out, "usage.input_tokens", inputTokens)
 	out, _ = sjson.Set(out, "usage.output_tokens", outputTokens)
-	if cachedTokens > 0 {
-		out, _ = sjson.Set(out, "usage.cache_read_input_tokens", cachedTokens)
-	}
+	out, _ = sjson.Set(out, "usage.cache_read_input_tokens", cachedTokens)
 
 	hasToolCall := false
 

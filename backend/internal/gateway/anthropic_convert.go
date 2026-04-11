@@ -293,41 +293,52 @@ func convertAnthropicRequestToResponses(rawJSON []byte, modelName, mappingEffort
 		}
 	}
 
-	// ─── thinking → reasoning ───
-	// 优先级：客户端 thinking 配置 > 模型映射默认值 > 全局默认 "medium"
+	// ─── thinking / output_config → reasoning_effort ───
+	// 优先级：
+	//   1. output_config.effort         （Claude Code Effort 滑块，最高优先级，任何 thinking 形态都识别）
+	//   2. thinking.budget_tokens       （Anthropic 原生 extended thinking 预算）
+	//   3. thinking.type=disabled       （显式关闭 → minimal）
+	//   4. mappingEffort                （模型映射默认）
+	//   5. "medium"                     （全局兜底）
 	reasoningEffort := "medium"
 	clientEffortSet := false
-	if thinkingConfig := root.Get("thinking"); thinkingConfig.Exists() && thinkingConfig.IsObject() {
-		switch thinkingConfig.Get("type").String() {
-		case "enabled":
-			if budgetTokens := thinkingConfig.Get("budget_tokens"); budgetTokens.Exists() {
-				if effort := thinkingBudgetToReasoningEffort(budgetTokens.Int()); effort != "" {
-					reasoningEffort = effort
-					clientEffortSet = true
+
+	// 1. output_config.effort：任何 thinking 形态下都识别（Claude Code 通过此字段传 Effort 滑块）
+	if v := root.Get("output_config.effort"); v.Exists() && v.Type == gjson.String {
+		if e := normalizeReasoningEffort(v.String()); e != "" {
+			reasoningEffort = e
+			clientEffortSet = true
+		}
+	}
+
+	// 2/3. thinking 字段
+	if !clientEffortSet {
+		if thinkingConfig := root.Get("thinking"); thinkingConfig.Exists() && thinkingConfig.IsObject() {
+			switch thinkingConfig.Get("type").String() {
+			case "enabled":
+				if budgetTokens := thinkingConfig.Get("budget_tokens"); budgetTokens.Exists() {
+					if effort := thinkingBudgetToReasoningEffort(budgetTokens.Int()); effort != "" {
+						reasoningEffort = effort
+						clientEffortSet = true
+					}
 				}
-			}
-		case "adaptive", "auto":
-			effort := ""
-			if v := root.Get("output_config.effort"); v.Exists() && v.Type == gjson.String {
-				effort = strings.ToLower(strings.TrimSpace(v.String()))
-			}
-			if effort != "" {
-				// 客户端显式指定 effort，直接使用
-				reasoningEffort = effort
-				clientEffortSet = true
-			}
-			// 未指定时不设 clientEffortSet，
-			// 让模型映射默认值（如 Opus→xhigh）生效
-		case "disabled":
-			if effort := thinkingBudgetToReasoningEffort(0); effort != "" {
-				reasoningEffort = effort
+			case "adaptive", "auto":
+				// adaptive 已在第 1 步消费 output_config.effort；
+				// 走到这里说明客户端没传，让模型映射默认（如 Opus→xhigh）生效
+			case "disabled":
+				reasoningEffort = "minimal"
 				clientEffortSet = true
 			}
 		}
 	}
-	// 客户端未指定 thinking 时，使用模型映射的默认 effort
+
+	// 4. 客户端未指定 → 使用模型映射的默认 effort
 	if !clientEffortSet && mappingEffort != "" {
-		reasoningEffort = mappingEffort
+		if e := normalizeReasoningEffort(mappingEffort); e != "" {
+			reasoningEffort = e
+		} else {
+			reasoningEffort = mappingEffort
+		}
 	}
 
 	// ─── 固定参数（对齐 Codex CLI ResponsesApiRequest）───
@@ -338,6 +349,9 @@ func convertAnthropicRequestToResponses(rawJSON []byte, modelName, mappingEffort
 	template, _ = sjson.Set(template, "store", false)
 	template, _ = sjson.Set(template, "include", []string{"reasoning.encrypted_content"})
 	template, _ = sjson.Set(template, "text.verbosity", "medium") // 输出简练度（对齐 Codex CLI 默认值）
+
+	// 注意：上游 Codex 风格 Responses 代理不接受 max_output_tokens 字段（会 400 Unsupported parameter），
+	// Anthropic 的 max_tokens 在此被静默丢弃。如果以后切到原生 OpenAI Responses API，再恢复此映射。
 
 	return []byte(template)
 }
