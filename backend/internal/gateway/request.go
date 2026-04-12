@@ -167,7 +167,7 @@ func buildAPIKeyURL(account *sdk.Account, reqPath string) string {
 // 请求预处理
 // ──────────────────────────────────────────────────────
 
-// preprocessRequestBody 预处理请求体（同步 model 字段，并做轻量 context guard）
+// preprocessRequestBody 预处理请求体（同步 model 字段，并做轻量 context guard 与 input 规范化）
 func preprocessRequestBody(body []byte, model, reqPath string) []byte {
 	if len(body) == 0 {
 		return body
@@ -184,7 +184,79 @@ func preprocessRequestBody(body []byte, model, reqPath string) []byte {
 	}
 
 	result = applyContextGuard(result, reqPath)
+	result = normalizeResponsesInput(result, reqPath)
 	return result
+}
+
+// normalizeResponsesInput 对 Responses API 请求的 input 字段做格式规范化。
+//
+// OpenAI 官方 Responses API 接受两种 input 形式：
+//  1. string：简写，等价于单条 user message
+//  2. ResponseInputItem 数组：完整形式
+//
+// 但部分兼容上游（代理、私有部署）只接受 2）。为了让 airgate 对客户端保持宽松
+// 同时兼容严格上游，这里把 string 形式自动包装成标准的单条 user input item 列表。
+//
+// 同时处理一种历史兼容场景：客户端把 Chat Completions 风格的 messages 字段发到
+// /v1/responses，本函数把 messages 翻译成 Responses API 的 input 列表（复用
+// convertChatMessagesToResponsesInput）。
+func normalizeResponsesInput(body []byte, reqPath string) []byte {
+	if !strings.Contains(reqPath, "/v1/responses") && !strings.HasSuffix(reqPath, "/responses") {
+		return body
+	}
+
+	inputNode := gjson.GetBytes(body, "input")
+
+	// 情况 1：input 是 string → 包装成单条 user message item 列表
+	if inputNode.Exists() && inputNode.Type == gjson.String {
+		text := inputNode.String()
+		item := []map[string]any{
+			{
+				"type": "message",
+				"role": "user",
+				"content": []map[string]string{
+					{"type": "input_text", "text": text},
+				},
+			},
+		}
+		encoded, err := json.Marshal(item)
+		if err != nil {
+			return body
+		}
+		if modified, err := sjson.SetRawBytes(body, "input", encoded); err == nil {
+			return modified
+		}
+		return body
+	}
+
+	// 情况 2：没有 input 但有 Chat Completions 风格的 messages → 翻译
+	if !inputNode.Exists() {
+		if msgs := gjson.GetBytes(body, "messages"); msgs.Exists() && msgs.IsArray() {
+			input, instructions := convertChatMessagesToResponsesInput(msgs.Array())
+			if input == nil {
+				input = []any{}
+			}
+			encoded, err := json.Marshal(input)
+			if err != nil {
+				return body
+			}
+			result := body
+			if modified, err := sjson.SetRawBytes(result, "input", encoded); err == nil {
+				result = modified
+			}
+			if modified, err := sjson.DeleteBytes(result, "messages"); err == nil {
+				result = modified
+			}
+			if instructions != "" && !gjson.GetBytes(result, "instructions").Exists() {
+				if modified, err := sjson.SetBytes(result, "instructions", instructions); err == nil {
+					result = modified
+				}
+			}
+			return result
+		}
+	}
+
+	return body
 }
 
 // getModelMetadataByID 返回网关内置模型元信息，用于 /v1/models 字段补齐与上下文预算估算
