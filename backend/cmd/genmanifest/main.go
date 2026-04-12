@@ -51,6 +51,22 @@ type modelInfo struct {
 	InputPrice       float64 `yaml:"input_price"`
 	OutputPrice      float64 `yaml:"output_price"`
 	CachedInputPrice float64 `yaml:"cached_input_price,omitempty"`
+
+	// Priority 档单价（$/1M tokens）
+	InputPricePriority       float64 `yaml:"input_price_priority,omitempty"`
+	OutputPricePriority      float64 `yaml:"output_price_priority,omitempty"`
+	CachedInputPricePriority float64 `yaml:"cached_input_price_priority,omitempty"`
+
+	// Flex / Batch 档单价（$/1M tokens）
+	InputPriceFlex       float64 `yaml:"input_price_flex,omitempty"`
+	OutputPriceFlex      float64 `yaml:"output_price_flex,omitempty"`
+	CachedInputPriceFlex float64 `yaml:"cached_input_price_flex,omitempty"`
+
+	// 长上下文阶梯（仅 gpt-5.4 家族）
+	LongContextThreshold        int     `yaml:"long_context_threshold,omitempty"`
+	LongContextInputMultiplier  float64 `yaml:"long_context_input_multiplier,omitempty"`
+	LongContextOutputMultiplier float64 `yaml:"long_context_output_multiplier,omitempty"`
+	LongContextCachedMultiplier float64 `yaml:"long_context_cached_multiplier,omitempty"`
 }
 
 type accountType struct {
@@ -164,15 +180,25 @@ func convertRoutes(routes []sdk.RouteDefinition) []routeDef {
 
 func convertModels(models []sdk.ModelInfo) []modelInfo {
 	items := make([]modelInfo, 0, len(models))
-	for _, model := range models {
+	for _, m := range models {
 		items = append(items, modelInfo{
-			ID:               model.ID,
-			Name:             model.Name,
-			ContextWindow:    model.ContextWindow,
-			MaxOutputTokens:  model.MaxOutputTokens,
-			InputPrice:       model.InputPrice,
-			OutputPrice:      model.OutputPrice,
-			CachedInputPrice: model.CachedInputPrice,
+			ID:                          m.ID,
+			Name:                        m.Name,
+			ContextWindow:               m.ContextWindow,
+			MaxOutputTokens:             m.MaxOutputTokens,
+			InputPrice:                  m.InputPrice,
+			OutputPrice:                 m.OutputPrice,
+			CachedInputPrice:            m.CachedInputPrice,
+			InputPricePriority:          m.InputPricePriority,
+			OutputPricePriority:         m.OutputPricePriority,
+			CachedInputPricePriority:    m.CachedInputPricePriority,
+			InputPriceFlex:              m.InputPriceFlex,
+			OutputPriceFlex:             m.OutputPriceFlex,
+			CachedInputPriceFlex:        m.CachedInputPriceFlex,
+			LongContextThreshold:        m.LongContextThreshold,
+			LongContextInputMultiplier:  m.LongContextInputMultiplier,
+			LongContextOutputMultiplier: m.LongContextOutputMultiplier,
+			LongContextCachedMultiplier: m.LongContextCachedMultiplier,
 		})
 	}
 	return items

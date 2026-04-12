@@ -13,37 +13,90 @@ import (
 // ──────────────────────────────────────────────────────
 
 // Spec 单个模型的完整元数据
+//
+// 定价对齐 OpenAI 官方规则：
+//   - 标准档：Input / Cached / Output
+//   - Priority 档：*Priority 字段（≈ 标准 × 2），缺省时 SDK 以 × 2 兜底
+//   - Flex / Batch 档：*Flex 字段（= 标准 × 0.5），缺省时 SDK 以 × 0.5 兜底
+//   - 长上下文档（仅 gpt-5.4 家族）：完整 input_tokens 超过 LongContextThreshold
+//     且非 priority 档时，整次请求全量按倍率计费
 type Spec struct {
-	Name            string  // 展示名称
-	ContextWindow   int     // 上下文窗口（tokens）
-	MaxOutputTokens int     // 最大输出 tokens
-	InputPrice      float64 // 输入价格（$/1M tokens）
-	CachedPrice     float64 // 缓存输入价格（$/1M tokens）
-	OutputPrice     float64 // 输出价格（$/1M tokens）
+	Name            string
+	ContextWindow   int
+	MaxOutputTokens int
+
+	// 标准档单价（$/1M tokens）
+	InputPrice  float64
+	CachedPrice float64
+	OutputPrice float64
+
+	// Priority 档单价（$/1M tokens）。零值表示未配置，由 SDK 以标准 × 2 兜底。
+	InputPricePriority  float64
+	CachedPricePriority float64
+	OutputPricePriority float64
+
+	// Flex / Batch 档单价（$/1M tokens）。零值表示未配置，由 SDK 以标准 × 0.5 兜底。
+	InputPriceFlex  float64
+	CachedPriceFlex float64
+	OutputPriceFlex float64
+
+	// 长上下文阶梯（只对 gpt-5.4 家族填非零值）。
+	LongContextThreshold        int
+	LongContextInputMultiplier  float64
+	LongContextOutputMultiplier float64
+	LongContextCachedMultiplier float64
+}
+
+// std 快捷构造一个三档（standard / priority / flex）价格齐全的 Spec，
+// 倍率按 OpenAI 官方：priority = 2×standard，flex = 0.5×standard。
+func std(name string, ctx, maxOut int, input, cached, output float64) Spec {
+	return Spec{
+		Name:                name,
+		ContextWindow:       ctx,
+		MaxOutputTokens:     maxOut,
+		InputPrice:          input,
+		CachedPrice:         cached,
+		OutputPrice:         output,
+		InputPricePriority:  input * 2,
+		CachedPricePriority: cached * 2,
+		OutputPricePriority: output * 2,
+		InputPriceFlex:      input * 0.5,
+		CachedPriceFlex:     cached * 0.5,
+		OutputPriceFlex:     output * 0.5,
+	}
+}
+
+// withLongCtx 在已构造的 Spec 基础上附加 gpt-5.4 家族的长上下文阶梯。
+// OpenAI 官方：input ×2、cached ×2、output ×1.5，阈值 272k input_tokens。
+func withLongCtx(s Spec) Spec {
+	s.LongContextThreshold = 272_000
+	s.LongContextInputMultiplier = 2.0
+	s.LongContextOutputMultiplier = 1.5
+	s.LongContextCachedMultiplier = 2.0
+	return s
 }
 
 // registry 全局模型注册表（按模型 ID 索引）
 // ─── 新增模型只需在此处加一行 ───
-// 字段顺序：Name, ContextWindow, MaxOutputTokens, InputPrice, CachedPrice, OutputPrice
 var registry = map[string]Spec{
-	// ── GPT-5.4 ──
-	"gpt-5.4": {"GPT 5.4", 272000, 128000, 2.5, 0.25, 15.0},
+	// ── GPT-5.4（唯一具备长上下文阶梯的家族）──
+	"gpt-5.4": withLongCtx(std("GPT 5.4", 272000, 128000, 2.5, 0.25, 15.0)),
 
 	// ── Codex 5.x ──
-	"gpt-5.3-codex":       {"GPT 5.3 Codex", 272000, 128000, 1.75, 0.175, 14.0},
-	"gpt-5.3-codex-spark": {"GPT 5.3 Codex Spark", 128000, 128000, 1.75, 0.175, 14.0},
-	"gpt-5.2-codex":       {"GPT 5.2 Codex", 272000, 128000, 1.75, 0.175, 14.0},
-	"gpt-5.1-codex":       {"GPT 5.1 Codex", 272000, 128000, 1.25, 0.125, 10.0},
-	"gpt-5.1-codex-max":   {"GPT 5.1 Codex Max", 272000, 128000, 1.25, 0.125, 10.0},
-	"gpt-5.1-codex-mini":  {"GPT 5.1 Codex Mini", 128000, 128000, 0.25, 0.025, 2.0},
-	"gpt-5-codex":         {"GPT 5 Codex", 272000, 128000, 1.25, 0.125, 10.0},
-	"gpt-5-codex-mini":    {"GPT 5 Codex Mini", 128000, 128000, 0.25, 0.025, 2.0},
+	"gpt-5.3-codex":       std("GPT 5.3 Codex", 272000, 128000, 1.75, 0.175, 14.0),
+	"gpt-5.3-codex-spark": std("GPT 5.3 Codex Spark", 128000, 128000, 1.75, 0.175, 14.0),
+	"gpt-5.2-codex":       std("GPT 5.2 Codex", 272000, 128000, 1.75, 0.175, 14.0),
+	"gpt-5.1-codex":       std("GPT 5.1 Codex", 272000, 128000, 1.25, 0.125, 10.0),
+	"gpt-5.1-codex-max":   std("GPT 5.1 Codex Max", 272000, 128000, 1.25, 0.125, 10.0),
+	"gpt-5.1-codex-mini":  std("GPT 5.1 Codex Mini", 128000, 128000, 0.25, 0.025, 2.0),
+	"gpt-5-codex":         std("GPT 5 Codex", 272000, 128000, 1.25, 0.125, 10.0),
+	"gpt-5-codex-mini":    std("GPT 5 Codex Mini", 128000, 128000, 0.25, 0.025, 2.0),
 
 	// ── GPT 基础系列 ──
-	"gpt-5":      {"GPT 5", 272000, 128000, 1.25, 0.125, 10.0},
-	"gpt-5.1":    {"GPT 5.1", 272000, 128000, 1.25, 0.125, 10.0},
-	"gpt-5.2":    {"GPT 5.2", 272000, 128000, 1.75, 0.175, 14.0},
-	"gpt-5-mini": {"GPT 5 Mini", 128000, 16384, 0.125, 0.025, 1.0},
+	"gpt-5":      std("GPT 5", 272000, 128000, 1.25, 0.125, 10.0),
+	"gpt-5.1":    std("GPT 5.1", 272000, 128000, 1.25, 0.125, 10.0),
+	"gpt-5.2":    std("GPT 5.2", 272000, 128000, 1.75, 0.175, 14.0),
+	"gpt-5-mini": std("GPT 5 Mini", 128000, 16384, 0.125, 0.025, 1.0),
 }
 
 // DefaultSpec 未注册模型的兜底值
@@ -78,18 +131,33 @@ func IsKnown(modelID string) bool {
 func AllSpecs() []sdk.ModelInfo {
 	models := make([]sdk.ModelInfo, 0, len(registry))
 	for id, spec := range registry {
-		models = append(models, sdk.ModelInfo{
-			ID:               id,
-			Name:             spec.Name,
-			ContextWindow:    spec.ContextWindow,
-			MaxOutputTokens:  spec.MaxOutputTokens,
-			InputPrice:       spec.InputPrice,
-			OutputPrice:      spec.OutputPrice,
-			CachedInputPrice: spec.CachedPrice,
-		})
+		models = append(models, toModelInfo(id, spec))
 	}
 	sort.Slice(models, func(i, j int) bool {
 		return models[i].ID < models[j].ID
 	})
 	return models
+}
+
+// toModelInfo 将内部 Spec 映射为 SDK ModelInfo，供 manifest 生成与费用计算共用。
+func toModelInfo(id string, spec Spec) sdk.ModelInfo {
+	return sdk.ModelInfo{
+		ID:                          id,
+		Name:                        spec.Name,
+		ContextWindow:               spec.ContextWindow,
+		MaxOutputTokens:             spec.MaxOutputTokens,
+		InputPrice:                  spec.InputPrice,
+		OutputPrice:                 spec.OutputPrice,
+		CachedInputPrice:            spec.CachedPrice,
+		InputPricePriority:          spec.InputPricePriority,
+		OutputPricePriority:         spec.OutputPricePriority,
+		CachedInputPricePriority:    spec.CachedPricePriority,
+		InputPriceFlex:              spec.InputPriceFlex,
+		OutputPriceFlex:             spec.OutputPriceFlex,
+		CachedInputPriceFlex:        spec.CachedPriceFlex,
+		LongContextThreshold:        spec.LongContextThreshold,
+		LongContextInputMultiplier:  spec.LongContextInputMultiplier,
+		LongContextOutputMultiplier: spec.LongContextOutputMultiplier,
+		LongContextCachedMultiplier: spec.LongContextCachedMultiplier,
+	}
 }

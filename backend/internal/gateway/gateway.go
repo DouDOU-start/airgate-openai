@@ -509,26 +509,41 @@ func (g *OpenAIGateway) HandleRequest(ctx context.Context, _, path, _ string, _ 
 }
 
 // fillCost 根据模型定价填充 ForwardResult 的费用字段
+//
+// 使用 SDK 的 CalculateCost 统一处理 standard / priority / flex 三档
+// 以及 gpt-5.4 家族的长上下文阶梯。插件侧只负责把 Spec 翻译成 ModelInfo。
 func fillCost(result *sdk.ForwardResult) {
 	if result == nil || result.Model == "" {
 		return
 	}
 	spec := model.Lookup(result.Model)
+	modelInfo := sdk.ModelInfo{
+		InputPrice:                  spec.InputPrice,
+		OutputPrice:                 spec.OutputPrice,
+		CachedInputPrice:            spec.CachedPrice,
+		InputPricePriority:          spec.InputPricePriority,
+		OutputPricePriority:         spec.OutputPricePriority,
+		CachedInputPricePriority:    spec.CachedPricePriority,
+		InputPriceFlex:              spec.InputPriceFlex,
+		OutputPriceFlex:             spec.OutputPriceFlex,
+		CachedInputPriceFlex:        spec.CachedPriceFlex,
+		LongContextThreshold:        spec.LongContextThreshold,
+		LongContextInputMultiplier:  spec.LongContextInputMultiplier,
+		LongContextOutputMultiplier: spec.LongContextOutputMultiplier,
+		LongContextCachedMultiplier: spec.LongContextCachedMultiplier,
+	}
 	cost := sdk.CalculateCost(sdk.CostInput{
 		InputTokens:       result.InputTokens,
 		OutputTokens:      result.OutputTokens,
 		CachedInputTokens: result.CachedInputTokens,
 		ServiceTier:       result.ServiceTier,
-	}, sdk.ModelInfo{
-		InputPrice:       spec.InputPrice,
-		OutputPrice:      spec.OutputPrice,
-		CachedInputPrice: spec.CachedPrice,
-	})
+	}, modelInfo)
 	result.InputCost = cost.InputCost
 	result.OutputCost = cost.OutputCost
 	result.CachedInputCost = cost.CachedInputCost
 
-	// 回填单价（$/1M token）
+	// 回填标准档单价用于 usage_log 展示（$/1M token）
+	// 注：此处只写标准单价，实际计费中若命中 priority/flex/长上下文会反映在 *_cost 字段
 	result.InputPrice = spec.InputPrice
 	result.OutputPrice = spec.OutputPrice
 	result.CachedInputPrice = spec.CachedPrice
