@@ -167,7 +167,14 @@ func buildAPIKeyURL(account *sdk.Account, reqPath string) string {
 // 请求预处理
 // ──────────────────────────────────────────────────────
 
-// preprocessRequestBody 预处理请求体（同步 model 字段，并做轻量 context guard 与 input 规范化）
+// preprocessRequestBody 统一预处理请求体。
+//
+// 在 forwardHTTP 入口调用，保证 API Key / OAuth / Anthropic 等所有路径
+// 拿到的 body 格式一致。当前处理步骤：
+//  1. model 同步（body 中的 model 与核心调度选定的 model 对齐）
+//  2. 剔除客户端 previous_response_id（多账号调度下不可靠，会话接续由网关内部管理）
+//  3. 上下文守卫（/v1/chat/completions 超长 messages 裁剪）
+//  4. input 规范化（/v1/responses 的 string input → list，messages → input 转换）
 func preprocessRequestBody(body []byte, model, reqPath string) []byte {
 	if len(body) == 0 {
 		return body
@@ -182,6 +189,12 @@ func preprocessRequestBody(body []byte, model, reqPath string) []byte {
 			}
 		}
 	}
+
+	// 剔除客户端传入的 previous_response_id。
+	// AirGate 在多个上游账号之间做负载均衡，客户端的 previous_response_id
+	// 可能指向另一个账号的 response，上游会返回 "not found"。
+	// 会话接续由网关内部的 session 机制（OAuth sessionState / Anthropic digestChain）管理。
+	result, _ = dropPreviousResponseIDFromJSON(result)
 
 	result = applyContextGuard(result, reqPath)
 	result = normalizeResponsesInput(result, reqPath)
@@ -298,7 +311,8 @@ func (g *OpenAIGateway) buildWSRequest(req *sdk.ForwardRequest, session openAISe
 	if err != nil {
 		return nil, err
 	}
-	return applyForceInstructions(body, req.Headers), nil
+	// applyForceInstructions 已在 forwardHTTP 入口统一处理
+	return body, nil
 }
 
 // applyForceInstructions 若请求头中指定了 X-Airgate-Force-Instructions 则强制覆盖 instructions 字段。
@@ -402,10 +416,10 @@ func applyContinuationState(reqData map[string]any, session openAISessionResolut
 		return reqData
 	}
 
-	previousResponseID := strings.TrimSpace(gjson.GetBytes(mustJSON(reqData), "previous_response_id").String())
-	if previousResponseID == "" && session.PreviousRespID != "" && hasFunctionCallOutput(reqData) {
-		reqData["previous_response_id"] = session.PreviousRespID
-	}
+	// 不再从 session 回填 previous_response_id。
+	// 多账号调度下，上一轮 response 可能在另一个账号上，注入后上游会返回 "not found"；
+	// 且 function_call_output 自带 call_id，上游可以靠 call_id 匹配，不依赖 previous_response_id。
+	// 客户端的 previous_response_id 已在 preprocessRequestBody 统一剔除。
 	return reqData
 }
 
@@ -418,9 +432,4 @@ func dropPreviousResponseIDFromJSON(body []byte) ([]byte, bool) {
 		return body, false
 	}
 	return next, true
-}
-
-func mustJSON(v any) []byte {
-	data, _ := json.Marshal(v)
-	return data
 }

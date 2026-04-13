@@ -41,6 +41,13 @@ func (g *OpenAIGateway) forwardHTTP(ctx context.Context, req *sdk.ForwardRequest
 		return buildLocalModelsResponse(), nil
 	}
 
+	// 统一预处理请求体：model 同步、上下文守卫、input 规范化、force instructions。
+	// 在 API Key / OAuth 分发之前执行，保证两条路径拿到的 body 格式一致。
+	// 注：Anthropic 路径有自己的 applyForceInstructions（在格式转换之后），不走这里。
+	_, reqPath := resolveAPIKeyRoute(req)
+	req.Body = preprocessRequestBody(req.Body, req.Model, reqPath)
+	req.Body = applyForceInstructions(req.Body, req.Headers)
+
 	account := req.Account
 
 	if account.Credentials["api_key"] != "" {
@@ -114,12 +121,7 @@ func (g *OpenAIGateway) forwardAPIKey(ctx context.Context, req *sdk.ForwardReque
 	// 解析上游请求方法与路径
 	reqMethod, reqPath := resolveAPIKeyRoute(req)
 	targetURL := buildAPIKeyURL(account, reqPath)
-	// 预处理请求体（含 model 同步与上下文预算守卫）
 	body := req.Body
-	if methodAllowsBody(reqMethod) {
-		body = preprocessRequestBody(body, req.Model, reqPath)
-		body = applyForceInstructions(body, req.Headers)
-	}
 
 	var bodyReader io.Reader
 	if methodAllowsBody(reqMethod) && len(body) > 0 {
@@ -323,15 +325,6 @@ func (g *OpenAIGateway) forwardOAuth(ctx context.Context, req *sdk.ForwardReques
 	result, err := runAttempt(createMsg, w)
 	if err != nil {
 		return nil, err
-	}
-	if result.Err != nil && (strings.Contains(result.Err.Error(), "上游续链锚点失效") || strings.Contains(strings.ToLower(result.Err.Error()), "previous response")) {
-		if retried, changed := dropPreviousResponseIDFromJSON(createMsg); changed {
-			g.logger.Warn("检测到 previous_response_id 失效，降级为 full create 重试一次", "session", session.SessionKey)
-			result, err = runAttempt(retried, w)
-			if err != nil {
-				return nil, err
-			}
-		}
 	}
 	if session.SessionKey != "" {
 		if result.ResponseID != "" {

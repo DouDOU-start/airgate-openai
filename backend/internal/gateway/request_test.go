@@ -2,7 +2,7 @@ package gateway
 
 import "testing"
 
-func TestApplyContinuationStateBackfillsPreviousResponseIDForFunctionCallOutput(t *testing.T) {
+func TestApplyContinuationStateDoesNotBackfillPreviousResponseID(t *testing.T) {
 	reqBody := map[string]any{
 		"input": []any{
 			map[string]any{
@@ -15,8 +15,8 @@ func TestApplyContinuationStateBackfillsPreviousResponseIDForFunctionCallOutput(
 
 	session := openAISessionResolution{PreviousRespID: "resp_prev"}
 	reqBody = applyContinuationState(reqBody, session)
-	if got, _ := reqBody["previous_response_id"].(string); got != "resp_prev" {
-		t.Fatalf("expected previous_response_id to be backfilled, got %q", got)
+	if got, _ := reqBody["previous_response_id"].(string); got != "" {
+		t.Fatalf("expected previous_response_id to NOT be backfilled, got %q", got)
 	}
 }
 

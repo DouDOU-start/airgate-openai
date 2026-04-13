@@ -25,7 +25,8 @@ func wrapAsResponsesAPI(body []byte, model string) ([]byte, error) {
 }
 
 func wrapAsResponsesAPIWithTier(body []byte, model string, reqServiceTierOverride string) ([]byte, error) {
-	// 已是 Responses 格式（有 input 字段），直接补齐默认字段
+	// 已是 Responses 格式（有 input 字段），直接补齐默认字段。
+	// input 格式规范化（string → list）已在 forwardHTTP 入口统一完成。
 	if gjson.GetBytes(body, "input").Exists() {
 		return ensureResponsesDefaultsWithTier(body, reqServiceTierOverride), nil
 	}

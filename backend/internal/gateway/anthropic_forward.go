@@ -59,10 +59,7 @@ func (g *OpenAIGateway) forwardAnthropicMessage(ctx context.Context, req *sdk.Fo
 		return &sdk.ForwardResult{StatusCode: statusCode, Duration: time.Since(start)}, nil
 	}
 
-	// 2. 同步 model/stream
-	if req.Model != "" && gjson.GetBytes(body, "model").String() != req.Model {
-		body, _ = sjson.SetBytes(body, "model", req.Model)
-	}
+	// 2. 同步 stream（model 同步已在 forwardHTTP 入口的 preprocessRequestBody 统一处理）
 	if req.Stream && !gjson.GetBytes(body, "stream").Bool() {
 		body, _ = sjson.SetBytes(body, "stream", true)
 	}
