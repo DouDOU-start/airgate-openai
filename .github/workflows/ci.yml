@@ -16,6 +16,20 @@ jobs:
       - name: Clone airgate-sdk (go.work replace)
         run: git clone --depth 1 https://github.com/DouDOU-start/airgate-sdk.git ../airgate-sdk
 
+      - name: Create go.work to use cloned airgate-sdk
+        # 本地开发时 go.work 被 gitignore，CI 在这里临时生成一份，
+        # 让 backend 的 Go 构建也直接使用 sibling 的 airgate-sdk master，
+        # 避免每次 SDK 新增字段都要手动 bump backend/go.mod。
+        run: |
+          cat > go.work <<'EOF'
+          go 1.25.7
+
+          use (
+              ./backend
+              ../airgate-sdk
+          )
+          EOF
+
       - uses: actions/setup-node@v4
         with:
           node-version: 20
