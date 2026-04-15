@@ -299,22 +299,60 @@ func (g *OpenAIGateway) forwardOAuth(ctx context.Context, req *sdk.ForwardReques
 		return nil, fmt.Errorf("构建 WebSocket 请求失败: %w", err)
 	}
 
-	var lastHandler *sseEventWriter
+	// 协议分叉：客户端如果走的是 /v1/chat/completions（而不是原生 /v1/responses），
+	// OAuth 上游依然只吐 Responses API 的 SSE 事件——需要把这些事件翻译回 Chat
+	// Completions 协议，否则标准 OpenAI SDK 的 chat.completions.create 无法解析。
+	isChatCompletions := isChatCompletionsRequest(req)
+	chatStreamInclude := isChatCompletions && req.Stream &&
+		gjson.GetBytes(req.Body, "stream_options.include_usage").Bool()
+
+	var (
+		lastSSEHandler *sseEventWriter
+		lastChatWriter *chatCompletionsStreamWriter
+		lastSilent     *chatCompletionsSilentHandler
+	)
+
 	runAttempt := func(msg []byte, w http.ResponseWriter) (WSResult, error) {
 		if err := conn.WriteJSON(json.RawMessage(msg)); err != nil {
 			return WSResult{}, fmt.Errorf("发送 WebSocket 消息失败: %w", err)
 		}
-		handler := &sseEventWriter{w: w, accountID: account.ID, sessionKey: session.SessionKey, start: start}
-		if f, ok := w.(http.Flusher); ok {
-			handler.flusher = f
+		var handler WSEventHandler
+		switch {
+		case isChatCompletions && req.Stream:
+			writer := newChatCompletionsStreamWriter(
+				w, req.Model, account.ID, session.SessionKey, chatStreamInclude, start,
+			)
+			lastChatWriter = writer
+			handler = writer
+		case isChatCompletions && !req.Stream:
+			silent := &chatCompletionsSilentHandler{
+				accountID:  account.ID,
+				sessionKey: session.SessionKey,
+				start:      start,
+			}
+			lastSilent = silent
+			handler = silent
+		default:
+			sseHandler := &sseEventWriter{
+				w:          w,
+				accountID:  account.ID,
+				sessionKey: session.SessionKey,
+				start:      start,
+			}
+			if f, ok := w.(http.Flusher); ok {
+				sseHandler.flusher = f
+			}
+			lastSSEHandler = sseHandler
+			handler = sseHandler
 		}
-		lastHandler = handler
 		return ReceiveWSResponse(ctx, conn, handler), nil
 	}
 
-	// 设置 SSE 响应头
 	w := req.Writer
-	if w != nil {
+
+	// 流式响应头：chat.completions 流式 + 原生 responses 都走 SSE；
+	// 非流式 chat.completions 延后到 result 就绪后再写 application/json。
+	if w != nil && (!isChatCompletions || req.Stream) {
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.Header().Set("Cache-Control", "no-cache")
 		w.Header().Set("Connection", "keep-alive")
@@ -332,19 +370,38 @@ func (g *OpenAIGateway) forwardOAuth(ctx context.Context, req *sdk.ForwardReques
 		}
 	}
 
-	// 发送 SSE 结束标记
-	if w != nil {
-		if _, err := fmt.Fprint(w, "data: [DONE]\n\n"); err == nil {
-			if flusher, ok := w.(http.Flusher); ok {
-				flusher.Flush()
+	// 结束标记 / 响应体写回
+	switch {
+	case isChatCompletions && req.Stream:
+		if lastChatWriter != nil {
+			lastChatWriter.finalize()
+		}
+	case isChatCompletions && !req.Stream:
+		if result.Err == nil && w != nil {
+			body := buildNonStreamChatCompletion(result, req.Model)
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write(body)
+		}
+	default:
+		if w != nil {
+			if _, err := fmt.Fprint(w, "data: [DONE]\n\n"); err == nil {
+				if flusher, ok := w.(http.Flusher); ok {
+					flusher.Flush()
+				}
 			}
 		}
 	}
 
 	elapsed := time.Since(start)
 	firstTokenMs := elapsed.Milliseconds()
-	if lastHandler != nil && lastHandler.firstTokenMs > 0 {
-		firstTokenMs = lastHandler.firstTokenMs
+	switch {
+	case lastChatWriter != nil && lastChatWriter.firstTokenMs > 0:
+		firstTokenMs = lastChatWriter.firstTokenMs
+	case lastSSEHandler != nil && lastSSEHandler.firstTokenMs > 0:
+		firstTokenMs = lastSSEHandler.firstTokenMs
+	case lastSilent != nil && lastSilent.firstTokenMs > 0:
+		firstTokenMs = lastSilent.firstTokenMs
 	}
 	fwdResult := &sdk.ForwardResult{
 		StatusCode:            http.StatusOK,
