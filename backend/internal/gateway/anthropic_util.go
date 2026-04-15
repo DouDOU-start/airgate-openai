@@ -70,6 +70,26 @@ func normalizeAnthropicStopReason(reason string) string {
 	}
 }
 
+// anthropicValidStopReasons Claude 官方 stop_reason 合法枚举
+// 参考：https://docs.anthropic.com/en/api/messages
+var anthropicValidStopReasons = map[string]struct{}{
+	"end_turn":      {},
+	"max_tokens":    {},
+	"stop_sequence": {},
+	"tool_use":      {},
+	"refusal":       {},
+	"pause_turn":    {},
+}
+
+// ensureAnthropicStopReason 兜底白名单校验：如果 normalize 后的值不在合法集合里，
+// 统一降级为 "end_turn"，避免把 OpenAI 内部的奇怪 reason 泄漏给客户端。
+func ensureAnthropicStopReason(reason string) string {
+	if _, ok := anthropicValidStopReasons[reason]; ok {
+		return reason
+	}
+	return "end_turn"
+}
+
 // ──────────────────────────────────────────────────────
 // 工具名缩短
 // ──────────────────────────────────────────────────────

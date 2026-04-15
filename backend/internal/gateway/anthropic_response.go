@@ -54,10 +54,13 @@ func convertResponsesEventToAnthropic(rawLine []byte, originalRequest []byte, st
 
 	switch typeStr {
 	case "response.created":
-		// 注：message_start 的 usage 全部填零（Anthropic 标准做法），
-		// 真实 token 数在 message_delta（response.completed）时下发。
-		// 必须包含完整的 4 个字段，否则下游（如 sub2api）按字段是否存在做判断会出现统计偏差。
-		template := `{"type":"message_start","message":{"id":"","type":"message","role":"assistant","model":"","stop_sequence":null,"usage":{"input_tokens":0,"output_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":0},"content":[],"stop_reason":null}}`
+		// message_start 的 usage 必须对齐 Claude 官方 schema：
+		// - input_tokens / output_tokens / cache_creation_input_tokens / cache_read_input_tokens：4 个核心字段
+		// - cache_creation：嵌套对象（ephemeral_5m / ephemeral_1h），新版 Claude API 新增
+		// - service_tier：配额档位，固定 "standard"
+		// - server_tool_use：服务端工具调用统计，通常为 null
+		// 真实 token 数在 message_delta（response.completed）时下发，这里初始化为 0。
+		template := `{"type":"message_start","message":{"id":"","type":"message","role":"assistant","model":"","stop_sequence":null,"usage":{"input_tokens":0,"output_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":0},"service_tier":"standard","server_tool_use":null},"content":[],"stop_reason":null}}`
 		// 使用原始 Claude 模型名，让 Claude Code 正确识别模型能力（上下文按钮等）
 		modelName := model
 		if modelName == "" {
@@ -65,7 +68,9 @@ func convertResponsesEventToAnthropic(rawLine []byte, originalRequest []byte, st
 		}
 		template, _ = sjson.Set(template, "message.model", modelName)
 		template, _ = sjson.Set(template, "message.id", normalizeAnthropicMessageID(root.Get("response.id").String()))
-		return "event: message_start\n" + fmt.Sprintf("data: %s\n\n", template)
+		// Claude 官方流式序列：message_start 之后紧跟一个 ping 事件，客户端用它确认连接已建立。
+		return "event: message_start\n" + fmt.Sprintf("data: %s\n\n", template) +
+			"event: ping\ndata: {\"type\":\"ping\"}\n\n"
 
 	case "response.reasoning_summary_part.added":
 		// 若仍有未关闭的 text block，先关闭它
@@ -211,20 +216,25 @@ func convertResponsesEventToAnthropic(rawLine []byte, originalRequest []byte, st
 		prefix += closeOpenThinkingBlock(state)
 
 		// 构建 message_delta
-		// usage 字段必须保持 Anthropic 完整 schema（4 个 token 字段都要有），
-		// 否则下游解析器（如 sub2api parseSSEUsagePassthrough）做 Exists() / >0 判断会丢字段。
+		// usage 字段对齐 Claude 官方完整 schema，否则下游解析器（如 sub2api parseSSEUsagePassthrough）
+		// 做 Exists() / >0 判断会丢字段。
 		// cache_creation_input_tokens 保持 0：OpenAI Responses API 不区分 cache creation vs read，
 		// 所有命中缓存的 prompt 都归在 cached_tokens（→ cache_read_input_tokens）。
-		template := `{"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"input_tokens":0,"output_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}`
+		template := `{"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"input_tokens":0,"output_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":0},"service_tier":"standard","server_tool_use":null}}`
 
-		stopReason := root.Get("response.stop_reason").String()
+		var finalStop string
 		if state.HasToolCall {
-			template, _ = sjson.Set(template, "delta.stop_reason", "tool_use")
-		} else if stopReason == "max_tokens" {
-			template, _ = sjson.Set(template, "delta.stop_reason", "max_tokens")
+			finalStop = "tool_use"
 		} else {
-			// "stop" / "" / 其他值统一映射为 Anthropic 的 "end_turn"
-			template, _ = sjson.Set(template, "delta.stop_reason", "end_turn")
+			finalStop = normalizeAnthropicStopReason(root.Get("response.stop_reason").String())
+		}
+		// 最终再过一层白名单校验，只允许 Anthropic 官方合法枚举
+		finalStop = ensureAnthropicStopReason(finalStop)
+		template, _ = sjson.Set(template, "delta.stop_reason", finalStop)
+
+		// stop_sequence 若上游带了则透传，不会破坏合法性（null 亦合规）
+		if seq := root.Get("response.stop_sequence"); seq.Exists() && seq.Type != gjson.Null {
+			template, _ = sjson.SetRaw(template, "delta.stop_sequence", seq.Raw)
 		}
 
 		template, _ = sjson.Set(template, "usage.input_tokens", inputTokens)
@@ -368,8 +378,8 @@ func convertResponsesCompletedToAnthropicJSON(
 
 	revNames := buildReverseToolNameMap(originalRequest)
 
-	// usage 必须包含完整的 4 个 token 字段，避免下游按字段存在性判断时漏字段
-	out := `{"id":"","type":"message","role":"assistant","model":"","content":[],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":0,"output_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}`
+	// usage 对齐 Claude 官方完整 schema：4 个 token 字段 + cache_creation 嵌套对象 + service_tier + server_tool_use
+	out := `{"id":"","type":"message","role":"assistant","model":"","content":[],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":0,"output_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":0},"service_tier":"standard","server_tool_use":null}}`
 	out, _ = sjson.Set(out, "id", normalizeAnthropicMessageID(responseData.Get("id").String()))
 	// 始终使用原始 Claude 模型名，让 Claude Code 正确识别模型能力
 	out, _ = sjson.Set(out, "model", model)
@@ -479,13 +489,13 @@ func convertResponsesCompletedToAnthropicJSON(
 		out, _ = sjson.SetRaw(out, "content.-1", `{"type":"text","text":""}`)
 	}
 
+	var finalStop string
 	if hasToolCall {
-		out, _ = sjson.Set(out, "stop_reason", "tool_use")
-	} else if sr := responseData.Get("stop_reason").String(); sr == "max_tokens" {
-		out, _ = sjson.Set(out, "stop_reason", "max_tokens")
+		finalStop = "tool_use"
 	} else {
-		out, _ = sjson.Set(out, "stop_reason", "end_turn")
+		finalStop = normalizeAnthropicStopReason(responseData.Get("stop_reason").String())
 	}
+	out, _ = sjson.Set(out, "stop_reason", ensureAnthropicStopReason(finalStop))
 
 	if stopSeq := responseData.Get("stop_sequence"); stopSeq.Exists() && stopSeq.Type != gjson.Null {
 		out, _ = sjson.SetRaw(out, "stop_sequence", stopSeq.Raw)
@@ -545,6 +555,7 @@ func translateResponsesSSEToAnthropicSSE(
 	start time.Time,
 	session openAISessionResolution,
 ) (*sdk.ForwardResult, error) {
+	setAnthropicStyleResponseHeaders(w)
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")

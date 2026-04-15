@@ -468,6 +468,7 @@ func (g *OpenAIGateway) handleAnthropicNonStreamFromResponses(
 	}
 
 	if w != nil {
+		setAnthropicStyleResponseHeaders(w)
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte(anthropicJSON))

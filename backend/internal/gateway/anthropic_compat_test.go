@@ -182,6 +182,83 @@ func TestConvertResponsesCompletedToAnthropicJSON_FallbackFromDeltas(t *testing.
 	}
 }
 
+func TestEnsureAnthropicStopReason(t *testing.T) {
+	cases := map[string]string{
+		"end_turn":      "end_turn",
+		"max_tokens":    "max_tokens",
+		"stop_sequence": "stop_sequence",
+		"tool_use":      "tool_use",
+		"refusal":       "refusal",
+		"pause_turn":    "pause_turn",
+		// 非法值统一降级为 end_turn
+		"":               "end_turn",
+		"some_garbage":   "end_turn",
+		"content_filter": "end_turn", // 未经 normalize 的原始值不在白名单里
+	}
+	for in, want := range cases {
+		if got := ensureAnthropicStopReason(in); got != want {
+			t.Errorf("ensureAnthropicStopReason(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+func TestGenerateAnthropicRequestID_Format(t *testing.T) {
+	for i := 0; i < 5; i++ {
+		id := generateAnthropicRequestID()
+		if !strings.HasPrefix(id, "req_01") {
+			t.Fatalf("request id %q missing req_01 prefix", id)
+		}
+		// req_01 + 32 字符 hex = 38 字符
+		if len(id) != 38 {
+			t.Fatalf("request id %q length = %d, want 38", id, len(id))
+		}
+	}
+}
+
+func TestGenerateCloudflareRay_Format(t *testing.T) {
+	for i := 0; i < 5; i++ {
+		ray := generateCloudflareRay()
+		if !strings.HasSuffix(ray, "-SJC") {
+			t.Fatalf("cf-ray %q missing -SJC suffix", ray)
+		}
+		// 16 字符 hex + "-SJC" = 20 字符
+		if len(ray) != 20 {
+			t.Fatalf("cf-ray %q length = %d, want 20", ray, len(ray))
+		}
+	}
+}
+
+// 验证流式 message_start 事件后紧跟 ping 事件，对齐 Claude 官方行为
+func TestConvertResponsesEventToAnthropic_MessageStartEmitsPing(t *testing.T) {
+	state := &anthropicStreamState{}
+	line := []byte(`data: {"type":"response.created","response":{"id":"resp_xyz","model":"gpt-5"}}`)
+	out := convertResponsesEventToAnthropic(line, nil, state, "claude-sonnet-4-6")
+
+	if !strings.Contains(out, "event: message_start") {
+		t.Fatalf("missing message_start event, got: %s", out)
+	}
+	if !strings.Contains(out, "event: ping") {
+		t.Fatalf("missing ping event, got: %s", out)
+	}
+	if !strings.Contains(out, `"type":"ping"`) {
+		t.Fatalf("ping event payload wrong, got: %s", out)
+	}
+	// message_start 必须在 ping 前面
+	msi := strings.Index(out, "message_start")
+	pi := strings.Index(out, "ping")
+	if msi < 0 || pi < 0 || msi > pi {
+		t.Fatalf("message_start must come before ping, got: %s", out)
+	}
+	// id 前缀规范化
+	if !strings.Contains(out, `"id":"msg_xyz"`) {
+		t.Fatalf("message id not normalized to msg_ prefix, got: %s", out)
+	}
+	// usage 必须包含 service_tier
+	if !strings.Contains(out, `"service_tier":"standard"`) {
+		t.Fatalf("message_start usage missing service_tier, got: %s", out)
+	}
+}
+
 func TestNormalizeAnthropicMessageID(t *testing.T) {
 	cases := map[string]string{
 		"":                              "",
