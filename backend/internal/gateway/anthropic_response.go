@@ -30,6 +30,8 @@ type anthropicStreamState struct {
 	OutputTokens              int
 	CachedInputTokens         int
 	ReasoningOutputTokens     int
+	TextBlockOpen             bool              // 当前是否已打开 text content block（用于容错上游跳过 content_part.added 的情况）
+	ThinkingBlockOpen         bool              // 当前是否已打开 thinking content block
 	reverseNameMap            map[string]string // 缓存 short→original 工具名映射，避免每次事件重建
 }
 
@@ -62,41 +64,73 @@ func convertResponsesEventToAnthropic(rawLine []byte, originalRequest []byte, st
 			modelName = root.Get("response.model").String()
 		}
 		template, _ = sjson.Set(template, "message.model", modelName)
-		template, _ = sjson.Set(template, "message.id", root.Get("response.id").String())
+		template, _ = sjson.Set(template, "message.id", normalizeAnthropicMessageID(root.Get("response.id").String()))
 		return "event: message_start\n" + fmt.Sprintf("data: %s\n\n", template)
 
 	case "response.reasoning_summary_part.added":
+		// 若仍有未关闭的 text block，先关闭它
+		closePrefix := closeOpenTextBlock(state)
 		template := `{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}`
 		template, _ = sjson.Set(template, "index", state.BlockIndex)
-		return "event: content_block_start\n" + fmt.Sprintf("data: %s\n\n", template)
+		state.ThinkingBlockOpen = true
+		return closePrefix + "event: content_block_start\n" + fmt.Sprintf("data: %s\n\n", template)
 
 	case "response.reasoning_summary_text.delta":
+		// 容错：上游若跳过 reasoning_summary_part.added，这里按需补开
+		var prefix string
+		if !state.ThinkingBlockOpen {
+			prefix = closeOpenTextBlock(state)
+			startTpl := `{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}`
+			startTpl, _ = sjson.Set(startTpl, "index", state.BlockIndex)
+			prefix += "event: content_block_start\n" + fmt.Sprintf("data: %s\n\n", startTpl)
+			state.ThinkingBlockOpen = true
+		}
 		template := `{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":""}}`
 		template, _ = sjson.Set(template, "index", state.BlockIndex)
 		template, _ = sjson.Set(template, "delta.thinking", root.Get("delta").String())
-		return "event: content_block_delta\n" + fmt.Sprintf("data: %s\n\n", template)
+		return prefix + "event: content_block_delta\n" + fmt.Sprintf("data: %s\n\n", template)
 
 	case "response.reasoning_summary_part.done":
+		if !state.ThinkingBlockOpen {
+			return ""
+		}
 		template := `{"type":"content_block_stop","index":0}`
 		template, _ = sjson.Set(template, "index", state.BlockIndex)
 		state.BlockIndex++
+		state.ThinkingBlockOpen = false
 		return "event: content_block_stop\n" + fmt.Sprintf("data: %s\n\n", template)
 
 	case "response.content_part.added":
+		// 若仍有未关闭的 thinking block，先关闭
+		closePrefix := closeOpenThinkingBlock(state)
 		template := `{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}`
 		template, _ = sjson.Set(template, "index", state.BlockIndex)
-		return "event: content_block_start\n" + fmt.Sprintf("data: %s\n\n", template)
+		state.TextBlockOpen = true
+		return closePrefix + "event: content_block_start\n" + fmt.Sprintf("data: %s\n\n", template)
 
 	case "response.output_text.delta":
+		// 容错：上游若跳过 content_part.added，这里按需补开 text block
+		var prefix string
+		if !state.TextBlockOpen {
+			prefix = closeOpenThinkingBlock(state)
+			startTpl := `{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}`
+			startTpl, _ = sjson.Set(startTpl, "index", state.BlockIndex)
+			prefix += "event: content_block_start\n" + fmt.Sprintf("data: %s\n\n", startTpl)
+			state.TextBlockOpen = true
+		}
 		template := `{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":""}}`
 		template, _ = sjson.Set(template, "index", state.BlockIndex)
 		template, _ = sjson.Set(template, "delta.text", root.Get("delta").String())
-		return "event: content_block_delta\n" + fmt.Sprintf("data: %s\n\n", template)
+		return prefix + "event: content_block_delta\n" + fmt.Sprintf("data: %s\n\n", template)
 
 	case "response.content_part.done":
+		if !state.TextBlockOpen {
+			return ""
+		}
 		template := `{"type":"content_block_stop","index":0}`
 		template, _ = sjson.Set(template, "index", state.BlockIndex)
 		state.BlockIndex++
+		state.TextBlockOpen = false
 		return "event: content_block_stop\n" + fmt.Sprintf("data: %s\n\n", template)
 
 	case "response.output_item.added":
@@ -105,6 +139,10 @@ func convertResponsesEventToAnthropic(rawLine []byte, originalRequest []byte, st
 		if itemType == "function_call" {
 			state.HasToolCall = true
 			state.HasReceivedArgumentsDelta = false
+
+			// 工具调用前若仍有未关闭的 text/thinking 内容块，先关闭，保证事件序列成对
+			closePrefix := closeOpenTextBlock(state)
+			closePrefix += closeOpenThinkingBlock(state)
 
 			// 还原工具短名（懒初始化缓存）
 			if state.reverseNameMap == nil {
@@ -120,7 +158,7 @@ func convertResponsesEventToAnthropic(rawLine []byte, originalRequest []byte, st
 			template, _ = sjson.Set(template, "content_block.id", item.Get("call_id").String())
 			template, _ = sjson.Set(template, "content_block.name", name)
 
-			output := "event: content_block_start\n" + fmt.Sprintf("data: %s\n\n", template)
+			output := closePrefix + "event: content_block_start\n" + fmt.Sprintf("data: %s\n\n", template)
 
 			// 紧跟一个空 input_json_delta
 			deltaTemplate := `{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":""}}`
@@ -168,6 +206,10 @@ func convertResponsesEventToAnthropic(rawLine []byte, originalRequest []byte, st
 		state.CachedInputTokens = int(cachedTokens)
 		state.ReasoningOutputTokens = int(reasoningTokens)
 
+		// 先关闭任何未显式关闭的 text/thinking 内容块，避免 SSE 事件序列不成对
+		prefix := closeOpenTextBlock(state)
+		prefix += closeOpenThinkingBlock(state)
+
 		// 构建 message_delta
 		// usage 字段必须保持 Anthropic 完整 schema（4 个 token 字段都要有），
 		// 否则下游解析器（如 sub2api parseSSEUsagePassthrough）做 Exists() / >0 判断会丢字段。
@@ -189,7 +231,7 @@ func convertResponsesEventToAnthropic(rawLine []byte, originalRequest []byte, st
 		template, _ = sjson.Set(template, "usage.output_tokens", outputTokens)
 		template, _ = sjson.Set(template, "usage.cache_read_input_tokens", cachedTokens)
 
-		output := "event: message_delta\n" + fmt.Sprintf("data: %s\n\n", template)
+		output := prefix + "event: message_delta\n" + fmt.Sprintf("data: %s\n\n", template)
 		output += "event: message_stop\n" + "data: {\"type\":\"message_stop\"}\n\n"
 		return output
 
@@ -211,6 +253,48 @@ func convertResponsesEventToAnthropic(rawLine []byte, originalRequest []byte, st
 
 	// 忽略未知事件（web_search_call.* 等）
 	return ""
+}
+
+// closeOpenTextBlock 如果当前有未关闭的 text content block，返回对应的 content_block_stop SSE 片段；否则返回空
+func closeOpenTextBlock(state *anthropicStreamState) string {
+	if !state.TextBlockOpen {
+		return ""
+	}
+	template := `{"type":"content_block_stop","index":0}`
+	template, _ = sjson.Set(template, "index", state.BlockIndex)
+	state.BlockIndex++
+	state.TextBlockOpen = false
+	return "event: content_block_stop\n" + fmt.Sprintf("data: %s\n\n", template)
+}
+
+// closeOpenThinkingBlock 如果当前有未关闭的 thinking content block，返回对应的 content_block_stop SSE 片段；否则返回空
+func closeOpenThinkingBlock(state *anthropicStreamState) string {
+	if !state.ThinkingBlockOpen {
+		return ""
+	}
+	template := `{"type":"content_block_stop","index":0}`
+	template, _ = sjson.Set(template, "index", state.BlockIndex)
+	state.BlockIndex++
+	state.ThinkingBlockOpen = false
+	return "event: content_block_stop\n" + fmt.Sprintf("data: %s\n\n", template)
+}
+
+// normalizeAnthropicMessageID 把 OpenAI Responses API 的 `resp_...` id 规范化为 Anthropic 风格的 `msg_...`。
+// Anthropic 官方 message id 固定使用 `msg_` 前缀，部分 SDK / 下游消费方会以此为前缀做类型识别。
+// 保持后缀不变，确保和 Core 侧的请求追踪 ID 仍能对应。
+func normalizeAnthropicMessageID(id string) string {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return ""
+	}
+	if strings.HasPrefix(id, "msg_") {
+		return id
+	}
+	if strings.HasPrefix(id, "resp_") {
+		return "msg_" + strings.TrimPrefix(id, "resp_")
+	}
+	// 未知前缀兜底：直接加 msg_ 前缀，避免返回空或破坏下游解析
+	return "msg_" + id
 }
 
 // buildAnthropicStreamError 构建 Anthropic SSE 错误事件
@@ -257,7 +341,21 @@ func mapResponsesErrorType(errType, errCode string) string {
 // ──────────────────────────────────────────────────────
 
 // convertResponsesCompletedToAnthropicJSON 将 Responses completed 事件转为 Anthropic 非流式 JSON 响应
-func convertResponsesCompletedToAnthropicJSON(completedJSON, originalRequest []byte, model string) string {
+//
+// 上游行为说明：
+//   - 有的上游（如官方 Responses API）会在 response.completed 事件中带上完整的
+//     response.output[] 数组，包含所有 message/reasoning/function_call 内容。
+//   - 有的上游（如 ChatGPT WebSocket 会话）只把 output_text/reasoning 通过 delta 事件流式下发，
+//     而 response.completed 只带 metadata（id / model / usage），output[] 缺失或为空。
+//
+// 因此除了尝试从 completed 事件解析 output[] 之外，还必须回退到 ParseSSEStream 聚合出的
+// wsResult.Text / wsResult.Reasoning / wsResult.ToolUses，才能保证 Anthropic 客户端
+// 拿到非空的 content 数组。
+func convertResponsesCompletedToAnthropicJSON(
+	completedJSON, originalRequest []byte,
+	model string,
+	wsResult *WSResult,
+) string {
 	root := gjson.ParseBytes(completedJSON)
 	if typeStr := root.Get("type").String(); typeStr != "response.completed" && typeStr != "response.done" {
 		return ""
@@ -272,7 +370,7 @@ func convertResponsesCompletedToAnthropicJSON(completedJSON, originalRequest []b
 
 	// usage 必须包含完整的 4 个 token 字段，避免下游按字段存在性判断时漏字段
 	out := `{"id":"","type":"message","role":"assistant","model":"","content":[],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":0,"output_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}`
-	out, _ = sjson.Set(out, "id", responseData.Get("id").String())
+	out, _ = sjson.Set(out, "id", normalizeAnthropicMessageID(responseData.Get("id").String()))
 	// 始终使用原始 Claude 模型名，让 Claude Code 正确识别模型能力
 	out, _ = sjson.Set(out, "model", model)
 
@@ -281,6 +379,8 @@ func convertResponsesCompletedToAnthropicJSON(completedJSON, originalRequest []b
 	out, _ = sjson.Set(out, "usage.output_tokens", outputTokens)
 	out, _ = sjson.Set(out, "usage.cache_read_input_tokens", cachedTokens)
 
+	hasThinking := false
+	hasText := false
 	hasToolCall := false
 
 	if output := responseData.Get("output"); output.Exists() && output.IsArray() {
@@ -292,6 +392,7 @@ func convertResponsesCompletedToAnthropicJSON(completedJSON, originalRequest []b
 					block := `{"type":"thinking","thinking":""}`
 					block, _ = sjson.Set(block, "thinking", thinking)
 					out, _ = sjson.SetRaw(out, "content.-1", block)
+					hasThinking = true
 				}
 			case "message":
 				content := item.Get("content")
@@ -302,6 +403,7 @@ func convertResponsesCompletedToAnthropicJSON(completedJSON, originalRequest []b
 								block := `{"type":"text","text":""}`
 								block, _ = sjson.Set(block, "text", text)
 								out, _ = sjson.SetRaw(out, "content.-1", block)
+								hasText = true
 							}
 						}
 					}
@@ -309,6 +411,7 @@ func convertResponsesCompletedToAnthropicJSON(completedJSON, originalRequest []b
 					block := `{"type":"text","text":""}`
 					block, _ = sjson.Set(block, "text", text)
 					out, _ = sjson.SetRaw(out, "content.-1", block)
+					hasText = true
 				}
 			case "function_call":
 				hasToolCall = true
@@ -330,6 +433,50 @@ func convertResponsesCompletedToAnthropicJSON(completedJSON, originalRequest []b
 				out, _ = sjson.SetRaw(out, "content.-1", toolBlock)
 			}
 		}
+	}
+
+	// 回退：completed 事件没带完整 output 时，用 ParseSSEStream 聚合的 delta 内容补齐
+	if wsResult != nil {
+		if !hasThinking && wsResult.Reasoning != "" {
+			block := `{"type":"thinking","thinking":""}`
+			block, _ = sjson.Set(block, "thinking", wsResult.Reasoning)
+			out, _ = sjson.SetRaw(out, "content.-1", block)
+			hasThinking = true
+		}
+		if !hasText && wsResult.Text != "" {
+			block := `{"type":"text","text":""}`
+			block, _ = sjson.Set(block, "text", wsResult.Text)
+			out, _ = sjson.SetRaw(out, "content.-1", block)
+			hasText = true
+		}
+		if !hasToolCall && len(wsResult.ToolUses) > 0 {
+			for _, tu := range wsResult.ToolUses {
+				name := ""
+				if tu.Name != nil {
+					name = *tu.Name
+				}
+				if original, ok := revNames[name]; ok {
+					name = original
+				}
+				toolBlock := `{"type":"tool_use","id":"","name":"","input":{}}`
+				toolBlock, _ = sjson.Set(toolBlock, "id", tu.ID)
+				toolBlock, _ = sjson.Set(toolBlock, "name", name)
+				inputRaw := "{}"
+				if len(tu.Input) > 0 && gjson.ValidBytes(tu.Input) {
+					if parsed := gjson.ParseBytes(tu.Input); parsed.IsObject() {
+						inputRaw = parsed.Raw
+					}
+				}
+				toolBlock, _ = sjson.SetRaw(toolBlock, "input", inputRaw)
+				out, _ = sjson.SetRaw(out, "content.-1", toolBlock)
+				hasToolCall = true
+			}
+		}
+	}
+
+	// 如果最终还是没有任何内容块，至少塞一个空 text block，避免客户端 SDK 访问 content[0] 崩溃
+	if !hasThinking && !hasText && !hasToolCall {
+		out, _ = sjson.SetRaw(out, "content.-1", `{"type":"text","text":""}`)
 	}
 
 	if hasToolCall {

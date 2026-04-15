@@ -5,6 +5,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/tidwall/gjson"
 )
 
 func TestNormalizeAnthropicStopReason(t *testing.T) {
@@ -108,5 +110,90 @@ func TestParseSSEStream_AggregatesWebSearchToolUse(t *testing.T) {
 	wantInput := fmt.Sprintf(`{"query":%q}`, query)
 	if string(tool.Input) != wantInput {
 		t.Fatalf("websearch input = %s, want %s", string(tool.Input), wantInput)
+	}
+}
+
+// 上游只通过 delta 下发文本、response.completed 里 output 为空的场景（真实 ChatGPT WebSocket 会话行为）
+// 回退必须把 wsResult.Text 补到非流式响应的 content 数组里，否则客户端拿到空 content。
+func TestConvertResponsesCompletedToAnthropicJSON_FallbackFromDeltas(t *testing.T) {
+	sse := strings.Join([]string{
+		`data: {"type":"response.created","response":{"id":"resp_abc123"}}`,
+		`data: {"type":"response.reasoning_summary_text.delta","delta":"think-"}`,
+		`data: {"type":"response.reasoning_summary_text.delta","delta":"step"}`,
+		`data: {"type":"response.output_text.delta","delta":"你好"}`,
+		`data: {"type":"response.output_text.delta","delta":"，世界"}`,
+		`data: {"type":"response.completed","response":{"id":"resp_abc123","model":"gpt-5","usage":{"input_tokens":7,"output_tokens":13}}}`,
+		"",
+	}, "\n")
+
+	result := ParseSSEStream(strings.NewReader(sse), nil)
+	if result.Err != nil {
+		t.Fatalf("ParseSSEStream err: %v", result.Err)
+	}
+	if result.Text != "你好，世界" {
+		t.Fatalf("aggregated text = %q, want %q", result.Text, "你好，世界")
+	}
+
+	jsonOut := convertResponsesCompletedToAnthropicJSON(
+		result.CompletedEventRaw,
+		nil,
+		"claude-sonnet-4-6",
+		&result,
+	)
+	if jsonOut == "" {
+		t.Fatalf("convertResponsesCompletedToAnthropicJSON returned empty")
+	}
+
+	// id 前缀必须从 resp_ 规范化为 msg_
+	if id := gjson.Get(jsonOut, "id").String(); id != "msg_abc123" {
+		t.Fatalf("id = %q, want msg_abc123", id)
+	}
+	if model := gjson.Get(jsonOut, "model").String(); model != "claude-sonnet-4-6" {
+		t.Fatalf("model = %q, want claude-sonnet-4-6", model)
+	}
+	if sr := gjson.Get(jsonOut, "stop_reason").String(); sr != "end_turn" {
+		t.Fatalf("stop_reason = %q, want end_turn", sr)
+	}
+
+	// content 必须非空，并且应包含 thinking + text 两个块
+	contentLen := gjson.Get(jsonOut, "content.#").Int()
+	if contentLen < 2 {
+		t.Fatalf("content length = %d, want >= 2, full=%s", contentLen, jsonOut)
+	}
+	if got := gjson.Get(jsonOut, "content.0.type").String(); got != "thinking" {
+		t.Fatalf("content[0].type = %q, want thinking", got)
+	}
+	if got := gjson.Get(jsonOut, "content.0.thinking").String(); got != "think-step" {
+		t.Fatalf("content[0].thinking = %q, want think-step", got)
+	}
+	if got := gjson.Get(jsonOut, "content.1.type").String(); got != "text" {
+		t.Fatalf("content[1].type = %q, want text", got)
+	}
+	if got := gjson.Get(jsonOut, "content.1.text").String(); got != "你好，世界" {
+		t.Fatalf("content[1].text = %q, want %q", got, "你好，世界")
+	}
+
+	// usage 字段要带齐 4 个 token 字段
+	if inp := gjson.Get(jsonOut, "usage.input_tokens").Int(); inp != 7 {
+		t.Fatalf("usage.input_tokens = %d, want 7", inp)
+	}
+	if out := gjson.Get(jsonOut, "usage.output_tokens").Int(); out != 13 {
+		t.Fatalf("usage.output_tokens = %d, want 13", out)
+	}
+}
+
+func TestNormalizeAnthropicMessageID(t *testing.T) {
+	cases := map[string]string{
+		"":                              "",
+		"resp_abc123":                   "msg_abc123",
+		"msg_xyz":                       "msg_xyz",
+		"  resp_trim  ":                 "msg_trim",
+		"resp_0a530ec6a62d78460169df00": "msg_0a530ec6a62d78460169df00",
+		"unknown_prefix_99":             "msg_unknown_prefix_99",
+	}
+	for in, want := range cases {
+		if got := normalizeAnthropicMessageID(in); got != want {
+			t.Errorf("normalizeAnthropicMessageID(%q) = %q, want %q", in, got, want)
+		}
 	}
 }

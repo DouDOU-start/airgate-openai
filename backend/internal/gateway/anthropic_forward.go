@@ -455,7 +455,8 @@ func (g *OpenAIGateway) handleAnthropicNonStreamFromResponses(
 	}
 
 	// 客户端响应体使用原始 Claude 模型名（model）
-	anthropicJSON := convertResponsesCompletedToAnthropicJSON(wsResult.CompletedEventRaw, originalRequest, model)
+	// 传入整份 wsResult，让转换器在 completed 事件缺少完整 output 时能回退到 delta 累积的内容
+	anthropicJSON := convertResponsesCompletedToAnthropicJSON(wsResult.CompletedEventRaw, originalRequest, model, &wsResult)
 	if anthropicJSON == "" {
 		return nil, fmt.Errorf("responses 非流回译失败")
 	}
