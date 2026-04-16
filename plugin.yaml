@@ -53,19 +53,6 @@ gateway:
       path: /responses
       description: Responses API WebSocket（无 /v1 前缀）
   models:
-    - id: gpt-5-codex-mini
-      name: GPT 5 Codex Mini
-      context_window: 128000
-      max_output_tokens: 128000
-      input_price: 0.25
-      output_price: 2
-      cached_input_price: 0.025
-      input_price_priority: 0.5
-      output_price_priority: 4
-      cached_input_price_priority: 0.05
-      input_price_flex: 0.125
-      output_price_flex: 1
-      cached_input_price_flex: 0.0125
     - id: gpt-5.2
       name: GPT 5.2
       context_window: 272000
@@ -122,6 +109,19 @@ gateway:
       long_context_input_multiplier: 2
       long_context_output_multiplier: 1.5
       long_context_cached_multiplier: 2
+    - id: gpt-5.4-mini
+      name: GPT 5.4 Mini
+      context_window: 128000
+      max_output_tokens: 128000
+      input_price: 0.75
+      output_price: 4.5
+      cached_input_price: 0.075
+      input_price_priority: 1.5
+      output_price_priority: 9
+      cached_input_price_priority: 0.15
+      input_price_flex: 0.375
+      output_price_flex: 2.25
+      cached_input_price_flex: 0.0375
   account_types:
     - key: apikey
       label: API Key

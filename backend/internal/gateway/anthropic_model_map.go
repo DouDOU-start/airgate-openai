@@ -42,7 +42,7 @@ var (
 	)
 	// haikuFallbackModel Haiku 降级模型：当主模型不可用时回退
 	haikuFallbackModel = resolveRoleTargetModel(
-		"gpt-5-codex-mini",
+		"gpt-5.4-mini",
 		"AIRGATE_MODEL_HAIKU_FALLBACK",
 	)
 	// opusFallbackModel Opus 降级模型：普通账号不支持 gpt-5.4 时回退

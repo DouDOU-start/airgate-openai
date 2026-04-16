@@ -85,7 +85,7 @@ var registry = map[string]Spec{
 	// ── Codex 5.x ──
 	"gpt-5.3-codex":       std("GPT 5.3 Codex", 272000, 128000, 1.75, 0.175, 14.0),
 	"gpt-5.3-codex-spark": std("GPT 5.3 Codex Spark", 128000, 128000, 1.75, 0.175, 14.0),
-	"gpt-5-codex-mini":    std("GPT 5 Codex Mini", 128000, 128000, 0.25, 0.025, 2.0),
+	"gpt-5.4-mini":        std("GPT 5.4 Mini", 128000, 128000, 0.75, 0.075, 4.5),
 
 	// ── GPT 基础系列 ──
 	"gpt-5.2": std("GPT 5.2", 272000, 128000, 1.75, 0.175, 14.0),
