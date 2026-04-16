@@ -2,8 +2,10 @@ package gateway
 
 import (
 	"net/http"
+	"strings"
 	"time"
 
+	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 
 	sdk "github.com/DouDOU-start/airgate-sdk"
@@ -25,6 +27,21 @@ func accountStatusFromCode(statusCode int) sdk.AccountStatus {
 	default:
 		return sdk.AccountStatusOK
 	}
+}
+
+// accountStatusFromAnthropicBody 从 Anthropic 错误响应体推断账号状态。
+// Anthropic 某些账号级错误（如组织被封禁）走 400，accountStatusFromCode 无法识别，
+// 需额外检查 error.message 内容。
+func accountStatusFromAnthropicBody(statusCode int, body []byte) sdk.AccountStatus {
+	base := accountStatusFromCode(statusCode)
+	if base != sdk.AccountStatusOK || statusCode != 400 {
+		return base
+	}
+	msg := strings.ToLower(gjson.GetBytes(body, "error.message").String())
+	if strings.Contains(msg, "disabled") || strings.Contains(msg, "deactivated") || strings.Contains(msg, "suspended") {
+		return sdk.AccountStatusDisabled
+	}
+	return base
 }
 
 // anthropicErrorType 根据 HTTP 状态码返回 Anthropic 错误类型

@@ -518,25 +518,32 @@ func (g *OpenAIGateway) writeAnthropicUpstreamError(
 	}
 
 	errType := anthropicErrorType(statusCode)
+	accountStatus := accountStatusFromAnthropicBody(statusCode, body)
 
-	if w != nil {
+	// 账号级错误（被禁用 / 限流 / 凭证失效，包括 400 "organization disabled" 这类）：
+	//   1. 不写 w — 保持 c.Writer 处于 unwritten 状态，让 Core 的 canFailover 检查不被
+	//      "stream already written" 短路，从而能正常切换账号重试。
+	//   2. 返回 error — 触发 Core 的 failover 循环和 ReportAccountError 惩罚逻辑。
+	// 客户端侧错误（请求参数有误、context 超长等）才写 w，并返回 nil 让 Core 识别为
+	// client error 不做 failover。
+	isAccountError := accountStatus != sdk.AccountStatusOK
+	if !isAccountError && w != nil {
 		writeAnthropicErrorJSON(w, statusCode, errType, errMsg)
 	}
 
 	result := &sdk.ForwardResult{
 		StatusCode:    statusCode,
 		Duration:      time.Since(start),
-		AccountStatus: accountStatusFromCode(statusCode),
+		AccountStatus: accountStatus,
 		ErrorMessage:  errMsg,
 	}
-
-	if statusCode >= 500 || statusCode == 429 {
-		if statusCode == 429 {
-			result.RetryAfter = parseRetryDelay(errMsg)
-		}
-		return result, fmt.Errorf("上游返回 %d: %s", statusCode, errMsg)
+	if statusCode == 429 {
+		result.RetryAfter = parseRetryDelay(errMsg)
 	}
 
+	if isAccountError || statusCode >= 500 {
+		return result, fmt.Errorf("上游返回 %d: %s", statusCode, errMsg)
+	}
 	return result, nil
 }
 

@@ -253,9 +253,15 @@ func TestConvertResponsesEventToAnthropic_MessageStartEmitsPing(t *testing.T) {
 	if !strings.Contains(out, `"id":"msg_xyz"`) {
 		t.Fatalf("message id not normalized to msg_ prefix, got: %s", out)
 	}
-	// usage 必须包含 service_tier
-	if !strings.Contains(out, `"service_tier":"standard"`) {
-		t.Fatalf("message_start usage missing service_tier, got: %s", out)
+	// usage 必须只含 4 个核心 token 字段，不含非标准的 service_tier / server_tool_use / cache_creation
+	if strings.Contains(out, `"service_tier"`) {
+		t.Fatalf("message_start usage must NOT contain service_tier, got: %s", out)
+	}
+	if strings.Contains(out, `"server_tool_use"`) {
+		t.Fatalf("message_start usage must NOT contain server_tool_use, got: %s", out)
+	}
+	if strings.Contains(out, `"cache_creation":{"`) {
+		t.Fatalf("message_start usage must NOT contain nested cache_creation object, got: %s", out)
 	}
 }
 

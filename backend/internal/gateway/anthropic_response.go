@@ -54,13 +54,13 @@ func convertResponsesEventToAnthropic(rawLine []byte, originalRequest []byte, st
 
 	switch typeStr {
 	case "response.created":
-		// message_start 的 usage 必须对齐 Claude 官方 schema：
-		// - input_tokens / output_tokens / cache_creation_input_tokens / cache_read_input_tokens：4 个核心字段
-		// - cache_creation：嵌套对象（ephemeral_5m / ephemeral_1h），新版 Claude API 新增
-		// - service_tier：配额档位，固定 "standard"
-		// - server_tool_use：服务端工具调用统计，通常为 null
+		// message_start 的 usage 对齐 Claude 官方 schema 的 4 个核心字段：
+		// - input_tokens / output_tokens / cache_creation_input_tokens / cache_read_input_tokens
 		// 真实 token 数在 message_delta（response.completed）时下发，这里初始化为 0。
-		template := `{"type":"message_start","message":{"id":"","type":"message","role":"assistant","model":"","stop_sequence":null,"usage":{"input_tokens":0,"output_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":0},"service_tier":"standard","server_tool_use":null},"content":[],"stop_reason":null}}`
+		// 注意：不包含 cache_creation 嵌套对象、service_tier、server_tool_use：
+		//   - 这些非标准字段会触发 Anthropic TypeScript SDK 的 "Cannot read properties of undefined" 错误
+		//   - 尤其 server_tool_use: null → JS `||` 运算转为 undefined → undefined.input_tokens 报错
+		template := `{"type":"message_start","message":{"id":"","type":"message","role":"assistant","model":"","stop_sequence":null,"usage":{"input_tokens":0,"output_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":0},"content":[],"stop_reason":null}}`
 		// 使用原始 Claude 模型名，让 Claude Code 正确识别模型能力（上下文按钮等）
 		modelName := model
 		if modelName == "" {
@@ -216,11 +216,12 @@ func convertResponsesEventToAnthropic(rawLine []byte, originalRequest []byte, st
 		prefix += closeOpenThinkingBlock(state)
 
 		// 构建 message_delta
-		// usage 字段对齐 Claude 官方完整 schema，否则下游解析器（如 sub2api parseSSEUsagePassthrough）
-		// 做 Exists() / >0 判断会丢字段。
-		// cache_creation_input_tokens 保持 0：OpenAI Responses API 不区分 cache creation vs read，
-		// 所有命中缓存的 prompt 都归在 cached_tokens（→ cache_read_input_tokens）。
-		template := `{"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"input_tokens":0,"output_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":0},"service_tier":"standard","server_tool_use":null}}`
+		// usage 仅包含 output_tokens，与 Claude 官方协议的 MessageDeltaUsage 对齐。
+		// 原先包含的 cache_creation、service_tier、server_tool_use: null 均为非标准字段，
+		// 会导致 Anthropic TypeScript SDK 抛出 "Cannot read properties of undefined (reading 'input_tokens')"：
+		//   server_tool_use: null → JS `||` 运算变为 undefined → undefined.input_tokens 崩溃。
+		// input_tokens / cache_read_input_tokens 已通过 state.InputTokens 传递给计费层，无需写入 SSE 流。
+		template := `{"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"output_tokens":0}}`
 
 		var finalStop string
 		if state.HasToolCall {
@@ -237,9 +238,7 @@ func convertResponsesEventToAnthropic(rawLine []byte, originalRequest []byte, st
 			template, _ = sjson.SetRaw(template, "delta.stop_sequence", seq.Raw)
 		}
 
-		template, _ = sjson.Set(template, "usage.input_tokens", inputTokens)
 		template, _ = sjson.Set(template, "usage.output_tokens", outputTokens)
-		template, _ = sjson.Set(template, "usage.cache_read_input_tokens", cachedTokens)
 
 		output := prefix + "event: message_delta\n" + fmt.Sprintf("data: %s\n\n", template)
 		output += "event: message_stop\n" + "data: {\"type\":\"message_stop\"}\n\n"
@@ -378,8 +377,9 @@ func convertResponsesCompletedToAnthropicJSON(
 
 	revNames := buildReverseToolNameMap(originalRequest)
 
-	// usage 对齐 Claude 官方完整 schema：4 个 token 字段 + cache_creation 嵌套对象 + service_tier + server_tool_use
-	out := `{"id":"","type":"message","role":"assistant","model":"","content":[],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":0,"output_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":0},"service_tier":"standard","server_tool_use":null}}`
+	// usage 对齐 Claude 官方 schema 的 4 个核心 token 字段，不含非标准字段
+	// （cache_creation 嵌套对象、service_tier、server_tool_use: null 均会触发 SDK 解析错误）
+	out := `{"id":"","type":"message","role":"assistant","model":"","content":[],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":0,"output_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}`
 	out, _ = sjson.Set(out, "id", normalizeAnthropicMessageID(responseData.Get("id").String()))
 	// 始终使用原始 Claude 模型名，让 Claude Code 正确识别模型能力
 	out, _ = sjson.Set(out, "model", model)
