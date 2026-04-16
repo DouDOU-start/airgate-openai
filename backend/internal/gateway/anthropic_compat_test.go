@@ -253,15 +253,18 @@ func TestConvertResponsesEventToAnthropic_MessageStartEmitsPing(t *testing.T) {
 	if !strings.Contains(out, `"id":"msg_xyz"`) {
 		t.Fatalf("message id not normalized to msg_ prefix, got: %s", out)
 	}
-	// usage 必须只含 4 个核心 token 字段，不含非标准的 service_tier / server_tool_use / cache_creation
-	if strings.Contains(out, `"service_tier"`) {
-		t.Fatalf("message_start usage must NOT contain service_tier, got: %s", out)
+	// usage 必须包含 Claude Code usage 累加器要求的完整字段：
+	// - service_tier 字段（原生 Anthropic 下发）
+	// - cache_creation 嵌套对象（Mo$ 合并函数直接访问 .ephemeral_1h_input_tokens，缺失会崩）
+	if !strings.Contains(out, `"service_tier":"standard"`) {
+		t.Fatalf("message_start usage missing service_tier, got: %s", out)
 	}
-	if strings.Contains(out, `"server_tool_use"`) {
-		t.Fatalf("message_start usage must NOT contain server_tool_use, got: %s", out)
+	if !strings.Contains(out, `"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":0}`) {
+		t.Fatalf("message_start usage missing cache_creation nested object, got: %s", out)
 	}
-	if strings.Contains(out, `"cache_creation":{"`) {
-		t.Fatalf("message_start usage must NOT contain nested cache_creation object, got: %s", out)
+	// 但绝不能包含 server_tool_use: null —— 会触发 JS `||` 短路转 undefined 后访问 .input_tokens 崩溃
+	if strings.Contains(out, `"server_tool_use":null`) {
+		t.Fatalf("message_start usage must NOT contain server_tool_use:null (triggers SDK undefined.input_tokens), got: %s", out)
 	}
 }
 
