@@ -85,12 +85,10 @@ var registry = map[string]Spec{
 	// ── Codex 5.x ──
 	"gpt-5.3-codex":       std("GPT 5.3 Codex", 272000, 128000, 1.75, 0.175, 14.0),
 	"gpt-5.3-codex-spark": std("GPT 5.3 Codex Spark", 128000, 128000, 1.75, 0.175, 14.0),
-	"gpt-5-codex":         std("GPT 5 Codex", 272000, 128000, 1.25, 0.125, 10.0),
 	"gpt-5-codex-mini":    std("GPT 5 Codex Mini", 128000, 128000, 0.25, 0.025, 2.0),
 
 	// ── GPT 基础系列 ──
-	"gpt-5.2":    std("GPT 5.2", 272000, 128000, 1.75, 0.175, 14.0),
-	"gpt-5-mini": std("GPT 5 Mini", 128000, 16384, 0.125, 0.025, 1.0),
+	"gpt-5.2": std("GPT 5.2", 272000, 128000, 1.75, 0.175, 14.0),
 }
 
 // DefaultSpec 未注册模型的兜底值

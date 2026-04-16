@@ -503,6 +503,60 @@ func (g *OpenAIGateway) HandleRequest(ctx context.Context, _, path, _ string, _ 
 			"account_name": result.AccountName,
 		}), nil
 
+	case "oauth/import-refresh":
+		var raw struct {
+			RefreshToken string `json:"refresh_token"`
+			ProxyURL     string `json:"proxy_url"`
+		}
+		if err := json.Unmarshal(body, &raw); err != nil || strings.TrimSpace(raw.RefreshToken) == "" {
+			return http.StatusBadRequest, nil, jsonError("缺少 refresh_token 参数"), nil
+		}
+		result, err := g.ImportFromRefreshToken(context.Background(), raw.RefreshToken, raw.ProxyURL)
+		if err != nil {
+			return http.StatusInternalServerError, nil, jsonError(err.Error()), nil
+		}
+		return http.StatusOK, nil, jsonMarshal(map[string]any{
+			"account_type": result.AccountType,
+			"credentials":  result.Credentials,
+			"account_name": result.AccountName,
+		}), nil
+
+	case "oauth/batch-import-refresh":
+		var raw struct {
+			RefreshTokens []string `json:"refresh_tokens"`
+			ProxyURL      string   `json:"proxy_url"`
+		}
+		if err := json.Unmarshal(body, &raw); err != nil || len(raw.RefreshTokens) == 0 {
+			return http.StatusBadRequest, nil, jsonError("缺少 refresh_tokens 参数"), nil
+		}
+
+		type batchResult struct {
+			AccountType string            `json:"account_type,omitempty"`
+			AccountName string            `json:"account_name,omitempty"`
+			Credentials map[string]string `json:"credentials,omitempty"`
+			Status      string            `json:"status"`
+			Error       string            `json:"error,omitempty"`
+		}
+
+		results := make([]batchResult, 0, len(raw.RefreshTokens))
+		for _, rt := range raw.RefreshTokens {
+			if strings.TrimSpace(rt) == "" {
+				continue
+			}
+			imported, err := g.ImportFromRefreshToken(context.Background(), rt, raw.ProxyURL)
+			if err != nil {
+				results = append(results, batchResult{Status: "failed", Error: err.Error()})
+				continue
+			}
+			results = append(results, batchResult{
+				Status:      "ok",
+				AccountType: imported.AccountType,
+				AccountName: imported.AccountName,
+				Credentials: imported.Credentials,
+			})
+		}
+		return http.StatusOK, nil, jsonMarshal(map[string]any{"results": results}), nil
+
 	default:
 		return http.StatusNotFound, nil, jsonError("未知的操作: " + path), nil
 	}

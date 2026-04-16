@@ -337,7 +337,7 @@ func (g *OpenAIGateway) forwardAnthropicResponses(
 			return &sdk.ForwardResult{
 				StatusCode:    resp.StatusCode,
 				Duration:      time.Since(start),
-				AccountStatus: accountStatusFromCode(resp.StatusCode),
+				AccountStatus: accountStatusFromAnthropicBody(resp.StatusCode, body),
 				RetryAfter:    extractRetryAfterHeader(resp.Header),
 			}, body, nil
 		}

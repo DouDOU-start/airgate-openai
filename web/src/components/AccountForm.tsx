@@ -1,5 +1,21 @@
-import { useState, useCallback } from 'react';
+import { useState, useCallback, useEffect } from 'react';
 import { cssVar } from '@airgate/theme';
+
+/** 批量导入单条结果 */
+export interface BatchExchangeResult {
+  accountType: string;
+  accountName: string;
+  credentials: Record<string, string>;
+  status: 'ok' | 'failed';
+  error?: string;
+}
+
+/** 批量导入账号项 */
+export interface BatchAccountInput {
+  name: string;
+  type: string;
+  credentials: Record<string, string>;
+}
 
 /** 账号表单 Props（由核心 AccountsPage 注入） */
 export interface AccountFormProps {
@@ -9,6 +25,10 @@ export interface AccountFormProps {
   accountType?: string;
   onAccountTypeChange?: (type: string) => void;
   onSuggestedName?: (name: string) => void;
+  /** 进入/退出批量模式时通知外层，用于隐藏"下一步/创建"按钮 */
+  onBatchModeChange?: (isBatch: boolean) => void;
+  /** 批量导入账号，由核心侧调用 accountsApi.import 完成落库 */
+  onBatchImport?: (accounts: BatchAccountInput[]) => Promise<{ imported: number; failed: number }>;
   oauth?: {
     start: () => Promise<{ authorizeURL: string; state: string }>;
     exchange: (callbackURL: string) => Promise<{
@@ -16,6 +36,12 @@ export interface AccountFormProps {
       accountName: string;
       credentials: Record<string, string>;
     }>;
+    importRefresh?: (refreshToken: string) => Promise<{
+      accountType: string;
+      accountName: string;
+      credentials: Record<string, string>;
+    }>;
+    batchImportRefresh?: (refreshTokens: string[]) => Promise<BatchExchangeResult[]>;
   };
 }
 
@@ -86,7 +112,31 @@ const descStyle: React.CSSProperties = {
   marginTop: '0.25rem',
 };
 
+const pillStyle: React.CSSProperties = {
+  display: 'inline-block',
+  padding: '0.25rem 0.75rem',
+  borderRadius: '9999px',
+  fontSize: '0.75rem',
+  cursor: 'pointer',
+  transition: 'all 0.15s',
+  borderWidth: '1px',
+  borderStyle: 'solid',
+  borderColor: cssVar('glassBorder'),
+  color: cssVar('textSecondary'),
+  backgroundColor: 'transparent',
+};
+
+const pillActiveStyle: React.CSSProperties = {
+  ...pillStyle,
+  borderColor: cssVar('primary'),
+  color: cssVar('primary'),
+  backgroundColor: cssVar('primarySubtle'),
+};
+
 type AccountType = 'apikey' | 'oauth';
+
+/** OAuth 导入模式：浏览器授权 / 单个 Refresh Token / 批量 Refresh Token */
+type OAuthMode = 'browser' | 'refresh_single' | 'refresh_batch';
 
 function detectType(credentials: Record<string, string>): AccountType | '' {
   if (credentials.api_key) return 'apikey';
@@ -112,6 +162,32 @@ function parseJWTSubscription(token: string): { planType: string; subscriptionUn
   }
 }
 
+function parseRefreshTokenLines(text: string): string[] {
+  return text
+    .split('\n')
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0 && !line.startsWith('#'));
+}
+
+function StatusMessage({ status }: { status: { type: 'info' | 'success' | 'error'; text: string } | null }) {
+  if (!status) return null;
+  return (
+    <div
+      style={{
+        fontSize: '0.75rem',
+        color:
+          status.type === 'error'
+            ? cssVar('danger')
+            : status.type === 'success'
+              ? cssVar('success')
+              : cssVar('textSecondary'),
+      }}
+    >
+      {status.text}
+    </div>
+  );
+}
+
 export function AccountForm({
   credentials,
   onChange,
@@ -119,16 +195,30 @@ export function AccountForm({
   accountType: propType,
   onAccountTypeChange,
   onSuggestedName,
+  onBatchModeChange,
+  onBatchImport,
   oauth,
 }: AccountFormProps) {
   const [localType, setLocalType] = useState<AccountType | ''>(
     (propType as AccountType) || (mode === 'edit' ? detectType(credentials) : ''),
   );
+  const [oauthMode, setOauthMode] = useState<OAuthMode>('browser');
   const [authorizeURL, setAuthorizeURL] = useState('');
   const [callbackURL, setCallbackURL] = useState('');
+  const [refreshTokenInput, setRefreshTokenInput] = useState('');
+  const [batchText, setBatchText] = useState('');
+  const [batchPhase, setBatchPhase] = useState<'input' | 'running' | 'result'>('input');
+  const [batchResults, setBatchResults] = useState<BatchExchangeResult[]>([]);
+  const [batchImportedCount, setBatchImportedCount] = useState(0);
   const [oauthLoading, setOAuthLoading] = useState(false);
   const [oauthStatus, setOAuthStatus] = useState<{ type: 'info' | 'success' | 'error'; text: string } | null>(null);
   const accountType = (propType as AccountType | undefined) ?? localType;
+
+  // 进入/退出批量模式时通知外层隐藏"下一步/创建"按钮
+  const isBatchActive = mode === 'create' && accountType === 'oauth' && oauthMode === 'refresh_batch';
+  useEffect(() => {
+    onBatchModeChange?.(isBatchActive);
+  }, [isBatchActive, onBatchModeChange]);
 
   // 从 credentials 中读取订阅信息，没有则从 access_token JWT 解析
   const jwtInfo = (!credentials.plan_type && credentials.access_token)
@@ -151,6 +241,12 @@ export function AccountForm({
       setAuthorizeURL('');
       setCallbackURL('');
       setOAuthStatus(null);
+      setOauthMode('browser');
+      setRefreshTokenInput('');
+      setBatchText('');
+      setBatchPhase('input');
+      setBatchResults([]);
+      setBatchImportedCount(0);
       const baseUrl = credentials.base_url || '';
       if (type === 'apikey') {
         onChange({ api_key: '', base_url: baseUrl, provider: '' });
@@ -202,6 +298,70 @@ export function AccountForm({
     }
   }, [oauth, callbackURL, onAccountTypeChange, onChange, credentials, onSuggestedName]);
 
+  const submitRefreshTokenImport = useCallback(async () => {
+    if (!oauth?.importRefresh || !refreshTokenInput.trim()) return;
+    setOAuthLoading(true);
+    setOAuthStatus({ type: 'info', text: '正在使用 Refresh Token 换取凭证...' });
+    try {
+      const result = await oauth.importRefresh(refreshTokenInput.trim());
+      onAccountTypeChange?.(result.accountType || 'oauth');
+      onChange({ ...credentials, ...result.credentials });
+      if (result.accountName) {
+        onSuggestedName?.(result.accountName);
+      }
+      setOAuthStatus({ type: 'success', text: '导入成功，凭证已自动填充。' });
+      setRefreshTokenInput('');
+    } catch (error) {
+      setOAuthStatus({
+        type: 'error',
+        text: error instanceof Error ? error.message : 'Refresh Token 导入失败',
+      });
+    } finally {
+      setOAuthLoading(false);
+    }
+  }, [oauth, refreshTokenInput, onAccountTypeChange, onChange, credentials, onSuggestedName]);
+
+  const submitBatchRefreshImport = useCallback(async () => {
+    if (!oauth?.batchImportRefresh || !onBatchImport) {
+      setOAuthStatus({ type: 'error', text: '当前环境不支持批量导入' });
+      return;
+    }
+    const tokens = parseRefreshTokenLines(batchText);
+    if (tokens.length === 0) {
+      setOAuthStatus({ type: 'error', text: '请至少粘贴一个 Refresh Token（每行一个）' });
+      return;
+    }
+    setBatchPhase('running');
+    setOAuthStatus({ type: 'info', text: `正在批量换取 ${tokens.length} 个 Token...` });
+    try {
+      const results = await oauth.batchImportRefresh(tokens);
+      setBatchResults(results);
+      const successItems = results.filter((r) => r.status === 'ok' && r.credentials);
+      if (successItems.length > 0) {
+        const accounts: BatchAccountInput[] = successItems.map((r) => ({
+          name: r.accountName || r.credentials.email || 'OpenAI OAuth',
+          type: r.accountType || 'oauth',
+          credentials: r.credentials,
+        }));
+        const importResp = await onBatchImport(accounts);
+        setBatchImportedCount(importResp.imported);
+      }
+      setBatchPhase('result');
+      setOAuthStatus(null);
+    } catch (err) {
+      setBatchPhase('input');
+      setOAuthStatus({ type: 'error', text: err instanceof Error ? err.message : '批量导入失败' });
+    }
+  }, [batchText, oauth, onBatchImport]);
+
+  const resetBatch = useCallback(() => {
+    setBatchText('');
+    setBatchPhase('input');
+    setBatchResults([]);
+    setBatchImportedCount(0);
+    setOAuthStatus(null);
+  }, []);
+
   const copyAuthorizeURL = useCallback(async () => {
     if (!authorizeURL) return;
 
@@ -241,6 +401,36 @@ export function AccountForm({
     setOAuthStatus({ type: 'error', text: '自动复制不可用，请手动选中上方链接并按 Ctrl+C 复制。' });
   }, [authorizeURL]);
 
+  const primaryBtnStyle = (disabled: boolean): React.CSSProperties => ({
+    ...inputStyle,
+    cursor: disabled ? 'not-allowed' : 'pointer',
+    backgroundColor: cssVar('primary'),
+    color: 'white',
+    borderColor: 'transparent',
+    fontWeight: 500,
+    width: 'auto',
+    opacity: disabled ? 0.6 : 1,
+  });
+
+  const ghostBtnStyle = (disabled: boolean): React.CSSProperties => ({
+    ...inputStyle,
+    cursor: disabled ? 'not-allowed' : 'pointer',
+    backgroundColor: 'transparent',
+    color: cssVar('text'),
+    width: 'auto',
+    opacity: disabled ? 0.6 : 1,
+  });
+
+  const outlineBtnStyle = (disabled: boolean): React.CSSProperties => ({
+    ...inputStyle,
+    cursor: disabled ? 'not-allowed' : 'pointer',
+    backgroundColor: 'transparent',
+    color: cssVar('primary'),
+    borderColor: cssVar('primary'),
+    width: 'auto',
+    opacity: disabled ? 0.6 : 1,
+  });
+
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: '1rem' }}>
       {/* 账号类型选择（编辑模式下只读） */}
@@ -265,7 +455,7 @@ export function AccountForm({
             onClick={mode === 'create' ? () => handleTypeChange('oauth') : undefined}
           >
             <div style={{ fontSize: '0.875rem', fontWeight: 500, color: cssVar('text') }}>OAuth 登录</div>
-            <div style={descStyle}>通过浏览器授权登录</div>
+            <div style={descStyle}>支持浏览器授权 / Refresh Token 导入</div>
           </div>
         </div>
       </div>
@@ -343,141 +533,226 @@ export function AccountForm({
             </div>
           )}
 
-          {oauth && (
+          {oauth && mode === 'create' && (
             <div style={{ borderWidth: '1px', borderStyle: 'solid', borderColor: cssVar('glassBorder'), borderRadius: cssVar('radiusLg'), padding: '1rem', backgroundColor: cssVar('bgSurface') }}>
-              <div style={{ fontSize: '0.875rem', fontWeight: 600, color: cssVar('text'), marginBottom: '0.25rem' }}>
-                OAuth 授权辅助
+              <div style={{ fontSize: '0.875rem', fontWeight: 600, color: cssVar('text'), marginBottom: '0.5rem' }}>
+                授权方式
               </div>
-              <div style={{ ...descStyle, marginTop: 0, marginBottom: '0.75rem' }}>
-                先生成授权链接，在浏览器完成授权后，把完整回调 URL 粘贴回来完成交换。
-              </div>
-              <div style={{ display: 'flex', gap: '0.75rem', marginBottom: '0.75rem', flexWrap: 'wrap' }}>
-                <button
-                  type="button"
-                  onClick={startOAuth}
-                  disabled={oauthLoading}
-                  style={{
-                    ...inputStyle,
-                    cursor: oauthLoading ? 'not-allowed' : 'pointer',
-                    backgroundColor: cssVar('primary'),
-                    color: 'white',
-                    borderColor: 'transparent',
-                    fontWeight: 500,
-                    width: 'auto',
-                    opacity: oauthLoading ? 0.6 : 1,
-                  }}
+              <div style={{ display: 'flex', gap: '0.5rem', flexWrap: 'wrap', marginBottom: '0.875rem' }}>
+                <span
+                  style={oauthMode === 'browser' ? pillActiveStyle : pillStyle}
+                  onClick={() => setOauthMode('browser')}
                 >
-                  生成授权链接
-                </button>
-                <button
-                  type="button"
-                  onClick={copyAuthorizeURL}
-                  disabled={!authorizeURL || oauthLoading}
-                  style={{
-                    ...inputStyle,
-                    cursor: !authorizeURL || oauthLoading ? 'not-allowed' : 'pointer',
-                    backgroundColor: 'transparent',
-                    color: cssVar('text'),
-                    width: 'auto',
-                    opacity: !authorizeURL || oauthLoading ? 0.6 : 1,
-                  }}
-                >
-                  复制授权链接
-                </button>
-              </div>
-              <div style={{ marginBottom: '0.75rem' }}>
-                <label style={labelStyle}>授权链接</label>
-                <textarea
-                  style={{ ...inputStyle, minHeight: '155px', resize: 'vertical' }}
-                  readOnly
-                  placeholder='点击"生成授权链接"后，这里会显示完整授权地址'
-                  value={authorizeURL}
-                />
-              </div>
-              <div style={{ marginBottom: '0.75rem' }}>
-                <label style={labelStyle}>回调 URL</label>
-                <textarea
-                  style={{ ...inputStyle, minHeight: '76px', resize: 'vertical' }}
-                  placeholder="粘贴完整回调 URL，例如 http://localhost:1455/auth/callback?code=...&state=..."
-                  value={callbackURL}
-                  onChange={(e) => setCallbackURL(e.target.value)}
-                />
-              </div>
-              <div style={{ display: 'flex', gap: '0.75rem', alignItems: 'center', flexWrap: 'wrap' }}>
-                <button
-                  type="button"
-                  onClick={submitOAuthCallback}
-                  disabled={!callbackURL.trim() || oauthLoading}
-                  style={{
-                    ...inputStyle,
-                    cursor: !callbackURL.trim() || oauthLoading ? 'not-allowed' : 'pointer',
-                    backgroundColor: 'transparent',
-                    color: cssVar('primary'),
-                    borderColor: cssVar('primary'),
-                    width: 'auto',
-                    opacity: !callbackURL.trim() || oauthLoading ? 0.6 : 1,
-                  }}
-                >
-                  完成授权交换
-                </button>
-                {oauthStatus && (
-                  <div
-                    style={{
-                      fontSize: '0.75rem',
-                      color:
-                        oauthStatus.type === 'error'
-                          ? cssVar('danger')
-                          : oauthStatus.type === 'success'
-                            ? cssVar('success')
-                            : cssVar('textSecondary'),
-                    }}
+                  浏览器授权
+                </span>
+                {oauth.importRefresh && (
+                  <span
+                    style={oauthMode === 'refresh_single' ? pillActiveStyle : pillStyle}
+                    onClick={() => setOauthMode('refresh_single')}
                   >
-                    {oauthStatus.text}
-                  </div>
+                    Refresh Token 导入
+                  </span>
+                )}
+                {oauth.batchImportRefresh && onBatchImport && (
+                  <span
+                    style={oauthMode === 'refresh_batch' ? pillActiveStyle : pillStyle}
+                    onClick={() => setOauthMode('refresh_batch')}
+                  >
+                    批量导入
+                  </span>
                 )}
               </div>
+
+              {oauthMode === 'browser' && (
+                <>
+                  <div style={{ ...descStyle, marginTop: 0, marginBottom: '0.75rem' }}>
+                    先生成授权链接，在浏览器完成授权后，把完整回调 URL 粘贴回来完成交换。
+                  </div>
+                  <div style={{ display: 'flex', gap: '0.75rem', marginBottom: '0.75rem', flexWrap: 'wrap' }}>
+                    <button type="button" onClick={startOAuth} disabled={oauthLoading} style={primaryBtnStyle(oauthLoading)}>
+                      生成授权链接
+                    </button>
+                    <button type="button" onClick={copyAuthorizeURL} disabled={!authorizeURL || oauthLoading} style={ghostBtnStyle(!authorizeURL || oauthLoading)}>
+                      复制授权链接
+                    </button>
+                  </div>
+                  <div style={{ marginBottom: '0.75rem' }}>
+                    <label style={labelStyle}>授权链接</label>
+                    <textarea
+                      style={{ ...inputStyle, minHeight: '120px', resize: 'vertical' }}
+                      readOnly
+                      placeholder='点击"生成授权链接"后，这里会显示完整授权地址'
+                      value={authorizeURL}
+                    />
+                  </div>
+                  <div style={{ marginBottom: '0.75rem' }}>
+                    <label style={labelStyle}>回调 URL</label>
+                    <textarea
+                      style={{ ...inputStyle, minHeight: '76px', resize: 'vertical' }}
+                      placeholder="粘贴完整回调 URL，例如 http://localhost:1455/auth/callback?code=...&state=..."
+                      value={callbackURL}
+                      onChange={(e) => setCallbackURL(e.target.value)}
+                    />
+                  </div>
+                  <div style={{ display: 'flex', gap: '0.75rem', alignItems: 'center', flexWrap: 'wrap' }}>
+                    <button
+                      type="button"
+                      onClick={submitOAuthCallback}
+                      disabled={!callbackURL.trim() || oauthLoading}
+                      style={outlineBtnStyle(!callbackURL.trim() || oauthLoading)}
+                    >
+                      完成授权交换
+                    </button>
+                    <StatusMessage status={oauthStatus} />
+                  </div>
+                </>
+              )}
+
+              {oauthMode === 'refresh_single' && (
+                <>
+                  <div style={{ ...descStyle, marginTop: 0, marginBottom: '0.75rem' }}>
+                    粘贴已有的 Refresh Token，后台会自动刷新拿回 access_token 并解析用户信息。
+                  </div>
+                  <div style={{ marginBottom: '0.75rem' }}>
+                    <label style={labelStyle}>Refresh Token</label>
+                    <textarea
+                      style={{ ...inputStyle, minHeight: '90px', resize: 'vertical' }}
+                      placeholder="粘贴单个 Refresh Token"
+                      value={refreshTokenInput}
+                      onChange={(e) => setRefreshTokenInput(e.target.value)}
+                      autoComplete="off"
+                    />
+                  </div>
+                  <div style={{ display: 'flex', gap: '0.75rem', alignItems: 'center', flexWrap: 'wrap' }}>
+                    <button
+                      type="button"
+                      onClick={submitRefreshTokenImport}
+                      disabled={!refreshTokenInput.trim() || oauthLoading}
+                      style={primaryBtnStyle(!refreshTokenInput.trim() || oauthLoading)}
+                    >
+                      导入
+                    </button>
+                    <StatusMessage status={oauthStatus} />
+                  </div>
+                </>
+              )}
+
+              {oauthMode === 'refresh_batch' && (
+                <>
+                  {batchPhase === 'input' && (
+                    <>
+                      <div style={{ ...descStyle, marginTop: 0, marginBottom: '0.75rem' }}>
+                        每行一个 Refresh Token，批量换取凭证并一键创建账号（# 开头的行视为注释）。
+                      </div>
+                      <div style={{ marginBottom: '0.75rem' }}>
+                        <label style={labelStyle}>Refresh Tokens</label>
+                        <textarea
+                          style={{ ...inputStyle, minHeight: '180px', resize: 'vertical', fontFamily: 'monospace' }}
+                          placeholder={'每行一个 Refresh Token\n# 以 # 开头的行会被忽略'}
+                          value={batchText}
+                          onChange={(e) => setBatchText(e.target.value)}
+                          autoComplete="off"
+                        />
+                      </div>
+                      <div style={{ display: 'flex', gap: '0.75rem', alignItems: 'center', flexWrap: 'wrap' }}>
+                        <button
+                          type="button"
+                          onClick={submitBatchRefreshImport}
+                          disabled={parseRefreshTokenLines(batchText).length === 0}
+                          style={primaryBtnStyle(parseRefreshTokenLines(batchText).length === 0)}
+                        >
+                          批量导入 ({parseRefreshTokenLines(batchText).length})
+                        </button>
+                        <StatusMessage status={oauthStatus} />
+                      </div>
+                    </>
+                  )}
+
+                  {batchPhase === 'running' && (
+                    <div style={{ fontSize: '0.875rem', color: cssVar('textSecondary') }}>
+                      正在换取并导入，请稍候...
+                    </div>
+                  )}
+
+                  {batchPhase === 'result' && (
+                    <>
+                      <div style={{ fontSize: '0.875rem', color: cssVar('text'), marginBottom: '0.75rem' }}>
+                        共 {batchResults.length} 个，成功 {batchImportedCount} 个，失败 {batchResults.filter((r) => r.status === 'failed').length} 个
+                      </div>
+                      <div style={{
+                        maxHeight: '280px',
+                        overflowY: 'auto',
+                        borderWidth: '1px',
+                        borderStyle: 'solid',
+                        borderColor: cssVar('glassBorder'),
+                        borderRadius: cssVar('radiusMd'),
+                        padding: '0.5rem 0.75rem',
+                        marginBottom: '0.75rem',
+                      }}>
+                        {batchResults.map((r, idx) => (
+                          <div key={idx} style={{
+                            fontSize: '0.75rem',
+                            padding: '0.375rem 0',
+                            borderBottom: idx < batchResults.length - 1 ? `1px solid ${cssVar('glassBorder')}` : 'none',
+                            color: r.status === 'ok' ? cssVar('success') : cssVar('danger'),
+                          }}>
+                            <span style={{ fontWeight: 500 }}>
+                              [{r.status === 'ok' ? '成功' : '失败'}]
+                            </span>{' '}
+                            {r.status === 'ok'
+                              ? (r.accountName || r.credentials.email || '未知账号')
+                              : (r.error || '未知错误')}
+                          </div>
+                        ))}
+                      </div>
+                      <button type="button" onClick={resetBatch} style={ghostBtnStyle(false)}>
+                        再导入一批
+                      </button>
+                    </>
+                  )}
+                </>
+              )}
             </div>
           )}
 
-          {mode === 'create' && (
-            <div>
-              <label style={labelStyle}>
-                Access Token {!oauth && <span style={{ color: cssVar('danger') }}>*</span>}
-              </label>
-              <input
-                type="text"
-                autoComplete="off"
-                style={passwordInputStyle}
-                placeholder={oauth ? '授权后自动填充，或手动输入' : 'eyJhbG...'}
-                value={credentials.access_token ?? ''}
-                onChange={(e) => updateField('access_token', e.target.value)}
-              />
-            </div>
-          )}
-          {mode === 'create' && (
-            <div>
-              <label style={labelStyle}>Refresh Token</label>
-              <input
-                type="text"
-                autoComplete="off"
-                style={passwordInputStyle}
-                placeholder="授权后自动填充"
-                value={credentials.refresh_token ?? ''}
-                onChange={(e) => updateField('refresh_token', e.target.value)}
-              />
-            </div>
-          )}
-          {mode === 'create' && (
-            <div>
-              <label style={labelStyle}>ChatGPT Account ID</label>
-              <input
-                type="text"
-                style={inputStyle}
-                placeholder="授权后自动填充"
-                value={credentials.chatgpt_account_id ?? ''}
-                onChange={(e) => updateField('chatgpt_account_id', e.target.value)}
-              />
-            </div>
+          {/* 非批量模式下展示凭证字段 */}
+          {!isBatchActive && mode === 'create' && (
+            <>
+              <div>
+                <label style={labelStyle}>
+                  Access Token {!oauth && <span style={{ color: cssVar('danger') }}>*</span>}
+                </label>
+                <input
+                  type="text"
+                  autoComplete="off"
+                  style={passwordInputStyle}
+                  placeholder={oauth ? '授权后自动填充，或手动输入' : 'eyJhbG...'}
+                  value={credentials.access_token ?? ''}
+                  onChange={(e) => updateField('access_token', e.target.value)}
+                />
+              </div>
+              <div>
+                <label style={labelStyle}>Refresh Token</label>
+                <input
+                  type="text"
+                  autoComplete="off"
+                  style={passwordInputStyle}
+                  placeholder="授权后自动填充"
+                  value={credentials.refresh_token ?? ''}
+                  onChange={(e) => updateField('refresh_token', e.target.value)}
+                />
+              </div>
+              <div>
+                <label style={labelStyle}>ChatGPT Account ID</label>
+                <input
+                  type="text"
+                  style={inputStyle}
+                  placeholder="授权后自动填充"
+                  value={credentials.chatgpt_account_id ?? ''}
+                  onChange={(e) => updateField('chatgpt_account_id', e.target.value)}
+                />
+              </div>
+            </>
           )}
         </>
       )}

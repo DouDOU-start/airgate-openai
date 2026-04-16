@@ -29,19 +29,59 @@ func accountStatusFromCode(statusCode int) sdk.AccountStatus {
 	}
 }
 
+func isTemporaryRateLimitText(parts ...string) bool {
+	combined := strings.ToLower(strings.Join(parts, " "))
+	if combined == "" {
+		return false
+	}
+	return strings.Contains(combined, "usage limit") ||
+		strings.Contains(combined, "rate limit") ||
+		strings.Contains(combined, "too many requests") ||
+		strings.Contains(combined, "quota exceeded") ||
+		strings.Contains(combined, "insufficient quota") ||
+		strings.Contains(combined, "insufficient_quota") ||
+		strings.Contains(combined, "billing hard limit") ||
+		strings.Contains(combined, "billing_hard_limit_reached") ||
+		strings.Contains(combined, "slow down") ||
+		strings.Contains(combined, "slow_down") ||
+		strings.Contains(combined, "try again later") ||
+		strings.Contains(combined, "try again in") ||
+		strings.Contains(combined, "retry after")
+}
+
+func isDisabledAccountText(parts ...string) bool {
+	combined := strings.ToLower(strings.Join(parts, " "))
+	if combined == "" {
+		return false
+	}
+	return strings.Contains(combined, "disabled") ||
+		strings.Contains(combined, "deactivated") ||
+		strings.Contains(combined, "suspended")
+}
+
+func accountStatusFromMessage(statusCode int, message string) sdk.AccountStatus {
+	base := accountStatusFromCode(statusCode)
+	if statusCode != 400 && statusCode != 403 {
+		return base
+	}
+	if isTemporaryRateLimitText(message) {
+		return sdk.AccountStatusRateLimited
+	}
+	if isDisabledAccountText(message) {
+		return sdk.AccountStatusDisabled
+	}
+	return base
+}
+
 // accountStatusFromAnthropicBody 从 Anthropic 错误响应体推断账号状态。
 // Anthropic 某些账号级错误（如组织被封禁）走 400，accountStatusFromCode 无法识别，
 // 需额外检查 error.message 内容。
 func accountStatusFromAnthropicBody(statusCode int, body []byte) sdk.AccountStatus {
-	base := accountStatusFromCode(statusCode)
-	if base != sdk.AccountStatusOK || statusCode != 400 {
-		return base
+	msg := gjson.GetBytes(body, "error.message").String()
+	if msg == "" {
+		msg = string(body)
 	}
-	msg := strings.ToLower(gjson.GetBytes(body, "error.message").String())
-	if strings.Contains(msg, "disabled") || strings.Contains(msg, "deactivated") || strings.Contains(msg, "suspended") {
-		return sdk.AccountStatusDisabled
-	}
-	return base
+	return accountStatusFromMessage(statusCode, msg)
 }
 
 // anthropicErrorType 根据 HTTP 状态码返回 Anthropic 错误类型

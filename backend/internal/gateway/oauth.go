@@ -169,6 +169,63 @@ func (g *OpenAIGateway) HandleOAuthCallback(ctx context.Context, req *OAuthCallb
 	}, nil
 }
 
+// ImportFromRefreshToken 使用已有的 refresh_token 重新申请一次 token，
+// 从 id_token 解析出 chatgpt_account_id / email / plan_type / 订阅到期等字段，
+// 返回 OAuthResult（结构与 HandleOAuthCallback 对齐）。
+//
+// 用于后台管理员粘贴 refresh_token 批量/单条导入 OAuth 账号的场景。
+func (g *OpenAIGateway) ImportFromRefreshToken(ctx context.Context, refreshToken, proxyURL string) (*OAuthResult, error) {
+	refreshToken = strings.TrimSpace(refreshToken)
+	if refreshToken == "" {
+		return nil, fmt.Errorf("refresh_token 不能为空")
+	}
+
+	tokens, err := g.refreshTokens(ctx, refreshToken, proxyURL)
+	if err != nil {
+		return nil, fmt.Errorf("刷新 token 失败: %w", err)
+	}
+	if tokens.AccessToken == "" {
+		return nil, fmt.Errorf("刷新响应缺少 access_token")
+	}
+
+	info := parseIDToken(tokens.IDToken)
+
+	// 部分上游在 refresh_token 模式下不轮换 refresh_token（返回空串），此时沿用原值。
+	nextRefresh := tokens.RefreshToken
+	if nextRefresh == "" {
+		nextRefresh = refreshToken
+	}
+
+	credentials := map[string]string{
+		"access_token":  tokens.AccessToken,
+		"refresh_token": nextRefresh,
+	}
+	if info.AccountID != "" {
+		credentials["chatgpt_account_id"] = info.AccountID
+	}
+	if info.Email != "" {
+		credentials["email"] = info.Email
+	}
+	if info.PlanType != "" {
+		credentials["plan_type"] = info.PlanType
+	}
+	if info.SubscriptionActiveUntil != "" {
+		credentials["subscription_active_until"] = info.SubscriptionActiveUntil
+	}
+
+	g.logger.Info("OAuth Refresh Token 导入成功",
+		"account_name", info.AccountName,
+		"account_id", info.AccountID,
+		"plan_type", info.PlanType,
+	)
+
+	return &OAuthResult{
+		AccountType: "oauth",
+		Credentials: credentials,
+		AccountName: info.AccountName,
+	}, nil
+}
+
 // tokenResponse token 交换响应
 // 注意：上游失败时 error 字段可能是 string（"invalid_grant"）也可能是 object
 // （{code, message, ...}），因此用 json.RawMessage 兼容，再用 errorMessage() 提取文本。

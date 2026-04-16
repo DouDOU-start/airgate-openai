@@ -166,7 +166,7 @@ func (g *OpenAIGateway) forwardAPIKey(ctx context.Context, req *sdk.ForwardReque
 		return &sdk.ForwardResult{
 			StatusCode:    resp.StatusCode,
 			Duration:      time.Since(start),
-			AccountStatus: accountStatusFromCode(resp.StatusCode),
+			AccountStatus: accountStatusFromMessage(resp.StatusCode, errDetail),
 			ErrorMessage:  errDetail,
 			RetryAfter:    extractRetryAfterHeader(resp.Header),
 		}, fmt.Errorf("上游返回 %d: %s", resp.StatusCode, errDetail)
@@ -274,11 +274,11 @@ func (g *OpenAIGateway) forwardOAuth(ctx context.Context, req *sdk.ForwardReques
 	conn, wsResp, err := DialWebSocket(cfg)
 	if err != nil {
 		// WS 握手失败时，根据 HTTP 状态码设置 AccountStatus，让核心正确处理账号状态
-		if wsResp != nil && (wsResp.StatusCode == 401 || wsResp.StatusCode == 403) {
+		if wsResp != nil && (wsResp.StatusCode == 401 || wsResp.StatusCode == 403 || wsResp.StatusCode == 429) {
 			return &sdk.ForwardResult{
 				StatusCode:    wsResp.StatusCode,
 				Duration:      time.Since(start),
-				AccountStatus: accountStatusFromCode(wsResp.StatusCode),
+				AccountStatus: accountStatusFromMessage(wsResp.StatusCode, err.Error()),
 				ErrorMessage:  err.Error(),
 			}, err
 		}

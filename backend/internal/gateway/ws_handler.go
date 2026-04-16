@@ -46,9 +46,9 @@ func (g *OpenAIGateway) HandleWebSocket(ctx context.Context, conn sdk.WebSocketC
 	if err != nil {
 		result.StatusCode = http.StatusBadGateway
 		// 如果是认证失败，设置 AccountStatus 让核心正确处理
-		if dialInfo != nil && (dialInfo.statusCode == 401 || dialInfo.statusCode == 403) {
+		if dialInfo != nil && (dialInfo.statusCode == 401 || dialInfo.statusCode == 403 || dialInfo.statusCode == 429) {
 			result.StatusCode = dialInfo.statusCode
-			result.AccountStatus = accountStatusFromCode(dialInfo.statusCode)
+			result.AccountStatus = accountStatusFromMessage(dialInfo.statusCode, dialInfo.errorMessage)
 			result.ErrorMessage = dialInfo.errorMessage
 		}
 	}
