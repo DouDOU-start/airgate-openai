@@ -41,7 +41,7 @@ func TestParseSSEStream_AggregatesReasoningFunctionToolUseAndStopReason(t *testi
 		`data: {"type":"response.reasoning_summary_text.delta","delta":"step"}`,
 		`data: {"type":"response.output_text.delta","delta":"hello"}`,
 		`data: {"type":"response.output_item.done","item":{"type":"function_call","call_id":"call_1","name":"get_weather","arguments":"{\"city\":\"Wuhan\"}"}}`,
-		`data: {"type":"response.completed","response":{"id":"resp_1","model":"gpt-5","stop_reason":"tool_calls","usage":{"input_tokens":12,"output_tokens":34,"input_tokens_details":{"cached_tokens":5}}}}`,
+		`data: {"type":"response.completed","response":{"id":"resp_1","model":"gpt-5.4","stop_reason":"tool_calls","usage":{"input_tokens":12,"output_tokens":34,"input_tokens_details":{"cached_tokens":5}}}}`,
 		"",
 	}, "\n")
 
@@ -52,8 +52,8 @@ func TestParseSSEStream_AggregatesReasoningFunctionToolUseAndStopReason(t *testi
 	if result.ResponseID != "resp_1" {
 		t.Fatalf("ResponseID = %q, want %q", result.ResponseID, "resp_1")
 	}
-	if result.Model != "gpt-5" {
-		t.Fatalf("Model = %q, want %q", result.Model, "gpt-5")
+	if result.Model != "gpt-5.4" {
+		t.Fatalf("Model = %q, want %q", result.Model, "gpt-5.4")
 	}
 	if result.Text != "hello" {
 		t.Fatalf("Text = %q, want %q", result.Text, "hello")
@@ -89,7 +89,7 @@ func TestParseSSEStream_AggregatesWebSearchToolUse(t *testing.T) {
 		`data: {"type":"response.created","response":{"id":"resp_2"}}`,
 		fmt.Sprintf(`data: {"type":"response.output_item.added","item":{"type":"web_search_call","id":%q}}`, itemID),
 		fmt.Sprintf(`data: {"type":"response.output_item.done","item":{"type":"web_search_call","id":%q,"action":{"query":%q}}}`, itemID, query),
-		`data: {"type":"response.completed","response":{"id":"resp_2","model":"gpt-5","stop_reason":"stop","usage":{"input_tokens":2,"output_tokens":3}}}`,
+		`data: {"type":"response.completed","response":{"id":"resp_2","model":"gpt-5.4","stop_reason":"stop","usage":{"input_tokens":2,"output_tokens":3}}}`,
 		"",
 	}, "\n")
 
@@ -122,7 +122,7 @@ func TestConvertResponsesCompletedToAnthropicJSON_FallbackFromDeltas(t *testing.
 		`data: {"type":"response.reasoning_summary_text.delta","delta":"step"}`,
 		`data: {"type":"response.output_text.delta","delta":"你好"}`,
 		`data: {"type":"response.output_text.delta","delta":"，世界"}`,
-		`data: {"type":"response.completed","response":{"id":"resp_abc123","model":"gpt-5","usage":{"input_tokens":7,"output_tokens":13}}}`,
+		`data: {"type":"response.completed","response":{"id":"resp_abc123","model":"gpt-5.4","usage":{"input_tokens":7,"output_tokens":13}}}`,
 		"",
 	}, "\n")
 
@@ -231,7 +231,7 @@ func TestGenerateCloudflareRay_Format(t *testing.T) {
 // 验证流式 message_start 事件后紧跟 ping 事件，对齐 Claude 官方行为
 func TestConvertResponsesEventToAnthropic_MessageStartEmitsPing(t *testing.T) {
 	state := &anthropicStreamState{}
-	line := []byte(`data: {"type":"response.created","response":{"id":"resp_xyz","model":"gpt-5"}}`)
+	line := []byte(`data: {"type":"response.created","response":{"id":"resp_xyz","model":"gpt-5.4"}}`)
 	out := convertResponsesEventToAnthropic(line, nil, state, "claude-sonnet-4-6")
 
 	if !strings.Contains(out, "event: message_start") {

@@ -53,19 +53,6 @@ gateway:
       path: /responses
       description: Responses API WebSocket（无 /v1 前缀）
   models:
-    - id: gpt-5
-      name: GPT 5
-      context_window: 272000
-      max_output_tokens: 128000
-      input_price: 1.25
-      output_price: 10
-      cached_input_price: 0.125
-      input_price_priority: 2.5
-      output_price_priority: 20
-      cached_input_price_priority: 0.25
-      input_price_flex: 0.625
-      output_price_flex: 5
-      cached_input_price_flex: 0.0625
     - id: gpt-5-codex
       name: GPT 5 Codex
       context_window: 272000
@@ -105,73 +92,8 @@ gateway:
       input_price_flex: 0.0625
       output_price_flex: 0.5
       cached_input_price_flex: 0.0125
-    - id: gpt-5.1
-      name: GPT 5.1
-      context_window: 272000
-      max_output_tokens: 128000
-      input_price: 1.25
-      output_price: 10
-      cached_input_price: 0.125
-      input_price_priority: 2.5
-      output_price_priority: 20
-      cached_input_price_priority: 0.25
-      input_price_flex: 0.625
-      output_price_flex: 5
-      cached_input_price_flex: 0.0625
-    - id: gpt-5.1-codex
-      name: GPT 5.1 Codex
-      context_window: 272000
-      max_output_tokens: 128000
-      input_price: 1.25
-      output_price: 10
-      cached_input_price: 0.125
-      input_price_priority: 2.5
-      output_price_priority: 20
-      cached_input_price_priority: 0.25
-      input_price_flex: 0.625
-      output_price_flex: 5
-      cached_input_price_flex: 0.0625
-    - id: gpt-5.1-codex-max
-      name: GPT 5.1 Codex Max
-      context_window: 272000
-      max_output_tokens: 128000
-      input_price: 1.25
-      output_price: 10
-      cached_input_price: 0.125
-      input_price_priority: 2.5
-      output_price_priority: 20
-      cached_input_price_priority: 0.25
-      input_price_flex: 0.625
-      output_price_flex: 5
-      cached_input_price_flex: 0.0625
-    - id: gpt-5.1-codex-mini
-      name: GPT 5.1 Codex Mini
-      context_window: 128000
-      max_output_tokens: 128000
-      input_price: 0.25
-      output_price: 2
-      cached_input_price: 0.025
-      input_price_priority: 0.5
-      output_price_priority: 4
-      cached_input_price_priority: 0.05
-      input_price_flex: 0.125
-      output_price_flex: 1
-      cached_input_price_flex: 0.0125
     - id: gpt-5.2
       name: GPT 5.2
-      context_window: 272000
-      max_output_tokens: 128000
-      input_price: 1.75
-      output_price: 14
-      cached_input_price: 0.175
-      input_price_priority: 3.5
-      output_price_priority: 28
-      cached_input_price_priority: 0.35
-      input_price_flex: 0.875
-      output_price_flex: 7
-      cached_input_price_flex: 0.0875
-    - id: gpt-5.2-codex
-      name: GPT 5.2 Codex
       context_window: 272000
       max_output_tokens: 128000
       input_price: 1.75
