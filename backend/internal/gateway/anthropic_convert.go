@@ -101,6 +101,12 @@ func convertAnthropicRequestToResponses(rawJSON []byte, modelName, mappingEffort
 				for _, block := range msgContents.Array() {
 					contentType := block.Get("type").String()
 					switch contentType {
+					// thinking / redacted_thinking：Anthropic extended thinking 产物，
+					// 带 signature 字段，Responses API 无此概念。显式剥离避免上游拒绝，
+					// 也防止 Claude Code 回传时被当成普通 content 注入 prompt。
+					case "thinking", "redacted_thinking":
+						continue
+
 					case "text":
 						appendTextContent(block.Get("text").String())
 

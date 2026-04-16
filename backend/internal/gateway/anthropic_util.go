@@ -65,6 +65,10 @@ func normalizeAnthropicStopReason(reason string) string {
 		return "tool_use"
 	case "content_filter":
 		return "refusal"
+	case "context_length_exceeded", "input_too_long":
+		// OpenAI 上下文超限 → Claude Code 会触发 tengu_context_window_exceeded 遥测 +
+		// 用户可见的 "response exceeded context window" 提示
+		return "model_context_window_exceeded"
 	default:
 		return normalized
 	}
@@ -73,12 +77,13 @@ func normalizeAnthropicStopReason(reason string) string {
 // anthropicValidStopReasons Claude 官方 stop_reason 合法枚举
 // 参考：https://docs.anthropic.com/en/api/messages
 var anthropicValidStopReasons = map[string]struct{}{
-	"end_turn":      {},
-	"max_tokens":    {},
-	"stop_sequence": {},
-	"tool_use":      {},
-	"refusal":       {},
-	"pause_turn":    {},
+	"end_turn":                      {},
+	"max_tokens":                    {},
+	"stop_sequence":                 {},
+	"tool_use":                      {},
+	"refusal":                       {},
+	"pause_turn":                    {},
+	"model_context_window_exceeded": {},
 }
 
 // ensureAnthropicStopReason 兜底白名单校验：如果 normalize 后的值不在合法集合里，

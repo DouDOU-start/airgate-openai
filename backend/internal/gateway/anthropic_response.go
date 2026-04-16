@@ -65,7 +65,7 @@ func convertResponsesEventToAnthropic(rawLine []byte, originalRequest []byte, st
 		//   JS `a || b` 运算把 null 转成 undefined（null || undefined = undefined），
 		//   SDK 后续访问 undefined.input_tokens 会崩溃。保持字段缺省即可，
 		//   SDK 代码普遍用 $.server_tool_use?.web_search_requests ?? 0 形式读取，安全。
-		template := `{"type":"message_start","message":{"id":"","type":"message","role":"assistant","model":"","stop_sequence":null,"usage":{"input_tokens":0,"output_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":0},"service_tier":"standard"},"content":[],"stop_reason":null}}`
+		template := `{"type":"message_start","message":{"id":"","type":"message","role":"assistant","model":"","stop_sequence":null,"usage":{"input_tokens":0,"output_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":0},"service_tier":"standard","inference_geo":"","iterations":[],"speed":"standard"},"content":[],"stop_reason":null}}`
 		// 使用原始 Claude 模型名，让 Claude Code 正确识别模型能力（上下文按钮等）
 		modelName := model
 		if modelName == "" {
@@ -228,7 +228,10 @@ func convertResponsesEventToAnthropic(rawLine []byte, originalRequest []byte, st
 		// 关键：绝不设置 server_tool_use: null —— 会触发 SDK `||` 短路转 undefined → 崩溃链。
 		// cache_creation_input_tokens 保持 0：OpenAI Responses API 不区分 cache creation vs read，
 		// 所有命中缓存的 prompt 都归在 cached_tokens（→ cache_read_input_tokens）。
-		template := `{"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"input_tokens":0,"output_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":0},"service_tier":"standard"}}`
+		// delta.container / context_management：Claude Code 反序列化对这两字段直接读（非可选链），
+		//   case "message_delta": q.container=$.delta.container, q.context_management=$.context_management
+		//   缺失会让 context_management 逻辑拿到 undefined 而不是 null。
+		template := `{"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null,"container":null},"context_management":null,"usage":{"input_tokens":0,"output_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":0},"service_tier":"standard","inference_geo":"","iterations":[],"speed":"standard"}}`
 
 		var finalStop string
 		if state.HasToolCall {
@@ -245,9 +248,28 @@ func convertResponsesEventToAnthropic(rawLine []byte, originalRequest []byte, st
 			template, _ = sjson.SetRaw(template, "delta.stop_sequence", seq.Raw)
 		}
 
+		// refusal 场景补 stop_details：Claude Code 的 WL7 函数会读 stop_details.explanation
+		// 在 UI 展示给用户。缺失时用户不知道为何被拒绝。
+		if finalStop == "refusal" {
+			explanation := root.Get("response.error.message").String()
+			if explanation == "" {
+				explanation = root.Get("response.refusal").String()
+			}
+			if explanation == "" {
+				explanation = "content blocked by upstream policy"
+			}
+			stopDetails, _ := sjson.Set(`{"type":"refusal","explanation":""}`, "explanation", explanation)
+			template, _ = sjson.SetRaw(template, "delta.stop_details", stopDetails)
+		}
+
 		template, _ = sjson.Set(template, "usage.input_tokens", inputTokens)
 		template, _ = sjson.Set(template, "usage.output_tokens", outputTokens)
 		template, _ = sjson.Set(template, "usage.cache_read_input_tokens", cachedTokens)
+
+		// 把上游真实 service_tier 写回 usage，合法枚举：standard / priority / batch
+		if tier := normalizeOpenAIServiceTier(root.Get("response.service_tier").String()); tier != "" {
+			template, _ = sjson.Set(template, "usage.service_tier", tier)
+		}
 
 		output := prefix + "event: message_delta\n" + fmt.Sprintf("data: %s\n\n", template)
 		output += "event: message_stop\n" + "data: {\"type\":\"message_stop\"}\n\n"
@@ -328,6 +350,11 @@ func buildAnthropicStreamError(errType, message string) string {
 }
 
 // mapResponsesErrorType 将 Responses API 错误类型映射为 Anthropic 错误类型
+// Anthropic 合法枚举：api_error / authentication_error / invalid_request_error /
+//
+//	not_found_error / overloaded_error / permission_error / rate_limit_error
+//
+// Claude Code 的重试分类器依赖这个 type 区分瞬时过载（可重试）与永久失败（不可重试）。
 func mapResponsesErrorType(errType, errCode string) string {
 	errType = strings.ToLower(strings.TrimSpace(errType))
 	errCode = strings.ToLower(strings.TrimSpace(errCode))
@@ -341,6 +368,17 @@ func mapResponsesErrorType(errType, errCode string) string {
 		return "authentication_error"
 	case "not_found_error":
 		return "not_found_error"
+	case "overloaded_error":
+		return "overloaded_error"
+	case "permission_error":
+		return "permission_error"
+	// OpenAI 常见错误类型映射到最贴切的 Anthropic 枚举
+	case "server_error", "internal_error":
+		return "overloaded_error"
+	case "insufficient_quota", "billing_not_active":
+		return "permission_error"
+	case "permission_denied":
+		return "permission_error"
 	}
 
 	// 通过 code 推断类型
@@ -349,6 +387,10 @@ func mapResponsesErrorType(errType, errCode string) string {
 		return "invalid_request_error"
 	case "rate_limit_exceeded":
 		return "rate_limit_error"
+	case "overloaded", "service_overloaded", "model_overloaded", "engine_overloaded":
+		return "overloaded_error"
+	case "insufficient_quota", "quota_exceeded", "billing_hard_limit_reached":
+		return "permission_error"
 	}
 
 	return "api_error"
@@ -388,7 +430,9 @@ func convertResponsesCompletedToAnthropicJSON(
 
 	// usage 包含 Claude Code 内部 usage 累加器期望的所有字段，但不含 server_tool_use: null。
 	// 详见 message_start 分支的注释：cache_creation 嵌套对象必填，server_tool_use 必须缺省。
-	out := `{"id":"","type":"message","role":"assistant","model":"","content":[],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":0,"output_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":0},"service_tier":"standard"}}`
+	// container / context_management：Claude Code 反序列化对这两字段直接读（非可选链），
+	// 缺失会让 context_management 逻辑拿到 undefined 而不是 null。
+	out := `{"id":"","type":"message","role":"assistant","model":"","container":null,"context_management":null,"content":[],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":0,"output_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":0},"service_tier":"standard","inference_geo":"","iterations":[],"speed":"standard"}}`
 	out, _ = sjson.Set(out, "id", normalizeAnthropicMessageID(responseData.Get("id").String()))
 	// 始终使用原始 Claude 模型名，让 Claude Code 正确识别模型能力
 	out, _ = sjson.Set(out, "model", model)
@@ -397,6 +441,11 @@ func convertResponsesCompletedToAnthropicJSON(
 	out, _ = sjson.Set(out, "usage.input_tokens", inputTokens)
 	out, _ = sjson.Set(out, "usage.output_tokens", outputTokens)
 	out, _ = sjson.Set(out, "usage.cache_read_input_tokens", cachedTokens)
+
+	// 把上游真实 service_tier 写回 usage，合法枚举：standard / priority / batch
+	if tier := normalizeOpenAIServiceTier(responseData.Get("service_tier").String()); tier != "" {
+		out, _ = sjson.Set(out, "usage.service_tier", tier)
+	}
 
 	hasThinking := false
 	hasText := false
@@ -504,10 +553,24 @@ func convertResponsesCompletedToAnthropicJSON(
 	} else {
 		finalStop = normalizeAnthropicStopReason(responseData.Get("stop_reason").String())
 	}
-	out, _ = sjson.Set(out, "stop_reason", ensureAnthropicStopReason(finalStop))
+	finalStop = ensureAnthropicStopReason(finalStop)
+	out, _ = sjson.Set(out, "stop_reason", finalStop)
 
 	if stopSeq := responseData.Get("stop_sequence"); stopSeq.Exists() && stopSeq.Type != gjson.Null {
 		out, _ = sjson.SetRaw(out, "stop_sequence", stopSeq.Raw)
+	}
+
+	// refusal 场景补 stop_details（同流式路径）
+	if finalStop == "refusal" {
+		explanation := responseData.Get("error.message").String()
+		if explanation == "" {
+			explanation = responseData.Get("refusal").String()
+		}
+		if explanation == "" {
+			explanation = "content blocked by upstream policy"
+		}
+		stopDetails, _ := sjson.Set(`{"type":"refusal","explanation":""}`, "explanation", explanation)
+		out, _ = sjson.SetRaw(out, "stop_details", stopDetails)
 	}
 
 	return out
