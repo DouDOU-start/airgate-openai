@@ -1,6 +1,7 @@
 package gateway
 
 import (
+	"container/list"
 	"crypto/sha256"
 	"fmt"
 	"net/http"
@@ -210,11 +211,85 @@ func resolveOpenAISession(headers http.Header, body []byte) openAISessionResolut
 }
 
 var sessionStateStore sync.Map
-var anthropicDigestStore sync.Map
+
+const (
+	anthropicDigestCacheMaxSize = 20000
+	anthropicDigestCacheTTL     = time.Hour
+)
+
+var anthropicDigestStore = newAnthropicDigestCache(anthropicDigestCacheMaxSize, anthropicDigestCacheTTL)
 
 type anthropicDigestEntry struct {
 	SessionID string
 	UpdatedAt time.Time
+}
+
+type anthropicDigestCacheNode struct {
+	key   string
+	entry *anthropicDigestEntry
+}
+
+type anthropicDigestCache struct {
+	mu      sync.Mutex
+	ll      *list.List
+	items   map[string]*list.Element
+	maxSize int
+	ttl     time.Duration
+}
+
+func newAnthropicDigestCache(maxSize int, ttl time.Duration) *anthropicDigestCache {
+	return &anthropicDigestCache{
+		ll:      list.New(),
+		items:   make(map[string]*list.Element),
+		maxSize: maxSize,
+		ttl:     ttl,
+	}
+}
+
+func (c *anthropicDigestCache) Load(key string) (*anthropicDigestEntry, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	el, ok := c.items[key]
+	if !ok {
+		return nil, false
+	}
+	node := el.Value.(*anthropicDigestCacheNode)
+	if c.ttl > 0 && time.Since(node.entry.UpdatedAt) > c.ttl {
+		c.ll.Remove(el)
+		delete(c.items, key)
+		return nil, false
+	}
+	c.ll.MoveToFront(el)
+	return node.entry, true
+}
+
+func (c *anthropicDigestCache) Store(key string, entry *anthropicDigestEntry) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if el, ok := c.items[key]; ok {
+		c.ll.MoveToFront(el)
+		el.Value.(*anthropicDigestCacheNode).entry = entry
+		return
+	}
+	el := c.ll.PushFront(&anthropicDigestCacheNode{key: key, entry: entry})
+	c.items[key] = el
+	for c.maxSize > 0 && c.ll.Len() > c.maxSize {
+		oldest := c.ll.Back()
+		if oldest == nil {
+			break
+		}
+		c.ll.Remove(oldest)
+		delete(c.items, oldest.Value.(*anthropicDigestCacheNode).key)
+	}
+}
+
+func (c *anthropicDigestCache) Delete(key string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if el, ok := c.items[key]; ok {
+		c.ll.Remove(el)
+		delete(c.items, key)
+	}
 }
 
 func shortHashBytes(data []byte) string {
@@ -262,9 +337,6 @@ func saveAnthropicDigestSession(accountID int64, digestChain, sessionID, oldDige
 		SessionID: sessionID,
 		UpdatedAt: time.Now().UTC(),
 	})
-	if store := getCodexUsagePersistenceStore(); store != nil {
-		store.SaveAnthropicDigestAsync(accountID, digestChain, sessionID, oldDigestChain)
-	}
 	if oldDigestChain != "" && oldDigestChain != digestChain {
 		anthropicDigestStore.Delete(ns + oldDigestChain)
 	}
@@ -277,10 +349,8 @@ func findAnthropicDigestSession(accountID int64, digestChain string) (sessionID 
 	ns := anthropicDigestNamespace(accountID)
 	chain := digestChain
 	for {
-		if val, ok := anthropicDigestStore.Load(ns + chain); ok {
-			if entry, ok := val.(*anthropicDigestEntry); ok && entry != nil {
-				return entry.SessionID, chain, true
-			}
+		if entry, ok := anthropicDigestStore.Load(ns + chain); ok && entry != nil {
+			return entry.SessionID, chain, true
 		}
 		i := strings.LastIndex(chain, "-")
 		if i < 0 {

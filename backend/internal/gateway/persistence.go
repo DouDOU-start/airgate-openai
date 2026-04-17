@@ -15,7 +15,6 @@ import (
 
 const (
 	codexUsageSnapshotTable         = "plugin_account_usage_snapshots"
-	anthropicDigestSessionTable     = "plugin_anthropic_digest_sessions"
 	sessionStatePersistTable        = "plugin_openai_session_states"
 	codexUsagePersistenceFlushEvery = 5 * time.Second
 	codexUsagePersistenceQueueSize  = 1024
@@ -28,21 +27,11 @@ type codexUsagePersistenceStore struct {
 
 	flushCh        chan int64
 	stopCh         chan struct{}
-	digestFlushCh  chan string
 	sessionFlushCh chan string
 
 	pending        sync.Map // accountID -> *CodexUsageSnapshot
-	digestPending  sync.Map // key(accountID|digestChain) -> *anthropicDigestPersistRecord
 	sessionPending sync.Map // sessionKey -> *openAISessionState
 	wg             sync.WaitGroup
-}
-
-type anthropicDigestPersistRecord struct {
-	AccountID      int64
-	DigestChain    string
-	SessionID      string
-	OldDigestChain string
-	UpdatedAt      time.Time
 }
 
 func sessionPersistKey(sessionKey string) string {
@@ -72,7 +61,6 @@ func newCodexUsagePersistenceStore(dsn, pluginID string, logger *slog.Logger) (*
 		pluginID:       pluginID,
 		flushCh:        make(chan int64, codexUsagePersistenceQueueSize),
 		stopCh:         make(chan struct{}),
-		digestFlushCh:  make(chan string, codexUsagePersistenceQueueSize),
 		sessionFlushCh: make(chan string, codexUsagePersistenceQueueSize),
 	}
 	if err := store.ensureSchema(ctx); err != nil {
@@ -106,23 +94,10 @@ CREATE INDEX IF NOT EXISTS idx_%s_plugin_updated_at
 	if _, err := s.db.ExecContext(ctx, query); err != nil {
 		return fmt.Errorf("ensure snapshot schema: %w", err)
 	}
-	digestQuery := fmt.Sprintf(`
-CREATE TABLE IF NOT EXISTS %s (
-  plugin_id    text        NOT NULL,
-  account_id   bigint      NOT NULL,
-  digest_chain text        NOT NULL,
-  session_id   text        NOT NULL,
-  updated_at   timestamptz NOT NULL DEFAULT NOW(),
-  PRIMARY KEY (plugin_id, account_id, digest_chain)
-);
-CREATE INDEX IF NOT EXISTS idx_%s_account_updated_at
-  ON %s (plugin_id, account_id, updated_at DESC);`,
-		anthropicDigestSessionTable,
-		anthropicDigestSessionTable,
-		anthropicDigestSessionTable,
-	)
-	if _, err := s.db.ExecContext(ctx, digestQuery); err != nil {
-		return fmt.Errorf("ensure anthropic digest schema: %w", err)
+	// 旧版本曾把 Anthropic digest 会话映射持久化到 plugin_anthropic_digest_sessions,
+	// 现已改为纯内存 LRU,这里顺手清理遗留表以免无人维护。
+	if _, err := s.db.ExecContext(ctx, `DROP TABLE IF EXISTS plugin_anthropic_digest_sessions`); err != nil {
+		return fmt.Errorf("drop legacy anthropic digest table: %w", err)
 	}
 	sessionQuery := fmt.Sprintf(`
 CREATE TABLE IF NOT EXISTS %s (
@@ -161,8 +136,6 @@ func (s *codexUsagePersistenceStore) run() {
 		select {
 		case accountID := <-s.flushCh:
 			s.flushAccount(context.Background(), accountID)
-		case digestKey := <-s.digestFlushCh:
-			s.flushDigestRecord(context.Background(), digestKey)
 		case sessionKey := <-s.sessionFlushCh:
 			s.flushSessionStateRecord(context.Background(), sessionKey)
 		case <-ticker.C:
@@ -198,13 +171,6 @@ func (s *codexUsagePersistenceStore) flushAll(ctx context.Context) {
 		accountID, ok := key.(int64)
 		if ok {
 			s.flushAccount(ctx, accountID)
-		}
-		return true
-	})
-	s.digestPending.Range(func(key, _ any) bool {
-		digestKey, ok := key.(string)
-		if ok {
-			s.flushDigestRecord(ctx, digestKey)
 		}
 		return true
 	})
@@ -262,28 +228,6 @@ DO UPDATE SET
 	return nil
 }
 
-func digestPersistKey(accountID int64, digestChain string) string {
-	return fmt.Sprintf("%d|%s", accountID, digestChain)
-}
-
-func (s *codexUsagePersistenceStore) SaveAnthropicDigestAsync(accountID int64, digestChain, sessionID, oldDigestChain string) {
-	if s == nil || accountID <= 0 || strings.TrimSpace(digestChain) == "" || strings.TrimSpace(sessionID) == "" {
-		return
-	}
-	key := digestPersistKey(accountID, digestChain)
-	s.digestPending.Store(key, &anthropicDigestPersistRecord{
-		AccountID:      accountID,
-		DigestChain:    digestChain,
-		SessionID:      sessionID,
-		OldDigestChain: oldDigestChain,
-		UpdatedAt:      time.Now().UTC(),
-	})
-	select {
-	case s.digestFlushCh <- key:
-	default:
-	}
-}
-
 func (s *codexUsagePersistenceStore) SaveSessionStateAsync(state *openAISessionState) {
 	if s == nil || state == nil {
 		return
@@ -297,23 +241,6 @@ func (s *codexUsagePersistenceStore) SaveSessionStateAsync(state *openAISessionS
 	case s.sessionFlushCh <- key:
 	default:
 	}
-}
-
-func (s *codexUsagePersistenceStore) flushDigestRecord(ctx context.Context, key string) {
-	val, ok := s.digestPending.Load(key)
-	if !ok {
-		return
-	}
-	record, ok := val.(*anthropicDigestPersistRecord)
-	if !ok || record == nil {
-		s.digestPending.Delete(key)
-		return
-	}
-	if err := s.upsertAnthropicDigest(ctx, record); err != nil {
-		s.logger.Warn("持久化 Anthropic digest session 失败", "account_id", record.AccountID, "digest_chain", record.DigestChain, "error", err)
-		return
-	}
-	s.digestPending.Delete(key)
 }
 
 func (s *codexUsagePersistenceStore) flushSessionStateRecord(ctx context.Context, key string) {
@@ -331,26 +258,6 @@ func (s *codexUsagePersistenceStore) flushSessionStateRecord(ctx context.Context
 		return
 	}
 	s.sessionPending.Delete(key)
-}
-
-func (s *codexUsagePersistenceStore) upsertAnthropicDigest(ctx context.Context, record *anthropicDigestPersistRecord) error {
-	query := fmt.Sprintf(`
-INSERT INTO %s (plugin_id, account_id, digest_chain, session_id, updated_at)
-VALUES ($1, $2, $3, $4, NOW())
-ON CONFLICT (plugin_id, account_id, digest_chain)
-DO UPDATE SET
-  session_id = EXCLUDED.session_id,
-  updated_at = NOW()`, anthropicDigestSessionTable)
-	if _, err := s.db.ExecContext(ctx, query, s.pluginID, record.AccountID, record.DigestChain, record.SessionID); err != nil {
-		return fmt.Errorf("upsert anthropic digest: %w", err)
-	}
-	if record.OldDigestChain != "" && record.OldDigestChain != record.DigestChain {
-		deleteQuery := fmt.Sprintf(`DELETE FROM %s WHERE plugin_id = $1 AND account_id = $2 AND digest_chain = $3`, anthropicDigestSessionTable)
-		if _, err := s.db.ExecContext(ctx, deleteQuery, s.pluginID, record.AccountID, record.OldDigestChain); err != nil {
-			return fmt.Errorf("delete old anthropic digest: %w", err)
-		}
-	}
-	return nil
 }
 
 func (s *codexUsagePersistenceStore) upsertSessionState(ctx context.Context, state *openAISessionState) error {
@@ -453,13 +360,6 @@ func (s *codexUsagePersistenceStore) WarmCache(ctx context.Context) error {
 	if count > 0 {
 		s.logger.Info("已预热 Codex 用量快照缓存", "count", count)
 	}
-	digestCount, err := s.warmAnthropicDigestCache(ctx)
-	if err != nil {
-		return err
-	}
-	if digestCount > 0 {
-		s.logger.Info("已预热 Anthropic digest 会话缓存", "count", digestCount)
-	}
 	sessionCount, err := s.warmSessionStateCache(ctx)
 	if err != nil {
 		return err
@@ -468,35 +368,6 @@ func (s *codexUsagePersistenceStore) WarmCache(ctx context.Context) error {
 		s.logger.Info("已预热 OpenAI 会话状态缓存", "count", sessionCount)
 	}
 	return nil
-}
-
-func (s *codexUsagePersistenceStore) warmAnthropicDigestCache(ctx context.Context) (int, error) {
-	query := fmt.Sprintf(`SELECT account_id, digest_chain, session_id, updated_at FROM %s WHERE plugin_id = $1`, anthropicDigestSessionTable)
-	rows, err := s.db.QueryContext(ctx, query, s.pluginID)
-	if err != nil {
-		return 0, fmt.Errorf("warm anthropic digest query: %w", err)
-	}
-	defer func() { _ = rows.Close() }()
-
-	count := 0
-	for rows.Next() {
-		var accountID int64
-		var digestChain, sessionID string
-		var updatedAt time.Time
-		if err := rows.Scan(&accountID, &digestChain, &sessionID, &updatedAt); err != nil {
-			return 0, fmt.Errorf("warm anthropic digest scan: %w", err)
-		}
-		key := digestPersistKey(accountID, digestChain)
-		anthropicDigestStore.Store(key, &anthropicDigestEntry{
-			SessionID: sessionID,
-			UpdatedAt: updatedAt,
-		})
-		count++
-	}
-	if err := rows.Err(); err != nil {
-		return 0, fmt.Errorf("warm anthropic digest rows: %w", err)
-	}
-	return count, nil
 }
 
 func (s *codexUsagePersistenceStore) warmSessionStateCache(ctx context.Context) (int, error) {
