@@ -180,6 +180,14 @@ func preprocessRequestBody(body []byte, model, reqPath string) []byte {
 		return body
 	}
 
+	// Images API 请求体只有 prompt/n/size/quality/model 等字段，后续的
+	// previous_response_id / context_guard / normalizeResponsesInput 对它都应
+	// 无作用。/images/edits 更是可能是 multipart/form-data（非 JSON），
+	// 提前 bypass 避免 sjson 把 multipart body 损坏成畸形 JSON。
+	if isImagesRequest(reqPath) {
+		return body
+	}
+
 	result := body
 	if model != "" {
 		bodyModel := gjson.GetBytes(result, "model").String()
@@ -188,13 +196,6 @@ func preprocessRequestBody(body []byte, model, reqPath string) []byte {
 				result = modified
 			}
 		}
-	}
-
-	// Images API 请求体只有 prompt/n/size/quality/model 等字段，后续的
-	// previous_response_id / context_guard / normalizeResponsesInput 对它都应
-	// 无作用。这里显式 bypass，避免未来扩展这些步骤时误伤图像请求。
-	if isImagesRequest(reqPath) {
-		return result
 	}
 
 	// 剔除客户端传入的 previous_response_id。

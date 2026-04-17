@@ -142,7 +142,15 @@ func (g *OpenAIGateway) forwardAPIKey(ctx context.Context, req *sdk.ForwardReque
 	// 设置认证头
 	setAuthHeaders(upstreamReq, account)
 	if methodAllowsBody(reqMethod) {
-		upstreamReq.Header.Set("Content-Type", "application/json")
+		// /v1/images/edits 在 SDK 侧是 multipart/form-data，必须保留 boundary，
+		// 否则上游解析 body 会失败。其它路径一律 application/json（Core 侧已把
+		// 请求体归一化成 JSON 文本）。
+		if ct := req.Headers.Get("Content-Type"); isImagesEditRequest(reqPath) &&
+			strings.HasPrefix(strings.ToLower(ct), "multipart/") {
+			upstreamReq.Header.Set("Content-Type", ct)
+		} else {
+			upstreamReq.Header.Set("Content-Type", "application/json")
+		}
 	}
 
 	// 透传白名单头

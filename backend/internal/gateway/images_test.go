@@ -1,11 +1,15 @@
 package gateway
 
 import (
+	"bytes"
+	"encoding/base64"
 	"encoding/json"
 	"io"
 	"math"
+	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
+	"net/textproto"
 	"testing"
 	"time"
 
@@ -16,19 +20,24 @@ import (
 
 func TestIsImagesRequest(t *testing.T) {
 	cases := []struct {
-		path string
-		want bool
+		path     string
+		want     bool
+		wantEdit bool
 	}{
-		{"/v1/images/generations", true},
-		{"/images/generations", true},
-		{"/v1/responses", false},
-		{"/v1/chat/completions", false},
-		{"/v1/images/edits", false},
-		{"", false},
+		{"/v1/images/generations", true, false},
+		{"/images/generations", true, false},
+		{"/v1/responses", false, false},
+		{"/v1/chat/completions", false, false},
+		{"/v1/images/edits", true, true},
+		{"/images/edits", true, true},
+		{"", false, false},
 	}
 	for _, tc := range cases {
 		if got := isImagesRequest(tc.path); got != tc.want {
 			t.Errorf("isImagesRequest(%q) = %v, want %v", tc.path, got, tc.want)
+		}
+		if got := isImagesEditRequest(tc.path); got != tc.wantEdit {
+			t.Errorf("isImagesEditRequest(%q) = %v, want %v", tc.path, got, tc.wantEdit)
 		}
 	}
 }
@@ -295,7 +304,7 @@ func TestCollectImageGenCall(t *testing.T) {
 // response.create 消息，tool 配置应正确透传 size/quality/background 等字段。
 func TestBuildImagesToolCreateMsg(t *testing.T) {
 	body := []byte(`{"model":"gpt-image-1.5","prompt":"a shiba","n":1,"size":"1024x1024","quality":"low","background":"transparent","output_format":"png"}`)
-	msg, n, promptTokens, err := buildImagesToolCreateMsg(body, openAISessionResolution{})
+	msg, n, promptTokens, err := buildImagesToolCreateMsg(body, "application/json", false, openAISessionResolution{})
 	if err != nil {
 		t.Fatalf("buildImagesToolCreateMsg returned err: %v", err)
 	}
@@ -344,7 +353,7 @@ func TestBuildImagesToolCreateMsg(t *testing.T) {
 // TestBuildImagesToolCreateMsg_NGreaterThanOne V1 不支持 n>1，应直接返错。
 func TestBuildImagesToolCreateMsg_NGreaterThanOne(t *testing.T) {
 	body := []byte(`{"prompt":"x","n":3}`)
-	_, _, _, err := buildImagesToolCreateMsg(body, openAISessionResolution{})
+	_, _, _, err := buildImagesToolCreateMsg(body, "application/json", false, openAISessionResolution{})
 	if err == nil {
 		t.Fatal("expected err for n>1, got nil")
 	}
@@ -352,9 +361,123 @@ func TestBuildImagesToolCreateMsg_NGreaterThanOne(t *testing.T) {
 
 // TestBuildImagesToolCreateMsg_EmptyPrompt prompt 空串应报错。
 func TestBuildImagesToolCreateMsg_EmptyPrompt(t *testing.T) {
-	_, _, _, err := buildImagesToolCreateMsg([]byte(`{"n":1}`), openAISessionResolution{})
+	_, _, _, err := buildImagesToolCreateMsg([]byte(`{"n":1}`), "application/json", false, openAISessionResolution{})
 	if err == nil {
 		t.Fatal("expected err for empty prompt, got nil")
+	}
+}
+
+// TestBuildImagesToolCreateMsg_Edit_JSON 验证 /images/edits 走 JSON 路径时：
+// 参考图会以 input_image 注入到 user message 的 content 里，
+// mask 走 tool 的 input_image_mask 字段，input_fidelity 也透传到 tool。
+func TestBuildImagesToolCreateMsg_Edit_JSON(t *testing.T) {
+	body := []byte(`{
+		"model":"gpt-image-1.5",
+		"prompt":"make it cyberpunk",
+		"size":"1024x1024",
+		"input_fidelity":"high",
+		"image":"data:image/png;base64,AAA",
+		"mask":"data:image/png;base64,BBB"
+	}`)
+	msg, n, inputTokens, err := buildImagesToolCreateMsg(body, "application/json", true, openAISessionResolution{})
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	if n != 1 {
+		t.Errorf("n = %d, want 1", n)
+	}
+	// text prompt "make it cyberpunk" = 17 runes → 6；image input = 1 * 272 → 278
+	if inputTokens != 6+272 {
+		t.Errorf("inputTokens = %d, want %d", inputTokens, 6+272)
+	}
+	content := gjson.GetBytes(msg, "input.0.content")
+	if !content.IsArray() || len(content.Array()) != 2 {
+		t.Fatalf("content len = %d, want 2 (text + image)", len(content.Array()))
+	}
+	if content.Get("0.type").String() != "input_text" || content.Get("1.type").String() != "input_image" {
+		t.Errorf("content types wrong: %s", content.Raw)
+	}
+	if content.Get("1.image_url").String() != "data:image/png;base64,AAA" {
+		t.Errorf("image_url not propagated: %s", content.Raw)
+	}
+	tool := gjson.GetBytes(msg, "tools.0")
+	if tool.Get("input_fidelity").String() != "high" {
+		t.Errorf("input_fidelity not propagated: %s", tool.Raw)
+	}
+	if tool.Get("input_image_mask.image_url").String() != "data:image/png;base64,BBB" {
+		t.Errorf("input_image_mask not propagated: %s", tool.Raw)
+	}
+}
+
+// TestBuildImagesToolCreateMsg_Edit_MissingImage /edits 模式下缺 image 字段应报错。
+func TestBuildImagesToolCreateMsg_Edit_MissingImage(t *testing.T) {
+	_, _, _, err := buildImagesToolCreateMsg(
+		[]byte(`{"prompt":"x"}`), "application/json", true, openAISessionResolution{},
+	)
+	if err == nil {
+		t.Fatal("expected err for missing image, got nil")
+	}
+}
+
+// TestParseImagesEditMultipart 覆盖 OpenAI SDK 标准的 multipart/form-data 请求：
+// image 文件 + prompt 文本 + mask 文件 → 规范化后 images / mask 都应是 data URL。
+func TestParseImagesEditMultipart(t *testing.T) {
+	pngBytes := []byte{0x89, 0x50, 0x4E, 0x47}
+	maskBytes := []byte{0x89, 0x50, 0x4E, 0x47, 0xFF}
+
+	var buf bytes.Buffer
+	mw := multipart.NewWriter(&buf)
+	_ = mw.WriteField("prompt", "relight the scene")
+	_ = mw.WriteField("model", "gpt-image-1.5")
+	_ = mw.WriteField("size", "1024x1024")
+	_ = mw.WriteField("quality", "high")
+	_ = mw.WriteField("input_fidelity", "high")
+
+	h := textproto.MIMEHeader{}
+	h.Set("Content-Disposition", `form-data; name="image"; filename="in.png"`)
+	h.Set("Content-Type", "image/png")
+	w, _ := mw.CreatePart(h)
+	_, _ = w.Write(pngBytes)
+
+	hm := textproto.MIMEHeader{}
+	hm.Set("Content-Disposition", `form-data; name="mask"; filename="mask.png"`)
+	hm.Set("Content-Type", "image/png")
+	wm, _ := mw.CreatePart(hm)
+	_, _ = wm.Write(maskBytes)
+
+	_ = mw.Close()
+
+	req, err := parseImagesRequest(buf.Bytes(), mw.FormDataContentType(), true)
+	if err != nil {
+		t.Fatalf("parseImagesRequest err: %v", err)
+	}
+	if !req.IsEdit || req.Prompt != "relight the scene" {
+		t.Errorf("prompt / edit flag wrong: %+v", req)
+	}
+	if req.Model != "gpt-image-1.5" || req.Size != "1024x1024" ||
+		req.Quality != "high" || req.InputFidelity != "high" {
+		t.Errorf("fields mis-parsed: %+v", req)
+	}
+	if len(req.Images) != 1 ||
+		req.Images[0] != "data:image/png;base64,"+base64.StdEncoding.EncodeToString(pngBytes) {
+		t.Errorf("image not encoded as data URL: %+v", req.Images)
+	}
+	if req.Mask != "data:image/png;base64,"+base64.StdEncoding.EncodeToString(maskBytes) {
+		t.Errorf("mask not encoded as data URL: %q", req.Mask)
+	}
+}
+
+// TestNormalizeImageRef 三种输入形式都应命中预期：data URL / http URL / 裸 base64。
+func TestNormalizeImageRef(t *testing.T) {
+	cases := map[string]string{
+		"data:image/png;base64,AAA": "data:image/png;base64,AAA",
+		"https://example.com/a.png": "https://example.com/a.png",
+		"AAA":                       "data:image/png;base64,AAA",
+	}
+	for in, want := range cases {
+		if got := normalizeImageRef(in); got != want {
+			t.Errorf("normalizeImageRef(%q) = %q, want %q", in, got, want)
+		}
 	}
 }
 

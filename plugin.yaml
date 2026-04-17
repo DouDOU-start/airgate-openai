@@ -33,7 +33,10 @@ gateway:
       description: 模型列表
     - method: POST
       path: /v1/images/generations
-      description: Images API（生图）
+      description: Images API（文生图）
+    - method: POST
+      path: /v1/images/edits
+      description: Images API（图生图 / 编辑）
     - method: WS
       path: /v1/responses
       description: Responses API（WebSocket）
@@ -54,7 +57,10 @@ gateway:
       description: 模型列表（无 /v1 前缀）
     - method: POST
       path: /images/generations
-      description: Images API（无 /v1 前缀）
+      description: Images API（文生图，无 /v1 前缀）
+    - method: POST
+      path: /images/edits
+      description: Images API（图生图，无 /v1 前缀）
     - method: WS
       path: /responses
       description: Responses API WebSocket（无 /v1 前缀）
