@@ -180,8 +180,12 @@ func (g *OpenAIGateway) validateAPIKeyViaResponses(ctx context.Context, account 
 	return nil
 }
 
+// ReauthRequiredPrefix 是 QueryQuota 在 refresh_token 失效且无法本地降级时返回的错误前缀。
+// Core 侧按前缀匹配以映射为"需要重新授权"的领域错误（gRPC 会保留 Go error 的字符串）。
+const ReauthRequiredPrefix = "reauth_required: "
+
 // QueryQuota 查询账号额度
-// OAuth 账号：刷新 token 并从 id_token 中提取订阅信息
+// OAuth 账号：刷新 token 并从 id_token 中提取订阅信息；refresh_token 失效时降级解析存储的 access_token
 // API Key 账号：不支持额度查询
 func (g *OpenAIGateway) QueryQuota(ctx context.Context, credentials map[string]string) (*sdk.QuotaInfo, error) {
 	refreshToken := credentials["refresh_token"]
@@ -192,7 +196,40 @@ func (g *OpenAIGateway) QueryQuota(ctx context.Context, credentials map[string]s
 	// 用 refresh_token 换取新的 token 组，从中获取最新订阅状态
 	tokens, err := g.refreshTokens(ctx, refreshToken, credentials["proxy_url"])
 	if err != nil {
-		return nil, fmt.Errorf("刷新 token 失败: %w", err)
+		// 降级：解析已存储的 access_token JWT（未验签），拿到签发时刻的 plan_type。
+		// access_token 可能已过期，但 claims 依然可读；拿到说明原凭证确实是这个账号。
+		// 在前端透传 refresh_warning，提示用户 refresh_token 已失效、数据可能陈旧。
+		if access := credentials["access_token"]; access != "" {
+			info := parseIDToken(access)
+			if info.PlanType != "" {
+				extra := map[string]string{
+					"refresh_warning": "refresh_token_invalid: " + err.Error(),
+				}
+				if info.PlanType != "" {
+					extra["plan_type"] = info.PlanType
+				}
+				if info.AccountID != "" {
+					extra["chatgpt_account_id"] = info.AccountID
+				}
+				if info.AccountName != "" {
+					extra["account_name"] = info.AccountName
+				}
+				if info.Email != "" {
+					extra["email"] = info.Email
+				}
+				if g.logger != nil {
+					g.logger.Warn("QueryQuota refresh 失败，降级为 access_token JWT 解析",
+						"error", err,
+						"plan_type", info.PlanType,
+					)
+				}
+				return &sdk.QuotaInfo{
+					ExpiresAt: info.SubscriptionActiveUntil,
+					Extra:     extra,
+				}, nil
+			}
+		}
+		return nil, fmt.Errorf("%srefresh_token 已失效，请重新授权 OAuth (原因: %s)", ReauthRequiredPrefix, err.Error())
 	}
 
 	info := parseIDToken(tokens.IDToken)
