@@ -71,7 +71,9 @@ func classifyResponsesFailure(data []byte) *responsesFailureError {
 	errType := strings.ToLower(strings.TrimSpace(errNode.Get("type").String()))
 	errCode := strings.ToLower(strings.TrimSpace(errNode.Get("code").String()))
 
-	return classifyResponsesError(errType, errCode, msg)
+	failure := classifyResponsesError(errType, errCode, msg)
+	applyOpenAIRateLimitReset(failure, errNode)
+	return failure
 }
 
 // classifyWSErrorEvent 处理 WebSocket "error" 事件（区别于 "response.failed"）。
@@ -92,7 +94,40 @@ func classifyWSErrorEvent(data []byte) *responsesFailureError {
 	}
 	errType := strings.ToLower(strings.TrimSpace(errNode.Get("type").String()))
 	errCode := strings.ToLower(strings.TrimSpace(errNode.Get("code").String()))
-	return classifyResponsesError(errType, errCode, msg)
+	failure := classifyResponsesError(errType, errCode, msg)
+	applyOpenAIRateLimitReset(failure, errNode)
+	return failure
+}
+
+// applyOpenAIRateLimitReset 把 OpenAI OAuth 错误体里的 resets_at / resets_in_seconds
+// 转换成精确的 RetryAfter，覆盖 parseRetryDelay 的文本估算。
+// 只在失败被归类为限流（Kind=RateLimited）时起作用。
+//
+// OpenAI usage_limit_reached / rate_limit_exceeded 错误体示例：
+//
+//	{"error": {
+//	    "type": "usage_limit_reached",
+//	    "message": "The usage limit has been reached",
+//	    "resets_at": 1769404154,
+//	    "resets_in_seconds": 133107}}
+func applyOpenAIRateLimitReset(failure *responsesFailureError, errNode gjson.Result) {
+	if failure == nil || failure.Kind != responsesFailureKindRateLimited {
+		return
+	}
+	if secs := errNode.Get("resets_in_seconds"); secs.Exists() {
+		if v := secs.Int(); v > 0 {
+			failure.RetryAfter = time.Duration(v) * time.Second
+			return
+		}
+	}
+	if resetsAt := errNode.Get("resets_at"); resetsAt.Exists() {
+		if ts := resetsAt.Int(); ts > 0 {
+			until := time.Until(time.Unix(ts, 0))
+			if until > 0 {
+				failure.RetryAfter = until
+			}
+		}
+	}
 }
 
 // classifyResponsesError 根据 type/code/message 关键词归类错误。
@@ -120,7 +155,7 @@ func classifyResponsesError(errType, errCode, msg string) *responsesFailureError
 			AnthropicErrorType: "invalid_request_error",
 			Message:            msg,
 		}
-	case containsAny(errType, errCode, msg, "rate_limit"):
+	case isTemporaryRateLimitText(errType, errCode, msg) || containsAny(errType, errCode, msg, "usage_limit_reached", "rate_limit_exceeded"):
 		return &responsesFailureError{
 			Kind:               responsesFailureKindRateLimited,
 			StatusCode:         http.StatusTooManyRequests,
