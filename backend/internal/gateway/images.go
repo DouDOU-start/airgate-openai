@@ -13,7 +13,6 @@ import (
 
 	"github.com/tidwall/gjson"
 
-	"github.com/DouDOU-start/airgate-openai/backend/resources"
 	sdk "github.com/DouDOU-start/airgate-sdk"
 )
 
@@ -21,6 +20,17 @@ import (
 // Codex 官方 $imagegen 技能同样用 gpt-5.4 作为主 model，image_generation 作为
 // tool 内部用 gpt-image-1.5。
 const imagesOAuthChatModel = "gpt-5.4"
+
+// imagesPassthroughInstructions 强制 gpt-5.4 只做"调工具"这一件事，不发挥创意。
+// 原因：
+//   - 客户端调 /v1/images/generations 期望的是 prompt 直达上游，而 Responses API
+//     的调用链必须先过一个 chat 模型再触发 image_generation 工具；
+//   - 如果给 gpt-5.4 用通用的 Codex/助理 instructions，它会把 prompt 扩写成一大段
+//     "构图/灯光/配色/风格"的创意导演描述（revised_prompt 明显变长），用户体感就是
+//     "prompt 被改了"。
+//   - 这里用极简指令把 gpt-5.4 的角色压缩成"透传路由"，只会补合规改写（如真实人物
+//     换成匿名替身，这是 OpenAI 侧硬编码的安全策略，instruction 拦不住）。
+const imagesPassthroughInstructions = "Forward the user's message verbatim as the prompt argument to the image_generation tool. Do not rewrite, elaborate, or add details about style, composition, lighting, color, mood, or any elements the user did not explicitly request. Do not answer with text."
 
 // imageGenOutputTokenTable 按 OpenAI 官方 image_generation tool 的 token 换算表，
 // 用于 ChatGPT OAuth 账号（上游 tool_usage.image_gen 永远为 0）时估算 output token。
@@ -169,7 +179,7 @@ func buildImagesToolCreateMsg(
 	}
 	payload := map[string]any{
 		"model":        imagesOAuthChatModel,
-		"instructions": resources.Instructions,
+		"instructions": imagesPassthroughInstructions,
 		"input":        inputList,
 		"tools":        []any{tool},
 		"stream":       true,
