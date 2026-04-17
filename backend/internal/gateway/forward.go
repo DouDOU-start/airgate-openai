@@ -54,6 +54,11 @@ func (g *OpenAIGateway) forwardHTTP(ctx context.Context, req *sdk.ForwardRequest
 		return g.forwardAPIKey(ctx, req)
 	}
 	if account.Credentials["access_token"] != "" {
+		// OAuth 账号收到 Images REST 请求时，翻译为 Responses API + image_generation
+		// tool（与 Codex $imagegen 一致），把结果打包回 Images REST 响应。
+		if isImagesRequest(reqPath) {
+			return g.forwardImagesViaResponsesTool(ctx, req)
+		}
 		return g.forwardOAuth(ctx, req)
 	}
 	return nil, fmt.Errorf("账号缺少 api_key 或 access_token")
@@ -180,6 +185,11 @@ func (g *OpenAIGateway) forwardAPIKey(ctx context.Context, req *sdk.ForwardReque
 	// 捕获上游 Codex 用量头
 	if snapshot := parseCodexUsageFromHeaders(resp.Header); snapshot != nil {
 		StoreCodexUsage(account.ID, snapshot)
+	}
+
+	// Images API 响应体无 model 字段，另走专用处理器回填模型后再 fillCost
+	if isImagesRequest(reqPath) {
+		return handleImagesResponse(resp, req.Writer, start, req.Model)
 	}
 
 	// 流式 / 非流式响应处理
@@ -414,6 +424,13 @@ func (g *OpenAIGateway) forwardOAuth(ctx context.Context, req *sdk.ForwardReques
 		Duration:              elapsed,
 		FirstTokenMs:          firstTokenMs,
 	}
+	toolImageIn := result.ToolImageInputTokens
+	toolImageOut := result.ToolImageOutputTokens
+	// ChatGPT OAuth 下 tool_usage.image_gen 永远为 0；只要流里出现了
+	// image_generation_call output item，就按 size×quality 估算 token 计入账单。
+	if toolImageOut == 0 && len(result.ImageGenCalls) > 0 {
+		toolImageOut = estimateImageGenOutputTokens(result.ImageGenCalls)
+	}
 	if result.Err != nil {
 		// 客户端侧错误（如不支持的 model、context 超长、参数无效）：
 		// 这是用户请求本身的问题，与账号无关，不能让 core 把账号惩罚停用。
@@ -428,7 +445,7 @@ func (g *OpenAIGateway) forwardOAuth(ctx context.Context, req *sdk.ForwardReques
 		fwdResult.StatusCode = http.StatusBadGateway
 		return fwdResult, result.Err
 	}
-	fillCost(fwdResult)
+	fillCostWithImageTool(fwdResult, toolImageIn, toolImageOut)
 	return fwdResult, nil
 }
 

@@ -89,6 +89,13 @@ var registry = map[string]Spec{
 
 	// ── GPT 基础系列 ──
 	"gpt-5.2": std("GPT 5.2", 272000, 128000, 1.75, 0.175, 14.0),
+
+	// ── 图像生成（token 化计费：text input + image output）──
+	// 说明：gpt-image-1 / gpt-image-1.5 的 usage.output_tokens 为图像转 token 数
+	// （如 1024x1024 高质量 ≈ 4160 tokens），乘上 OutputPrice 即为每张图成本。
+	// 单价参考 OpenAI 2025-2026 官方 $5 text input / $40 image output per 1M。
+	"gpt-image-1":   std("GPT Image 1", 32000, 0, 5.0, 1.25, 40.0),
+	"gpt-image-1.5": std("GPT Image 1.5", 32000, 0, 5.0, 1.25, 40.0),
 }
 
 // DefaultSpec 未注册模型的兜底值

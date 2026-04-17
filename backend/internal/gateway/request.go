@@ -190,6 +190,13 @@ func preprocessRequestBody(body []byte, model, reqPath string) []byte {
 		}
 	}
 
+	// Images API 请求体只有 prompt/n/size/quality/model 等字段，后续的
+	// previous_response_id / context_guard / normalizeResponsesInput 对它都应
+	// 无作用。这里显式 bypass，避免未来扩展这些步骤时误伤图像请求。
+	if isImagesRequest(reqPath) {
+		return result
+	}
+
 	// 剔除客户端传入的 previous_response_id。
 	// AirGate 在多个上游账号之间做负载均衡，客户端的 previous_response_id
 	// 可能指向另一个账号的 response，上游会返回 "not found"。

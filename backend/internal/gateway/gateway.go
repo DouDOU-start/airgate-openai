@@ -196,38 +196,44 @@ func (g *OpenAIGateway) QueryQuota(ctx context.Context, credentials map[string]s
 	// 用 refresh_token 换取新的 token 组，从中获取最新订阅状态
 	tokens, err := g.refreshTokens(ctx, refreshToken, credentials["proxy_url"])
 	if err != nil {
-		// 降级：解析已存储的 access_token JWT（未验签），拿到签发时刻的 plan_type。
-		// access_token 可能已过期，但 claims 依然可读；拿到说明原凭证确实是这个账号。
-		// 在前端透传 refresh_warning，提示用户 refresh_token 已失效、数据可能陈旧。
+		// refresh_token 失效，但只要 access_token 还在就降级使用它：
+		// access_token 是一个 JWT，不验签也能读 claims 拿到 plan_type / email /
+		// 订阅有效期；并且它本身也仍然可用于测试连接 / 拉 Codex usage 窗口等
+		// 只需 access_token 的操作（ProbeUsage 也走同一条路）。只有在连 access_token
+		// 都没有的情况下才视为彻底失效。
+		//
+		// 历史上这里要求 claims 里必须有 plan_type 才降级，导致 JWT claims 被
+		// 精简（只含 sub / exp 等）的账号直接触发 ErrReauthRequired，前端弹出
+		// "需要重新授权"，其实账号还能正常服务请求。现在放宽：有 access_token
+		// 就成功返回，带上 refresh_warning 标记数据陈旧即可。
 		if access := credentials["access_token"]; access != "" {
 			info := parseIDToken(access)
-			if info.PlanType != "" {
-				extra := map[string]string{
-					"refresh_warning": "refresh_token_invalid: " + err.Error(),
-				}
-				if info.PlanType != "" {
-					extra["plan_type"] = info.PlanType
-				}
-				if info.AccountID != "" {
-					extra["chatgpt_account_id"] = info.AccountID
-				}
-				if info.AccountName != "" {
-					extra["account_name"] = info.AccountName
-				}
-				if info.Email != "" {
-					extra["email"] = info.Email
-				}
-				if g.logger != nil {
-					g.logger.Warn("QueryQuota refresh 失败，降级为 access_token JWT 解析",
-						"error", err,
-						"plan_type", info.PlanType,
-					)
-				}
-				return &sdk.QuotaInfo{
-					ExpiresAt: info.SubscriptionActiveUntil,
-					Extra:     extra,
-				}, nil
+			extra := map[string]string{
+				"refresh_warning": "refresh_token_invalid: " + err.Error(),
 			}
+			if info.PlanType != "" {
+				extra["plan_type"] = info.PlanType
+			}
+			if info.AccountID != "" {
+				extra["chatgpt_account_id"] = info.AccountID
+			}
+			if info.AccountName != "" {
+				extra["account_name"] = info.AccountName
+			}
+			if info.Email != "" {
+				extra["email"] = info.Email
+			}
+			if g.logger != nil {
+				g.logger.Warn("QueryQuota refresh 失败，降级为 access_token JWT 解析",
+					"error", err,
+					"plan_type", info.PlanType,
+					"has_email", info.Email != "",
+				)
+			}
+			return &sdk.QuotaInfo{
+				ExpiresAt: info.SubscriptionActiveUntil,
+				Extra:     extra,
+			}, nil
 		}
 		return nil, fmt.Errorf("%srefresh_token 已失效，请重新授权 OAuth (原因: %s)", ReauthRequiredPrefix, err.Error())
 	}
@@ -501,6 +507,64 @@ func (g *OpenAIGateway) HandleRequest(ctx context.Context, _, path, _ string, _ 
 			Errors:   probeErrors,
 		}), nil
 
+	case "usage/probe":
+		// 强制重探测单账号：不走 GetCodexUsage 缓存，直接 ProbeUsage 并回写。
+		// 用户点"刷新用量"时调用，解决"从未成功探测 → 用量窗口一直为空"的问题。
+		var req struct {
+			ID          int64             `json:"id"`
+			Credentials map[string]string `json:"credentials"`
+		}
+		if err := json.Unmarshal(body, &req); err != nil || req.ID == 0 {
+			return http.StatusBadRequest, nil, jsonError("invalid request body"), nil
+		}
+		// ProbeUsage 内部会把结果写入 codex usage 缓存（见 probe*Usage 实现），
+		// 后续 usage/accounts 会直接读到新鲜数据；这里也顺手构造响应体，让调用方
+		// 可以立即拿到探测结果，而不需要再轮询一次 usage/accounts。
+		snapshot := g.ProbeUsage(ctx, req.ID, req.Credentials)
+		probeErr := GetProbeError(req.ID)
+		resp := map[string]any{}
+		if snapshot != nil {
+			now := time.Now()
+			// 复用 usage/accounts 里已经写好的 windows 构建逻辑：这里不方便直接
+			// 调用（它是内层闭包），所以内联一个最小版本——只回 5h/7d 的主窗口。
+			// usage/accounts 下一次拉取时会走完整的 buildUsageWindows 分支。
+			var windows []sdk.AccountUsageWindow
+			if normalized := snapshot.Normalize(); normalized != nil {
+				if normalized.Used5hPercent != nil || normalized.Reset5hSeconds != nil {
+					var resetAt *time.Time
+					if normalized.Reset5hSeconds != nil {
+						resetAt = sdk.ResetAtFromBase(snapshot.CapturedAt, *normalized.Reset5hSeconds)
+					}
+					used := 0.0
+					if normalized.Used5hPercent != nil {
+						used = *normalized.Used5hPercent
+					}
+					windows = append(windows, sdk.NewAccountUsageWindow("5h", "5h", used, resetAt, now))
+				}
+				if normalized.Used7dPercent != nil || normalized.Reset7dSeconds != nil {
+					var resetAt *time.Time
+					if normalized.Reset7dSeconds != nil {
+						resetAt = sdk.ResetAtFromBase(snapshot.CapturedAt, *normalized.Reset7dSeconds)
+					}
+					used := 0.0
+					if normalized.Used7dPercent != nil {
+						used = *normalized.Used7dPercent
+					}
+					windows = append(windows, sdk.NewAccountUsageWindow("7d", "7d", used, resetAt, now))
+				}
+			}
+			resp["windows"] = windows
+			resp["updated_at"] = snapshot.CapturedAt.UTC().Format(time.RFC3339)
+		}
+		if probeErr != "" {
+			resp["error"] = probeErr
+		}
+		if snapshot == nil && probeErr == "" {
+			// 探测失败但没捕获具体错误（ProbeUsage 内部日志有，但这里给调用方一个兜底提示）。
+			resp["error"] = "探测失败：上游未返回 rate_limits 事件"
+		}
+		return http.StatusOK, nil, jsonMarshal(resp), nil
+
 	case "oauth/start":
 		resp, err := g.StartOAuth(context.Background(), &OAuthStartRequest{})
 		if err != nil {
@@ -638,6 +702,53 @@ func fillCost(result *sdk.ForwardResult) {
 	result.InputPrice = spec.InputPrice
 	result.OutputPrice = spec.OutputPrice
 	result.CachedInputPrice = spec.CachedPrice
+}
+
+// imageToolCostModel 是 Responses API 的 image_generation 内置工具使用的模型，
+// 上游文档与 Codex `$imagegen` 技能均使用 gpt-image-1.5 作为实际图像生成模型。
+const imageToolCostModel = "gpt-image-1.5"
+
+// fillCostWithImageTool 在 fillCost 之上叠加 image_generation tool 的费用。
+//
+// 上游（Responses API）对主 model（如 gpt-5.4）与图像工具 (gpt-image-1.5)
+// 采用两套独立单价。tool_usage.image_gen.{input_tokens,output_tokens} 必须按
+// gpt-image-1.5 单价单独结算，不能直接并入主 model 的 token 总数（否则会以
+// chat 单价错算成本）。
+//
+// 本函数：
+//  1. 按主 model 用 fillCost 计算 InputCost / OutputCost / CachedInputCost
+//  2. 按 gpt-image-1.5 定价 + ServiceTier 档位计算工具图像的 input/output 费用
+//  3. 叠加到对应 *Cost 字段，同时把 tool 的 token 数累加到 Input/OutputTokens，
+//     让 usage_log 的总量反映真实用量（单价展示字段 *Price 保留主 model 单价，
+//     混合请求时 total_cost 才是权威口径）
+func fillCostWithImageTool(result *sdk.ForwardResult, toolImageInputTokens, toolImageOutputTokens int) {
+	fillCost(result)
+	if result == nil || toolImageInputTokens+toolImageOutputTokens <= 0 {
+		return
+	}
+	imageSpec := model.Lookup(imageToolCostModel)
+	if imageSpec.InputPrice == 0 && imageSpec.OutputPrice == 0 {
+		// 图像模型未在 registry 中注册，跳过叠加以免漏计变成错计 $0
+		return
+	}
+	imgModelInfo := sdk.ModelInfo{
+		InputPrice:          imageSpec.InputPrice,
+		OutputPrice:         imageSpec.OutputPrice,
+		CachedInputPrice:    imageSpec.CachedPrice,
+		InputPricePriority:  imageSpec.InputPricePriority,
+		OutputPricePriority: imageSpec.OutputPricePriority,
+		InputPriceFlex:      imageSpec.InputPriceFlex,
+		OutputPriceFlex:     imageSpec.OutputPriceFlex,
+	}
+	toolCost := sdk.CalculateCost(sdk.CostInput{
+		InputTokens:  toolImageInputTokens,
+		OutputTokens: toolImageOutputTokens,
+		ServiceTier:  result.ServiceTier,
+	}, imgModelInfo)
+	result.InputCost += toolCost.InputCost
+	result.OutputCost += toolCost.OutputCost
+	result.InputTokens += toolImageInputTokens
+	result.OutputTokens += toolImageOutputTokens
 }
 
 func jsonError(msg string) []byte {

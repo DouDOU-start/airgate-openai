@@ -47,6 +47,7 @@ func handleStreamResponse(resp *http.Response, w http.ResponseWriter, start time
 	scanner.Buffer(make([]byte, 64*1024), upstreamSSEMaxLineBytes)
 	var streamErr error
 	firstTokenRecorded := false
+	var toolImageIn, toolImageOut int
 
 	for scanner.Scan() {
 		line := scanner.Text()
@@ -72,7 +73,7 @@ func handleStreamResponse(resp *http.Response, w http.ResponseWriter, start time
 		}
 
 		// 解析 usage（仅在 response.completed 事件中）
-		parseSSEUsage([]byte(data), result)
+		parseSSEUsage([]byte(data), result, &toolImageIn, &toolImageOut)
 
 		// 捕获上游 SSE 失败事件
 		if streamErr == nil {
@@ -101,7 +102,7 @@ func handleStreamResponse(resp *http.Response, w http.ResponseWriter, start time
 		}
 		return result, streamErr
 	}
-	fillCost(result)
+	fillCostWithImageTool(result, toolImageIn, toolImageOut)
 	return result, nil
 }
 
@@ -138,7 +139,7 @@ func handleNonStreamResponse(resp *http.Response, w http.ResponseWriter, start t
 		result.Body = body
 		result.Headers = resp.Header.Clone()
 	}
-	fillCost(result)
+	fillCostWithImageTool(result, usage.toolImageInputTokens, usage.toolImageOutputTokens)
 	return result, nil
 }
 
@@ -198,6 +199,7 @@ func ParseSSEStream(reader io.Reader, handler WSEventHandler) WSResult {
 		case "response.output_item.done":
 			if item, ok := ev["item"].(map[string]any); ok {
 				appendToolUseBlock(&result, item)
+				collectImageGenCall(&result, item)
 			}
 
 		case "response.completed", "response.done":
@@ -267,7 +269,11 @@ func extractSSEData(line string) (string, bool) {
 }
 
 // parseSSEUsage 从 SSE 数据中提取 usage 信息
-func parseSSEUsage(data []byte, result *sdk.ForwardResult) {
+//
+// toolImageIn / toolImageOut：可选累加器指针，用于 image_generation tool
+// 的用量提取。调用方若传 nil 则忽略，否则把 response.tool_usage.image_gen.*
+// 写入指针指向的变量。
+func parseSSEUsage(data []byte, result *sdk.ForwardResult, toolImageIn, toolImageOut *int) {
 	eventType := gjson.GetBytes(data, "type").String()
 
 	switch eventType {
@@ -290,6 +296,14 @@ func parseSSEUsage(data []byte, result *sdk.ForwardResult) {
 			// 从 input_tokens 中扣除缓存部分，避免计费重复计算
 			if result.CachedInputTokens > 0 && result.InputTokens >= result.CachedInputTokens {
 				result.InputTokens -= result.CachedInputTokens
+			}
+		}
+		if imgTool := resp.Get("tool_usage.image_gen"); imgTool.Exists() {
+			if toolImageIn != nil {
+				*toolImageIn = int(imgTool.Get("input_tokens").Int())
+			}
+			if toolImageOut != nil {
+				*toolImageOut = int(imgTool.Get("output_tokens").Int())
 			}
 		}
 
@@ -365,6 +379,10 @@ type openaiUsage struct {
 	outputTokens          int
 	cachedInputTokens     int
 	reasoningOutputTokens int
+	// image_generation tool 的用量，从 response.tool_usage.image_gen 提取。
+	// 按 gpt-image-1.5 单价单独计费，与主 model 的单价隔离。
+	toolImageInputTokens  int
+	toolImageOutputTokens int
 }
 
 // parseUsage 从完整响应体解析 usage
@@ -405,6 +423,17 @@ func parseUsage(body []byte) openaiUsage {
 	usage.reasoningOutputTokens = int(usageNode.Get("output_tokens_details.reasoning_tokens").Int())
 	if usage.reasoningOutputTokens == 0 {
 		usage.reasoningOutputTokens = int(usageNode.Get("completion_tokens_details.reasoning_tokens").Int())
+	}
+
+	// tool_usage.image_gen 位于 response 顶层（与 usage 平级），Responses 响应体里可能
+	// 在 "response" 子对象下，也可能直接在根对象下。两条路径都试。
+	toolUsage := gjson.GetBytes(body, "tool_usage.image_gen")
+	if !toolUsage.Exists() {
+		toolUsage = gjson.GetBytes(body, "response.tool_usage.image_gen")
+	}
+	if toolUsage.Exists() {
+		usage.toolImageInputTokens = int(toolUsage.Get("input_tokens").Int())
+		usage.toolImageOutputTokens = int(toolUsage.Get("output_tokens").Int())
 	}
 
 	return usage

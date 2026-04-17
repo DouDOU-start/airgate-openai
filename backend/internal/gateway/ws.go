@@ -52,10 +52,32 @@ type WSResult struct {
 	OutputTokens          int
 	CachedInputTokens     int
 	ReasoningOutputTokens int
-	CompletedEventRaw     []byte
-	FailedEventRaw        []byte
-	Duration              time.Duration
-	Err                   error
+	// ToolImageInputTokens / ToolImageOutputTokens 来自 response.usage.tool_usage.image_gen
+	// 或 response.completed 的 tool_usage 字段。按 gpt-image-1.5 单价单独计费，
+	// 因为主 model（通常是 gpt-5.4）与图像工具内部模型的单价不同。
+	ToolImageInputTokens  int
+	ToolImageOutputTokens int
+	// ImageGenCalls 捕获 Responses API 返回的 image_generation_call output items，
+	// 供 REST→tools 翻译路径将 base64 结果打包回 OpenAI Images REST 响应。
+	ImageGenCalls []ImageGenCall
+	// ToolImageModel 是 response.tools[0].model —— 上游实际为 image_generation
+	// 工具选用的内部模型（客户端请求 gpt-image-2 时可能被静默降级为 gpt-image-1.5）。
+	ToolImageModel    string
+	CompletedEventRaw []byte
+	FailedEventRaw    []byte
+	Duration          time.Duration
+	Err               error
+}
+
+// ImageGenCall 对应 Responses API 输出项中 type="image_generation_call" 的一条记录。
+type ImageGenCall struct {
+	Result        string // base64 编码的图像
+	Size          string
+	Quality       string
+	OutputFormat  string
+	Background    string
+	RevisedPrompt string
+	Model         string // 上游实际使用的图像模型（如 gpt-image-1.5）
 }
 
 // ToolUseBlock 表示从 Responses 流中聚合出的工具调用块。
@@ -252,6 +274,7 @@ func ReceiveWSResponse(ctx context.Context, conn *websocket.Conn, handler WSEven
 		case "response.output_item.done":
 			if item, ok := ev["item"].(map[string]any); ok {
 				appendToolUseBlock(&result, item)
+				collectImageGenCall(&result, item)
 			}
 
 		case "response.completed", "response.done":
@@ -332,6 +355,24 @@ func mergeResponseMetadata(result *WSResult, response map[string]any) {
 	}
 	if model := jsonString(response["model"]); model != "" {
 		result.Model = model
+	}
+	// 从 response.tools[] 里扫出 image_generation 工具的实际 model 字段。
+	// 上游会把生效后的 tool 配置回写到 response.tools 里（客户端传的 gpt-image-2
+	// 会被替换为上游真正使用的值，比如 gpt-image-1.5）。
+	if tools, ok := response["tools"].([]any); ok {
+		for _, t := range tools {
+			tm, ok := t.(map[string]any)
+			if !ok {
+				continue
+			}
+			if jsonString(tm["type"]) != "image_generation" {
+				continue
+			}
+			if m := jsonString(tm["model"]); m != "" {
+				result.ToolImageModel = m
+			}
+			break
+		}
 	}
 }
 
@@ -449,4 +490,33 @@ func extractUsageFromResponseMap(result *WSResult, resp map[string]any) {
 			result.InputTokens -= result.CachedInputTokens
 		}
 	}
+	// ChatGPT OAuth 响应把 image_generation tool 的用量放在 response.tool_usage.image_gen，
+	// 与主 usage 分开上报。这里提取出来让计费层按 gpt-image-1.5 单价额外计费。
+	if toolUsage, ok := resp["tool_usage"].(map[string]any); ok {
+		if img, ok := toolUsage["image_gen"].(map[string]any); ok {
+			result.ToolImageInputTokens = JsonInt(img, "input_tokens")
+			result.ToolImageOutputTokens = JsonInt(img, "output_tokens")
+		}
+	}
+}
+
+// collectImageGenCall 读取 response.output_item.done 里 type=image_generation_call 的 item，
+// 把 base64 结果与尺寸/质量等元信息累加到 WSResult。仅在 REST→tools 翻译路径使用。
+func collectImageGenCall(result *WSResult, item map[string]any) {
+	if jsonString(item["type"]) != "image_generation_call" {
+		return
+	}
+	call := ImageGenCall{
+		Result:        jsonString(item["result"]),
+		Size:          jsonString(item["size"]),
+		Quality:       jsonString(item["quality"]),
+		OutputFormat:  jsonString(item["output_format"]),
+		Background:    jsonString(item["background"]),
+		RevisedPrompt: jsonString(item["revised_prompt"]),
+		Model:         jsonString(item["model"]),
+	}
+	if call.Result == "" {
+		return
+	}
+	result.ImageGenCalls = append(result.ImageGenCalls, call)
 }

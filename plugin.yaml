@@ -31,6 +31,9 @@ gateway:
     - method: GET
       path: /v1/models
       description: 模型列表
+    - method: POST
+      path: /v1/images/generations
+      description: Images API（生图）
     - method: WS
       path: /v1/responses
       description: Responses API（WebSocket）
@@ -49,6 +52,9 @@ gateway:
     - method: GET
       path: /models
       description: 模型列表（无 /v1 前缀）
+    - method: POST
+      path: /images/generations
+      description: Images API（无 /v1 前缀）
     - method: WS
       path: /responses
       description: Responses API WebSocket（无 /v1 前缀）
@@ -122,6 +128,32 @@ gateway:
       input_price_flex: 0.375
       output_price_flex: 2.25
       cached_input_price_flex: 0.0375
+    - id: gpt-image-1
+      name: GPT Image 1
+      context_window: 32000
+      max_output_tokens: 0
+      input_price: 5
+      output_price: 40
+      cached_input_price: 1.25
+      input_price_priority: 10
+      output_price_priority: 80
+      cached_input_price_priority: 2.5
+      input_price_flex: 2.5
+      output_price_flex: 20
+      cached_input_price_flex: 0.625
+    - id: gpt-image-1.5
+      name: GPT Image 1.5
+      context_window: 32000
+      max_output_tokens: 0
+      input_price: 5
+      output_price: 40
+      cached_input_price: 1.25
+      input_price_priority: 10
+      output_price_priority: 80
+      cached_input_price_priority: 2.5
+      input_price_flex: 2.5
+      output_price_flex: 20
+      cached_input_price_flex: 0.625
   account_types:
     - key: apikey
       label: API Key
