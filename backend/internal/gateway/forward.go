@@ -44,9 +44,13 @@ func (g *OpenAIGateway) forwardHTTP(ctx context.Context, req *sdk.ForwardRequest
 	// 统一预处理请求体：model 同步、上下文守卫、input 规范化、force instructions。
 	// 在 API Key / OAuth 分发之前执行，保证两条路径拿到的 body 格式一致。
 	// 注：Anthropic 路径有自己的 applyForceInstructions（在格式转换之后），不走这里。
+	// 注：multipart 请求（如 images/edits 上传图片）body 是二进制数据，不能按 JSON 处理，
+	//     否则 sjson 会把整个 body 替换成一个小 JSON 对象，丢失全部图片数据。
 	_, reqPath := resolveAPIKeyRoute(req)
-	req.Body = preprocessRequestBody(req.Body, req.Model, reqPath)
-	req.Body = applyForceInstructions(req.Body, req.Headers)
+	if !strings.HasPrefix(req.Headers.Get("Content-Type"), "multipart/") {
+		req.Body = preprocessRequestBody(req.Body, req.Model, reqPath)
+		req.Body = applyForceInstructions(req.Body, req.Headers)
+	}
 
 	account := req.Account
 
