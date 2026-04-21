@@ -1,0 +1,270 @@
+package imgen
+
+import (
+	"bytes"
+	"encoding/json"
+	"fmt"
+	"io"
+	"log"
+	"sort"
+	"strings"
+	"time"
+)
+
+// ---------- stream_status ----------
+//
+// 返回 conversation 当前 SSE 流是否仍在活动（= 异步任务未跑完）。仅做观察。
+
+func (c *Client) streamStatus(conversationID string) (isActive bool, err error) {
+	req, rerr := c.newReq("GET", "/backend-api/conversation/"+conversationID+"/stream_status", nil)
+	if rerr != nil {
+		return false, rerr
+	}
+	resp, derr := c.http.Do(req)
+	if derr != nil {
+		return false, derr
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != 200 {
+		return false, fmt.Errorf("stream_status HTTP %d", resp.StatusCode)
+	}
+	var out struct {
+		IsActive bool   `json:"is_active"`
+		Status   string `json:"status"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return false, err
+	}
+	if out.IsActive {
+		return true, nil
+	}
+	if out.Status == "active" || out.Status == "in_progress" {
+		return true, nil
+	}
+	return false, nil
+}
+
+// ---------- async-status ----------
+
+// AsyncStatusResult async-status 的规范化结果。
+type AsyncStatusResult struct {
+	Completed     bool
+	AssetPointers []string // "file-service://..." 或 "sediment://..."
+	RawStatus     string   // 原始 status 字段（调试用）
+}
+
+// asyncStatus POST /backend-api/conversation/{id}/async-status
+//
+// 对齐调研文档：查询会话异步任务（图像生成等）完成状态，
+// 返回 status + result.asset_pointer(s)。completed 且有 asset_pointer 即可直接下载。
+//
+// body 结构未完全验证，先尝试空 {}。响应结构兼容几种常见 shape：
+//  1. 单任务：{ "status": "completed", "result": { "asset_pointer": "..." } }
+//  2. 单任务多图：{ "status": "completed", "result": { "asset_pointers": [...] } }
+//  3. 多任务数组：{ "tasks": [ { "status": "...", "result": { "asset_pointer": "..." } } ] }
+func (c *Client) asyncStatus(conversationID string) (*AsyncStatusResult, error) {
+	req, err := c.newReq("POST", "/backend-api/conversation/"+conversationID+"/async-status",
+		bytes.NewReader([]byte(`{}`)))
+	if err != nil {
+		return nil, err
+	}
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != 200 {
+		return nil, fmt.Errorf("async-status HTTP %d: %s", resp.StatusCode, body)
+	}
+
+	var raw struct {
+		Status string `json:"status"`
+		Result struct {
+			AssetPointer  string   `json:"asset_pointer"`
+			AssetPointers []string `json:"asset_pointers"`
+		} `json:"result"`
+		Tasks []struct {
+			Status string `json:"status"`
+			Result struct {
+				AssetPointer  string   `json:"asset_pointer"`
+				AssetPointers []string `json:"asset_pointers"`
+			} `json:"result"`
+		} `json:"tasks"`
+	}
+	if err := json.Unmarshal(body, &raw); err != nil {
+		return nil, fmt.Errorf("async-status 响应解析失败: %w，body=%s", err, body)
+	}
+
+	r := &AsyncStatusResult{RawStatus: raw.Status}
+	seen := map[string]bool{}
+	addPointer := func(p string) {
+		if p == "" || seen[p] {
+			return
+		}
+		seen[p] = true
+		r.AssetPointers = append(r.AssetPointers, p)
+	}
+
+	if raw.Status != "" {
+		r.Completed = (raw.Status == "completed")
+		addPointer(raw.Result.AssetPointer)
+		for _, p := range raw.Result.AssetPointers {
+			addPointer(p)
+		}
+	}
+
+	if len(raw.Tasks) > 0 {
+		all := true
+		for _, t := range raw.Tasks {
+			if t.Status != "completed" {
+				all = false
+			}
+			addPointer(t.Result.AssetPointer)
+			for _, p := range t.Result.AssetPointers {
+				addPointer(p)
+			}
+		}
+		r.Completed = r.Completed || (all && len(r.AssetPointers) > 0)
+	}
+
+	return r, nil
+}
+
+// ---------- Step 4: 轮询策略 ----------
+//
+//	主路径：async-status → completed + asset_pointer → 立即返回
+//	辅路径：stream_status 仅做观察
+//	Fallback：mapping 拉 conversation 读 tool 消息的 asset_pointer；连续 N 轮
+//	          不变或含 file-service 即认。
+//
+// 不区分 IMG1/IMG2 —— sediment:// 在当前现网就是终稿。
+
+func (c *Client) pollForImages(conversationID string, maxAttempts int) ([]string, error) {
+	const (
+		interval     = 3 * time.Second
+		stableRounds = 2
+	)
+
+	var (
+		lastFallbackSig string
+		stableCount     int
+		asyncFailCount  int
+	)
+
+	for i := 0; i < maxAttempts; i++ {
+		time.Sleep(interval)
+		log.Printf("[imgen] 轮询 %d/%d", i+1, maxAttempts)
+
+		// 主路径：async-status
+		if asyncFailCount < 3 {
+			if as, err := c.asyncStatus(conversationID); err != nil {
+				asyncFailCount++
+				log.Printf("[imgen]   async-status 失败(%d/3): %v", asyncFailCount, err)
+			} else {
+				asyncFailCount = 0
+				if as.Completed && len(as.AssetPointers) > 0 {
+					log.Printf("[imgen] async-status 命中，返回 %d 个 asset_pointer", len(as.AssetPointers))
+					return as.AssetPointers, nil
+				}
+			}
+		}
+
+		// 辅路径：stream_status（仅日志）
+		_, _ = c.streamStatus(conversationID)
+
+		// Fallback：mapping
+		refs := c.readMappingRefs(conversationID)
+		if len(refs) == 0 {
+			continue
+		}
+
+		for _, r := range refs {
+			if strings.HasPrefix(r, "file-service://") {
+				log.Printf("[imgen] mapping 命中（file-service 直出，共 %d ref）", len(refs))
+				return refs, nil
+			}
+		}
+
+		sortedRefs := append([]string(nil), refs...)
+		sort.Strings(sortedRefs)
+		sig := strings.Join(sortedRefs, ",")
+		if sig == lastFallbackSig && sig != "" {
+			stableCount++
+			if stableCount >= stableRounds {
+				log.Printf("[imgen] mapping 命中（sediment 稳定 %d 轮，%d ref）", stableRounds, len(refs))
+				return refs, nil
+			}
+		} else {
+			stableCount = 0
+			lastFallbackSig = sig
+		}
+	}
+
+	return nil, fmt.Errorf("轮询 %d 次未拿到图片 asset_pointer", maxAttempts)
+}
+
+// readMappingRefs fallback 用：从 conversation mapping 里提取所有 image tool
+// 消息的 asset_pointer。
+func (c *Client) readMappingRefs(conversationID string) []string {
+	req, err := c.newReq("GET", "/backend-api/conversation/"+conversationID, nil)
+	if err != nil {
+		return nil
+	}
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return nil
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != 200 {
+		return nil
+	}
+	body, _ := io.ReadAll(resp.Body)
+	var conv map[string]any
+	if json.Unmarshal(body, &conv) != nil {
+		return nil
+	}
+	mapping, _ := conv["mapping"].(map[string]any)
+	tools := extractImageToolMsgs(mapping)
+
+	var refs []string
+	seenF := map[string]bool{}
+	seenS := map[string]bool{}
+	for _, t := range tools {
+		for _, f := range t.FileIDs {
+			if !seenF[f] {
+				seenF[f] = true
+				refs = append(refs, "file-service://"+f)
+			}
+		}
+		for _, s := range t.SedIDs {
+			if !seenS[s] {
+				seenS[s] = true
+				refs = append(refs, "sediment://"+s)
+			}
+		}
+	}
+	return refs
+}
+
+// hasFileService / filterFileService 两个小工具在 GenerateImage 里决定"优先用
+// file-service 终稿，没有再退到 sediment"。
+
+func hasFileService(refs []string) bool {
+	for _, r := range refs {
+		if strings.HasPrefix(r, "file-service://") {
+			return true
+		}
+	}
+	return false
+}
+
+func filterFileService(refs []string) []string {
+	var out []string
+	for _, r := range refs {
+		if strings.HasPrefix(r, "file-service://") {
+			out = append(out, r)
+		}
+	}
+	return out
+}

@@ -58,9 +58,14 @@ func (g *OpenAIGateway) forwardHTTP(ctx context.Context, req *sdk.ForwardRequest
 		return g.forwardAPIKey(ctx, req)
 	}
 	if account.Credentials["access_token"] != "" {
-		// OAuth 账号收到 Images REST 请求时，翻译为 Responses API + image_generation
-		// tool（与 Codex $imagegen 一致），把结果打包回 Images REST 响应。
+		// OAuth 账号收到 Images REST 请求时：
+		//   - model == "gpt-image-2" → 走 chatgpt.com 网页端逆向（imgen 子包）
+		//   - 其它 / 为空 → 翻译为 Responses API + image_generation tool
+		//     （与 Codex $imagegen 一致），把结果打包回 Images REST 响应。
 		if isImagesRequest(reqPath) {
+			if isImagesWebReverseModel(req.Model) {
+				return g.forwardImagesViaWebReverse(ctx, req)
+			}
 			return g.forwardImagesViaResponsesTool(ctx, req)
 		}
 		return g.forwardOAuth(ctx, req)

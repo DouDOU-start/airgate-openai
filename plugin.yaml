@@ -160,6 +160,19 @@ gateway:
       input_price_flex: 2.5
       output_price_flex: 20
       cached_input_price_flex: 0.625
+    - id: gpt-image-2
+      name: GPT Image 2 (Web Reverse)
+      context_window: 32000
+      max_output_tokens: 0
+      input_price: 5
+      output_price: 40
+      cached_input_price: 1.25
+      input_price_priority: 10
+      output_price_priority: 80
+      cached_input_price_priority: 2.5
+      input_price_flex: 2.5
+      output_price_flex: 20
+      cached_input_price_flex: 0.625
   account_types:
     - key: apikey
       label: API Key

@@ -96,6 +96,10 @@ var registry = map[string]Spec{
 	// 单价参考 OpenAI 2025-2026 官方 $5 text input / $40 image output per 1M。
 	"gpt-image-1":   std("GPT Image 1", 32000, 0, 5.0, 1.25, 40.0),
 	"gpt-image-1.5": std("GPT Image 1.5", 32000, 0, 5.0, 1.25, 40.0),
+	// gpt-image-2：chatgpt.com 网页端逆向通道（imgen 子包），走 OAuth access_token，
+	// 消耗 ChatGPT 订阅额度。token 定价与 gpt-image-1.5 对齐，按网页端 1024×1024
+	// medium 固定估算 1056 output tokens/张 × $40/1M ≈ $0.042/张。
+	"gpt-image-2": std("GPT Image 2 (Web Reverse)", 32000, 0, 5.0, 1.25, 40.0),
 }
 
 // DefaultSpec 未注册模型的兜底值
