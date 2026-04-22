@@ -1,6 +1,109 @@
 package gateway
 
-import "testing"
+import (
+	"net/http"
+	"testing"
+
+	sdk "github.com/DouDOU-start/airgate-sdk"
+)
+
+// TestIsAnthropicRequest 只认两个权威信号：X-Forwarded-Path + Anthropic-Version 头。
+// body 启发式已废除（见 isAnthropicRequest 注释）。
+func TestIsAnthropicRequest(t *testing.T) {
+	cases := []struct {
+		name    string
+		headers http.Header
+		body    []byte
+		want    bool
+	}{
+		// path 命中 Anthropic
+		{
+			name:    "path=/v1/messages",
+			headers: http.Header{"X-Forwarded-Path": []string{"/v1/messages"}},
+			body:    []byte(`{"model":"claude","messages":[{"role":"user","content":"hi"}],"max_tokens":4}`),
+			want:    true,
+		},
+		{
+			name:    "path=/v1/messages/count_tokens（子路径）",
+			headers: http.Header{"X-Forwarded-Path": []string{"/v1/messages/count_tokens"}},
+			body:    []byte(`{"model":"claude","messages":[]}`),
+			want:    true,
+		},
+		{
+			name:    "path=/v1/messages?foo=bar（带 query）",
+			headers: http.Header{"X-Forwarded-Path": []string{"/v1/messages?foo=bar"}},
+			body:    nil,
+			want:    true,
+		},
+		// 子串匹配防漏点
+		{
+			name:    "path=/v1/messages-custom 非 Anthropic 派生前缀",
+			headers: http.Header{"X-Forwarded-Path": []string{"/v1/messages-custom"}},
+			body:    nil,
+			want:    false,
+		},
+		{
+			name:    "query 里夹杂 /v1/messages 字样不应触发",
+			headers: http.Header{"X-Forwarded-Path": []string{"/v1/chat/completions?referer=/v1/messages"}},
+			body:    nil,
+			want:    false,
+		},
+		// path 命中 OpenAI
+		{
+			name:    "path=/v1/chat/completions",
+			headers: http.Header{"X-Forwarded-Path": []string{"/v1/chat/completions"}},
+			body:    []byte(`{"model":"gpt-5.4","messages":[{"role":"user","content":"hi"}],"max_tokens":4}`),
+			want:    false,
+		},
+		{
+			name:    "path=/v1/responses",
+			headers: http.Header{"X-Forwarded-Path": []string{"/v1/responses"}},
+			body:    []byte(`{"model":"gpt-5.4","input":"hi"}`),
+			want:    false,
+		},
+		// 头部兜底
+		{
+			name:    "Anthropic-Version 头",
+			headers: http.Header{"Anthropic-Version": []string{"2023-06-01"}},
+			body:    []byte(`{"model":"claude","messages":[{"role":"user","content":"hi"}],"max_tokens":4}`),
+			want:    true,
+		},
+		// 不再依靠 body 启发——body 有 Anthropic 风味但没 path/header 信号时，默认 OpenAI
+		{
+			name:    "body 有 top-level system 但无 path/header → 默认 OpenAI",
+			headers: nil,
+			body:    []byte(`{"model":"x","system":"You are helpful","messages":[{"role":"user","content":"hi"}],"max_tokens":4}`),
+			want:    false,
+		},
+		{
+			name:    "OpenAI chat.completions 无 path/header（之前会被误判，回归用例）",
+			headers: nil,
+			body:    []byte(`{"model":"gpt-5.4","messages":[{"role":"user","content":"hi"}],"max_tokens":8}`),
+			want:    false,
+		},
+		{
+			name:    "OpenAI vision 带 content block 数组（以前会误判）",
+			headers: nil,
+			body:    []byte(`{"model":"gpt-4-vision","messages":[{"role":"user","content":[{"type":"text","text":"hi"},{"type":"image_url","image_url":{"url":"..."}}]}],"max_tokens":4}`),
+			want:    false,
+		},
+		{
+			name:    "空 body + 无 headers",
+			headers: nil,
+			body:    nil,
+			want:    false,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			req := &sdk.ForwardRequest{Headers: tc.headers, Body: tc.body}
+			if got := isAnthropicRequest(req); got != tc.want {
+				t.Errorf("isAnthropicRequest() = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
 
 func TestApplyContinuationStateDoesNotBackfillPreviousResponseID(t *testing.T) {
 	reqBody := map[string]any{

@@ -314,10 +314,10 @@ func (s *chatCompletionsStreamWriter) makeFinishChunk(finishReason string) []byt
 // buildNonStreamChatCompletion 把 ReceiveWSResponse 聚合出的 WSResult 合成
 // 一个标准的 chat.completion 响应体。
 func buildNonStreamChatCompletion(result WSResult, model string) []byte {
-	id := result.ResponseID
-	if id == "" {
-		id = generateChatCmplID()
-	}
+	// Chat Completions 规范要求 id 带 "chatcmpl-" 前缀，否则严格 SDK 会校验失败。
+	// 上游 Responses API 给的 "resp_..." ID 只在网关内部用于 session 维护（见
+	// updateSessionStateResponseID），不能直接透出给客户端。
+	id := generateChatCmplID()
 	if strings.TrimSpace(model) == "" {
 		model = result.Model
 	}
@@ -461,4 +461,84 @@ func (h *chatCompletionsSilentHandler) OnRawEvent(eventType string, data []byte)
 			}
 		}
 	}
+}
+
+// ──────────────────────────────────────────────────────
+// /v1/responses 非流式
+// ──────────────────────────────────────────────────────
+
+// responsesSilentHandler 在非流式 /v1/responses 场景用：不向客户端写 SSE，
+// 等 ReceiveWSResponse 完成后由 forwardOAuth 用 WSResult.CompletedEventRaw
+// 抽出 response 字段一次性回写 JSON。行为和 chatCompletionsSilentHandler 完全一致，
+// 单独起个类型只是为了在 forward.go 里按场景区分时更显眼。
+type responsesSilentHandler struct {
+	accountID      int64
+	sessionKey     string
+	start          time.Time
+	firstTokenOnce sync.Once
+	firstTokenMs   int64
+}
+
+func (h *responsesSilentHandler) OnTextDelta(string)      {}
+func (h *responsesSilentHandler) OnReasoningDelta(string) {}
+
+func (h *responsesSilentHandler) OnRateLimits(usedPercent float64) {
+	if h.accountID > 0 {
+		StoreCodexUsage(h.accountID, &CodexUsageSnapshot{
+			PrimaryUsedPercent: usedPercent,
+			CapturedAt:         time.Now(),
+		})
+	}
+}
+
+func (h *responsesSilentHandler) OnRawEvent(eventType string, data []byte) {
+	if eventType == "" {
+		return
+	}
+	h.firstTokenOnce.Do(func() {
+		h.firstTokenMs = time.Since(h.start).Milliseconds()
+	})
+	switch eventType {
+	case "codex.rate_limits":
+		if h.accountID > 0 {
+			if snapshot := parseCodexUsageFromSSEEvent(data); snapshot != nil {
+				StoreCodexUsage(h.accountID, snapshot)
+			}
+		}
+	case "response.created", "response.completed", "response.done":
+		if h.sessionKey != "" {
+			if responseID := gjson.GetBytes(data, "response.id").String(); strings.TrimSpace(responseID) != "" {
+				updateSessionStateResponseID(h.sessionKey, responseID)
+			}
+		}
+	}
+}
+
+// buildNonStreamResponses 从 WSResult 聚合出 Responses API 非流式响应体。
+//
+// Responses API 非流式响应的 JSON 结构就是最终 `response.completed` SSE 事件里
+// `response` 字段的那坨对象——直接抽出来返回即可，无需自己拼装。拼装反而会丢失
+// 上游新加字段（OpenAI 常常悄悄扩展 Responses 的 output / tool_usage 等字段）。
+//
+// 上游没给 `response.completed`（典型：被中途 cancel）时回退到一个最小占位对象，
+// 避免空体返回。
+func buildNonStreamResponses(result WSResult) []byte {
+	if len(result.CompletedEventRaw) > 0 {
+		if respNode := gjson.GetBytes(result.CompletedEventRaw, "response"); respNode.Exists() {
+			return []byte(respNode.Raw)
+		}
+	}
+	// 兜底：空体不好看，给客户端一个最小但合法的 Responses 对象
+	fallback := map[string]any{
+		"object": "response",
+		"status": "incomplete",
+	}
+	if result.ResponseID != "" {
+		fallback["id"] = result.ResponseID
+	}
+	if result.Model != "" {
+		fallback["model"] = result.Model
+	}
+	b, _ := json.Marshal(fallback)
+	return b
 }

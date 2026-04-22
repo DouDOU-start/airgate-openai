@@ -188,6 +188,10 @@ func TestBuildNonStreamChatCompletion_Text(t *testing.T) {
 	if got["model"] != "gpt-5.4" {
 		t.Errorf("model = %v, want gpt-5.4", got["model"])
 	}
+	// id 必须带 chatcmpl- 前缀（不是上游的 resp_...），否则严格 SDK 会报错
+	if id, _ := got["id"].(string); !strings.HasPrefix(id, "chatcmpl-") {
+		t.Errorf("id = %v, want chatcmpl- prefix (never use upstream resp_)", id)
+	}
 
 	choices := got["choices"].([]any)
 	if len(choices) != 1 {
@@ -259,6 +263,56 @@ func TestBuildNonStreamChatCompletion_ToolCall(t *testing.T) {
 	}
 	if fn["arguments"] != `{"city":"北京"}` {
 		t.Errorf("function.arguments = %v, want {\"city\":\"北京\"}", fn["arguments"])
+	}
+}
+
+// TestBuildNonStreamResponses 验证 /v1/responses 非流式响应从 CompletedEventRaw 抽出 response 字段。
+func TestBuildNonStreamResponses_CompletedEvent(t *testing.T) {
+	completedEvent := []byte(`{"type":"response.completed","response":{"id":"resp_abc","object":"response","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"hello"}]}],"usage":{"input_tokens":3,"output_tokens":1,"total_tokens":4}},"sequence_number":9}`)
+	result := WSResult{CompletedEventRaw: completedEvent}
+
+	body := buildNonStreamResponses(result)
+	var got map[string]any
+	if err := json.Unmarshal(body, &got); err != nil {
+		t.Fatalf("body not valid JSON: %v", err)
+	}
+	if got["id"] != "resp_abc" {
+		t.Errorf("id = %v, want resp_abc", got["id"])
+	}
+	if got["object"] != "response" {
+		t.Errorf("object = %v, want response", got["object"])
+	}
+	if got["status"] != "completed" {
+		t.Errorf("status = %v, want completed", got["status"])
+	}
+	if got["output"] == nil {
+		t.Errorf("output 不应为空")
+	}
+	// 不应该包含 SSE 事件级字段（type、sequence_number）——只抽 response 字段
+	if got["type"] == "response.completed" {
+		t.Errorf("top-level 不应出现 SSE 事件字段 type=response.completed")
+	}
+	if _, ok := got["sequence_number"]; ok {
+		t.Errorf("top-level 不应出现 SSE 事件字段 sequence_number")
+	}
+}
+
+// 上游没给 response.completed 时用兜底占位
+func TestBuildNonStreamResponses_Fallback(t *testing.T) {
+	result := WSResult{ResponseID: "resp_xyz", Model: "gpt-5.4"}
+	body := buildNonStreamResponses(result)
+	var got map[string]any
+	if err := json.Unmarshal(body, &got); err != nil {
+		t.Fatalf("body not valid JSON: %v", err)
+	}
+	if got["object"] != "response" {
+		t.Errorf("object = %v, want response", got["object"])
+	}
+	if got["id"] != "resp_xyz" {
+		t.Errorf("id = %v, want resp_xyz", got["id"])
+	}
+	if got["status"] != "incomplete" {
+		t.Errorf("status = %v, want incomplete", got["status"])
 	}
 }
 

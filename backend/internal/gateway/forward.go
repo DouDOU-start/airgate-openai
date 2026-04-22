@@ -299,10 +299,16 @@ func (g *OpenAIGateway) forwardOAuth(ctx context.Context, req *sdk.ForwardReques
 	chatStreamInclude := isChatCompletions && req.Stream &&
 		gjson.GetBytes(req.Body, "stream_options.include_usage").Bool()
 
+	// 是否走静默缓冲路径（等整条响应就绪再吐 JSON）。两种场景触发：
+	//   - /v1/chat/completions 非流式
+	//   - /v1/responses 非流式
+	silentBuffered := !req.Stream
+
 	var (
-		lastSSEHandler *sseEventWriter
-		lastChatWriter *chatCompletionsStreamWriter
-		lastSilent     *chatCompletionsSilentHandler
+		lastSSEHandler      *sseEventWriter
+		lastChatWriter      *chatCompletionsStreamWriter
+		lastChatSilent      *chatCompletionsSilentHandler
+		lastResponsesSilent *responsesSilentHandler
 	)
 
 	runAttempt := func(msg []byte, w http.ResponseWriter) (WSResult, error) {
@@ -323,9 +329,19 @@ func (g *OpenAIGateway) forwardOAuth(ctx context.Context, req *sdk.ForwardReques
 				sessionKey: session.SessionKey,
 				start:      start,
 			}
-			lastSilent = silent
+			lastChatSilent = silent
+			handler = silent
+		case !isChatCompletions && !req.Stream:
+			// 原生 /v1/responses 非流式：缓冲事件，末尾一次性吐 JSON
+			silent := &responsesSilentHandler{
+				accountID:  account.ID,
+				sessionKey: session.SessionKey,
+				start:      start,
+			}
+			lastResponsesSilent = silent
 			handler = silent
 		default:
+			// 原生 /v1/responses 流式：SSE 透传
 			sseHandler := &sseEventWriter{
 				w:          w,
 				accountID:  account.ID,
@@ -343,9 +359,8 @@ func (g *OpenAIGateway) forwardOAuth(ctx context.Context, req *sdk.ForwardReques
 
 	w := req.Writer
 
-	// 流式响应头：chat.completions 流式 + 原生 responses 都走 SSE；
-	// 非流式 chat.completions 延后到 result 就绪后再写 application/json。
-	if w != nil && (!isChatCompletions || req.Stream) {
+	// 流式响应头在请求开始就写；非流式（chat.completions 或 responses）等 result 就绪后写 JSON。
+	if w != nil && !silentBuffered {
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.Header().Set("Cache-Control", "no-cache")
 		w.Header().Set("Connection", "keep-alive")
@@ -376,7 +391,16 @@ func (g *OpenAIGateway) forwardOAuth(ctx context.Context, req *sdk.ForwardReques
 			w.WriteHeader(http.StatusOK)
 			_, _ = w.Write(body)
 		}
+	case !isChatCompletions && !req.Stream:
+		// /v1/responses 非流式：从 WSResult 抽 response 字段回写 JSON
+		if result.Err == nil && w != nil {
+			body := buildNonStreamResponses(result)
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write(body)
+		}
 	default:
+		// /v1/responses 流式：补 [DONE] 标记
 		if w != nil {
 			if _, err := fmt.Fprint(w, "data: [DONE]\n\n"); err == nil {
 				if flusher, ok := w.(http.Flusher); ok {
@@ -393,8 +417,10 @@ func (g *OpenAIGateway) forwardOAuth(ctx context.Context, req *sdk.ForwardReques
 		firstTokenMs = lastChatWriter.firstTokenMs
 	case lastSSEHandler != nil && lastSSEHandler.firstTokenMs > 0:
 		firstTokenMs = lastSSEHandler.firstTokenMs
-	case lastSilent != nil && lastSilent.firstTokenMs > 0:
-		firstTokenMs = lastSilent.firstTokenMs
+	case lastChatSilent != nil && lastChatSilent.firstTokenMs > 0:
+		firstTokenMs = lastChatSilent.firstTokenMs
+	case lastResponsesSilent != nil && lastResponsesSilent.firstTokenMs > 0:
+		firstTokenMs = lastResponsesSilent.firstTokenMs
 	}
 
 	usage := &sdk.Usage{

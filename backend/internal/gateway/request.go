@@ -30,32 +30,55 @@ var modelMetadataOverrides = map[string]model.Spec{
 // Anthropic 请求检测
 // ──────────────────────────────────────────────────────
 
-// isAnthropicRequest 检测是否为 Anthropic Messages API 请求
+// isAnthropicRequest 检测是否为 Anthropic Messages API 请求。
+//
+// 响应格式由这个判别决定：Anthropic 请求走 convertResponsesCompletedToAnthropicJSON 回
+// Messages JSON；OpenAI 请求走 chatCompletionsStreamWriter 回 chat.completion JSON。
+// 判别错会导致协议错配（客户端收到的 body 格式和请求的端点不匹配）。
+//
+// 正确的判别只依赖两个权威信号：
+//  1. 路径——core 侧（plugin/request.go buildPluginRequest）强制塞 X-Forwarded-Path。
+//     生产路径上 100% 可靠，直接按路径分叉即可。
+//  2. Anthropic-Version 头——Anthropic 客户端 SDK 必带。
+//
+// body 启发式已废除：
+//   - OpenAI chat.completions 和 Anthropic Messages 的 body 形状高度相似（都有
+//     `model + messages + max_tokens`），可靠区分需要 Anthropic 专属字段。
+//   - top-level `system` 看似是 Anthropic 独有，但部分第三方客户端会把它发到 OpenAI。
+//   - content block 数组（`[{type:"text",...}]`）OpenAI vision 和 Anthropic 都用，
+//     只靠 type 字段无法区分。
+//   - 与其维护一堆脆弱的启发规则，不如只相信 path + header 这两个明确信号。
+//     path 透传 bug 是 core 的问题，应该在 core 修而不是在 plugin 瞎猜。
 func isAnthropicRequest(req *sdk.ForwardRequest) bool {
-	// 1. 通过转发路径检测
-	path := extractForwardedPath(req.Headers)
-	if strings.Contains(path, "/v1/messages") && !strings.Contains(path, "/chat/completions") {
+	// 1. 路径明确信号。只认 /v1/messages 本身或其子路径（如 /v1/messages/count_tokens）。
+	//    用 HasPrefix + 去 query 比 Contains 更严谨：避免 query 里误夹子串触发假阳。
+	if pathMatchesAnthropicMessages(extractForwardedPath(req.Headers)) {
 		return true
 	}
 
-	// 2. 通过请求头检测
+	// 2. Anthropic-Version 头（SDK 默认携带，路径缺失时靠它兜底）
 	if req.Headers != nil && req.Headers.Get("Anthropic-Version") != "" {
 		return true
 	}
 
-	// 3. 通过请求体特征检测：有 max_tokens + messages 但无 input 字段（区分 Responses API）
-	if len(req.Body) > 0 {
-		trimmed := bytes.TrimSpace(req.Body)
-		hasMaxTokens := gjson.GetBytes(trimmed, "max_tokens").Exists()
-		hasMessages := gjson.GetBytes(trimmed, "messages").Exists()
-		hasInput := gjson.GetBytes(trimmed, "input").Exists()
-
-		if hasMaxTokens && hasMessages && !hasInput {
-			return true
-		}
-	}
-
 	return false
+}
+
+// pathMatchesAnthropicMessages 判断路径是否落在 Anthropic Messages API 命名空间下。
+// 接受形如 `/v1/messages`、`/v1/messages?foo=bar`、`/v1/messages/count_tokens` 的路径。
+// 不接受 `/v1/messages-custom` 这类尾巴连字符的派生路径（HasPrefix 要求紧跟 `/` 或 `?` 或结束）。
+func pathMatchesAnthropicMessages(path string) bool {
+	// 剥掉 query string
+	if idx := strings.IndexByte(path, '?'); idx >= 0 {
+		path = path[:idx]
+	}
+	const prefix = "/v1/messages"
+	if !strings.HasPrefix(path, prefix) {
+		return false
+	}
+	// 精确匹配 /v1/messages，或子路径 /v1/messages/xxx
+	rest := path[len(prefix):]
+	return rest == "" || rest[0] == '/'
 }
 
 func isAnthropicCountTokensRequest(req *sdk.ForwardRequest) bool {
