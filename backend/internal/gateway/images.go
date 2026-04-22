@@ -402,7 +402,7 @@ func estimateImageInputTokens(count int, size string) int {
 //
 // 只在 OAuth 账号被调度到 /v1/images/generations 时使用；API Key 账号继续走
 // 原生 REST 通道（见 handleImagesResponse）。
-func (g *OpenAIGateway) forwardImagesViaResponsesTool(ctx context.Context, req *sdk.ForwardRequest) (*sdk.ForwardResult, error) {
+func (g *OpenAIGateway) forwardImagesViaResponsesTool(ctx context.Context, req *sdk.ForwardRequest) (sdk.ForwardOutcome, error) {
 	start := time.Now()
 	account := req.Account
 
@@ -420,11 +420,15 @@ func (g *OpenAIGateway) forwardImagesViaResponsesTool(ctx context.Context, req *
 			req.Writer.WriteHeader(http.StatusBadRequest)
 			_, _ = req.Writer.Write(body)
 		}
-		return &sdk.ForwardResult{
-			StatusCode:    http.StatusBadRequest,
-			AccountStatus: sdk.AccountStatusOK,
-			Body:          body,
-			Headers:       http.Header{"Content-Type": []string{"application/json"}},
+		return sdk.ForwardOutcome{
+			Kind: sdk.OutcomeClientError,
+			Upstream: sdk.UpstreamResponse{
+				StatusCode: http.StatusBadRequest,
+				Headers:    http.Header{"Content-Type": []string{"application/json"}},
+				Body:       body,
+			},
+			Reason:   err.Error(),
+			Duration: time.Since(start),
 		}, nil
 	}
 
@@ -439,15 +443,12 @@ func (g *OpenAIGateway) forwardImagesViaResponsesTool(ctx context.Context, req *
 	}
 	conn, wsResp, err := DialWebSocket(cfg)
 	if err != nil {
-		if wsResp != nil && (wsResp.StatusCode == 401 || wsResp.StatusCode == 403 || wsResp.StatusCode == 429) {
-			return &sdk.ForwardResult{
-				StatusCode:    wsResp.StatusCode,
-				Duration:      time.Since(start),
-				AccountStatus: accountStatusFromMessage(wsResp.StatusCode, err.Error()),
-				ErrorMessage:  err.Error(),
-			}, err
+		if wsResp != nil {
+			outcome := failureOutcome(wsResp.StatusCode, nil, wsResp.Header.Clone(), err.Error(), 0)
+			outcome.Duration = time.Since(start)
+			return outcome, err
 		}
-		return nil, err
+		return transientOutcome(err.Error()), err
 	}
 	defer func() { _ = conn.Close() }()
 	if wsResp != nil {
@@ -457,7 +458,7 @@ func (g *OpenAIGateway) forwardImagesViaResponsesTool(ctx context.Context, req *
 	}
 
 	if err := conn.WriteJSON(json.RawMessage(createMsg)); err != nil {
-		return nil, fmt.Errorf("发送 WebSocket 消息失败: %w", err)
+		return sdk.ForwardOutcome{}, fmt.Errorf("发送 WebSocket 消息失败: %w", err)
 	}
 
 	handler := &imagesSilentHandler{accountID: account.ID, start: start}
@@ -467,16 +468,11 @@ func (g *OpenAIGateway) forwardImagesViaResponsesTool(ctx context.Context, req *
 	}
 
 	elapsed := time.Since(start)
-	// 计费按 OpenAI Images API 官方口径：只计用户的 prompt tokens（输入）+
-	// 图像输出 tokens，统一按 gpt-image-1.5 单价。
-	// 上游 instructions / 工具调用包装产生的额外 chat tokens 由内层吸收（OAuth
-	// 账号在订阅制下无逐 token 成本，合情合理）；客户端看到的 usage 完全对齐
-	// OpenAI 官方 Images API 契约。
-	fwdResult := &sdk.ForwardResult{
-		StatusCode:   http.StatusOK,
+	// 计费按 OpenAI Images API 官方口径：prompt tokens + 图像输出 tokens，统一按 gpt-image-1.5。
+	// 上游 instructions / 工具调用包装产生的额外 chat tokens 由内层吸收（OAuth 订阅账号无逐 token 成本）。
+	usage := &sdk.Usage{
 		InputTokens:  promptTokens,
 		Model:        imageToolCostModel,
-		Duration:     elapsed,
 		FirstTokenMs: handler.firstTokenMs,
 	}
 
@@ -489,14 +485,23 @@ func (g *OpenAIGateway) forwardImagesViaResponsesTool(ctx context.Context, req *
 				req.Writer.WriteHeader(failure.StatusCode)
 				_, _ = req.Writer.Write(body)
 			}
-			fwdResult.StatusCode = failure.StatusCode
-			fwdResult.AccountStatus = sdk.AccountStatusOK
-			fwdResult.Body = body
-			fwdResult.Headers = http.Header{"Content-Type": []string{"application/json"}}
-			return fwdResult, wsResult.Err
+			return sdk.ForwardOutcome{
+				Kind: sdk.OutcomeClientError,
+				Upstream: sdk.UpstreamResponse{
+					StatusCode: failure.StatusCode,
+					Headers:    http.Header{"Content-Type": []string{"application/json"}},
+					Body:       body,
+				},
+				Reason:   failure.Message,
+				Duration: elapsed,
+			}, wsResult.Err
 		}
-		fwdResult.StatusCode = http.StatusBadGateway
-		return fwdResult, wsResult.Err
+		return sdk.ForwardOutcome{
+			Kind:     sdk.OutcomeUpstreamTransient,
+			Upstream: sdk.UpstreamResponse{StatusCode: http.StatusBadGateway},
+			Reason:   wsResult.Err.Error(),
+			Duration: elapsed,
+		}, wsResult.Err
 	}
 
 	if len(wsResult.ImageGenCalls) == 0 {
@@ -506,34 +511,43 @@ func (g *OpenAIGateway) forwardImagesViaResponsesTool(ctx context.Context, req *
 			req.Writer.WriteHeader(http.StatusBadGateway)
 			_, _ = req.Writer.Write(body)
 		}
-		fwdResult.StatusCode = http.StatusBadGateway
-		fwdResult.Body = body
-		fwdResult.Headers = http.Header{"Content-Type": []string{"application/json"}}
-		return fwdResult, fmt.Errorf("image_generation_call 为空 (n=%d)", n)
+		return sdk.ForwardOutcome{
+			Kind: sdk.OutcomeUpstreamTransient,
+			Upstream: sdk.UpstreamResponse{
+				StatusCode: http.StatusBadGateway,
+				Headers:    http.Header{"Content-Type": []string{"application/json"}},
+				Body:       body,
+			},
+			Reason:   fmt.Sprintf("image_generation_call 为空 (n=%d)", n),
+			Duration: elapsed,
+		}, fmt.Errorf("image_generation_call 为空 (n=%d)", n)
 	}
 
-	// ChatGPT OAuth 下 tool_usage.image_gen.output_tokens 永远 0（订阅账号不按 token
-	// 计价），用 OpenAI 官方 size×quality→tokens 换算表反推。
+	// ChatGPT OAuth 下 tool_usage.image_gen.output_tokens 永远 0；用 size×quality→tokens 换算。
 	toolOut := wsResult.ToolImageOutputTokens
 	if toolOut == 0 {
 		toolOut = estimateImageGenOutputTokens(wsResult.ImageGenCalls)
 	}
-	fwdResult.OutputTokens = toolOut
+	usage.OutputTokens = toolOut
 
 	respBody := buildImagesRESTResponse(wsResult, promptTokens, toolOut)
+	outcome := sdk.ForwardOutcome{
+		Kind:     sdk.OutcomeSuccess,
+		Upstream: sdk.UpstreamResponse{StatusCode: http.StatusOK},
+		Usage:    usage,
+		Duration: elapsed,
+	}
 	if req.Writer != nil {
 		req.Writer.Header().Set("Content-Type", "application/json")
 		req.Writer.WriteHeader(http.StatusOK)
 		_, _ = req.Writer.Write(respBody)
 	} else {
-		fwdResult.Body = respBody
-		fwdResult.Headers = http.Header{"Content-Type": []string{"application/json"}}
+		outcome.Upstream.Body = respBody
+		outcome.Upstream.Headers = http.Header{"Content-Type": []string{"application/json"}}
 	}
 
-	// 全部按 gpt-image-1.5 单价算：prompt × $5/1M + image × $40/1M，
-	// 与 OpenAI 原生 Images API 计费口径一致。
-	fillCost(fwdResult)
-	return fwdResult, nil
+	fillUsageCost(usage)
+	return outcome, nil
 }
 
 // buildImagesRESTResponse 按 OpenAI Images API 官方契约打包响应。
@@ -605,13 +619,14 @@ func buildImagesErrorBody(status int, message string) []byte {
 // 计费字段复用 parseUsage：gpt-image-1 / gpt-image-1.5 返回的
 // usage.input_tokens / usage.output_tokens / usage.input_tokens_details.cached_tokens
 // 与 Responses API 字段同构，parseUsage 已经处理了 cached token 扣减。
-func handleImagesResponse(resp *http.Response, w http.ResponseWriter, start time.Time, fallbackModel string) (*sdk.ForwardResult, error) {
+func handleImagesResponse(resp *http.Response, w http.ResponseWriter, start time.Time, fallbackModel string) (sdk.ForwardOutcome, error) {
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return nil, fmt.Errorf("读取 Images 响应失败: %w", err)
+		return sdk.ForwardOutcome{}, fmt.Errorf("读取 Images 响应失败: %w", err)
 	}
 
-	usage := parseUsage(body)
+	parsed := parseUsage(body)
+	headers := resp.Header.Clone()
 
 	if w != nil {
 		if ct := resp.Header.Get("Content-Type"); ct != "" {
@@ -621,25 +636,29 @@ func handleImagesResponse(resp *http.Response, w http.ResponseWriter, start time
 		_, _ = w.Write(body)
 	}
 
-	model := strings.TrimSpace(gjson.GetBytes(body, "model").String())
-	if model == "" {
-		model = fallbackModel
+	modelName := strings.TrimSpace(gjson.GetBytes(body, "model").String())
+	if modelName == "" {
+		modelName = fallbackModel
 	}
 
 	elapsed := time.Since(start)
-	result := &sdk.ForwardResult{
-		StatusCode:        resp.StatusCode,
-		InputTokens:       usage.inputTokens,
-		OutputTokens:      usage.outputTokens,
-		CachedInputTokens: usage.cachedInputTokens,
-		Model:             model,
-		Duration:          elapsed,
+	usage := &sdk.Usage{
+		InputTokens:       parsed.inputTokens,
+		OutputTokens:      parsed.outputTokens,
+		CachedInputTokens: parsed.cachedInputTokens,
+		Model:             modelName,
 		FirstTokenMs:      elapsed.Milliseconds(),
 	}
-	if w == nil {
-		result.Body = body
-		result.Headers = resp.Header.Clone()
+	fillUsageCost(usage)
+
+	outcome := sdk.ForwardOutcome{
+		Kind:     sdk.OutcomeSuccess,
+		Upstream: sdk.UpstreamResponse{StatusCode: resp.StatusCode, Headers: headers},
+		Usage:    usage,
+		Duration: elapsed,
 	}
-	fillCost(result)
-	return result, nil
+	if w == nil {
+		outcome.Upstream.Body = body
+	}
+	return outcome, nil
 }

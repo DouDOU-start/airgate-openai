@@ -24,7 +24,7 @@ import (
 // ──────────────────────────────────────────────────────
 
 // forwardHTTP 根据账号凭证类型分发到不同转发模式
-func (g *OpenAIGateway) forwardHTTP(ctx context.Context, req *sdk.ForwardRequest) (*sdk.ForwardResult, error) {
+func (g *OpenAIGateway) forwardHTTP(ctx context.Context, req *sdk.ForwardRequest) (sdk.ForwardOutcome, error) {
 	if isAnthropicCountTokensRequest(req) {
 		return g.forwardAnthropicCountTokens(ctx, req)
 	}
@@ -34,18 +34,13 @@ func (g *OpenAIGateway) forwardHTTP(ctx context.Context, req *sdk.ForwardRequest
 		return g.forwardAnthropicMessage(ctx, req)
 	}
 
-	// GET /v1/models 直接用插件内置模型清单本地返回，不走账号分发。
-	// OAuth 账号无法转发 /v1/models（上游是 ChatGPT WS responses 端点），
-	// API Key 账号即使上游支持，也没必要为一份静态清单多打一次外网。
+	// GET /v1/models：用插件内置模型清单本地返回。
 	if isModelsListingRequest(req) {
 		return buildLocalModelsResponse(), nil
 	}
 
-	// 统一预处理请求体：model 同步、上下文守卫、input 规范化、force instructions。
-	// 在 API Key / OAuth 分发之前执行，保证两条路径拿到的 body 格式一致。
-	// 注：Anthropic 路径有自己的 applyForceInstructions（在格式转换之后），不走这里。
-	// 注：multipart 请求（如 images/edits 上传图片）body 是二进制数据，不能按 JSON 处理，
-	//     否则 sjson 会把整个 body 替换成一个小 JSON 对象，丢失全部图片数据。
+	// 统一预处理请求体。multipart 请求（images/edits 上传图片）body 是二进制，
+	// 不能按 JSON 处理否则会被 sjson 覆盖丢失数据。
 	_, reqPath := resolveAPIKeyRoute(req)
 	if !strings.HasPrefix(req.Headers.Get("Content-Type"), "multipart/") {
 		req.Body = preprocessRequestBody(req.Body, req.Model, reqPath)
@@ -58,10 +53,6 @@ func (g *OpenAIGateway) forwardHTTP(ctx context.Context, req *sdk.ForwardRequest
 		return g.forwardAPIKey(ctx, req)
 	}
 	if account.Credentials["access_token"] != "" {
-		// OAuth 账号收到 Images REST 请求时：
-		//   - model == "gpt-image-2" → 走 chatgpt.com 网页端逆向（imgen 子包）
-		//   - 其它 / 为空 → 翻译为 Responses API + image_generation tool
-		//     （与 Codex $imagegen 一致），把结果打包回 Images REST 响应。
 		if isImagesRequest(reqPath) {
 			if isImagesWebReverseModel(req.Model) {
 				return g.forwardImagesViaWebReverse(ctx, req)
@@ -70,7 +61,7 @@ func (g *OpenAIGateway) forwardHTTP(ctx context.Context, req *sdk.ForwardRequest
 		}
 		return g.forwardOAuth(ctx, req)
 	}
-	return nil, fmt.Errorf("账号缺少 api_key 或 access_token")
+	return sdk.ForwardOutcome{}, fmt.Errorf("账号缺少 api_key 或 access_token")
 }
 
 // isModelsListingRequest 判断当前请求是否为 GET /v1/models。
@@ -89,7 +80,7 @@ func isModelsListingRequest(req *sdk.ForwardRequest) bool {
 }
 
 // buildLocalModelsResponse 用插件内置模型注册表合成 OpenAI 兼容的 /v1/models 响应。
-func buildLocalModelsResponse() *sdk.ForwardResult {
+func buildLocalModelsResponse() sdk.ForwardOutcome {
 	specs := model.AllSpecs()
 	data := make([]map[string]any, 0, len(specs))
 	created := time.Now().Unix()
@@ -116,44 +107,34 @@ func buildLocalModelsResponse() *sdk.ForwardResult {
 	})
 	headers := http.Header{}
 	headers.Set("Content-Type", "application/json")
-	return &sdk.ForwardResult{
-		StatusCode:    http.StatusOK,
-		Body:          body,
-		Headers:       headers,
-		AccountStatus: sdk.AccountStatusOK,
-	}
+	return successOutcome(http.StatusOK, body, headers, nil)
 }
 
 // ──────────────────────────────────────────────────────
 // API Key 模式：HTTP/SSE 直连上游
 // ──────────────────────────────────────────────────────
 
-func (g *OpenAIGateway) forwardAPIKey(ctx context.Context, req *sdk.ForwardRequest) (*sdk.ForwardResult, error) {
+func (g *OpenAIGateway) forwardAPIKey(ctx context.Context, req *sdk.ForwardRequest) (sdk.ForwardOutcome, error) {
 	start := time.Now()
 	account := req.Account
 
-	// 解析上游请求方法与路径
 	reqMethod, reqPath := resolveAPIKeyRoute(req)
 	targetURL := buildAPIKeyURL(account, reqPath)
-	body := req.Body
 
 	var bodyReader io.Reader
-	if methodAllowsBody(reqMethod) && len(body) > 0 {
-		bodyReader = bytes.NewReader(body)
+	if methodAllowsBody(reqMethod) && len(req.Body) > 0 {
+		bodyReader = bytes.NewReader(req.Body)
 	}
 
-	// 构建 HTTP 请求
 	upstreamReq, err := http.NewRequestWithContext(ctx, reqMethod, targetURL, bodyReader)
 	if err != nil {
-		return nil, fmt.Errorf("构建上游请求失败: %w", err)
+		return sdk.ForwardOutcome{}, fmt.Errorf("构建上游请求失败: %w", err)
 	}
 
-	// 设置认证头
 	setAuthHeaders(upstreamReq, account)
 	if methodAllowsBody(reqMethod) {
-		// /v1/images/edits 在 SDK 侧是 multipart/form-data，必须保留 boundary，
-		// 否则上游解析 body 会失败。其它路径一律 application/json（Core 侧已把
-		// 请求体归一化成 JSON 文本）。
+		// /v1/images/edits 是 multipart/form-data，必须保留 boundary。其它路径
+		// Core 侧已把 body 归一化成 JSON 文本，统一 application/json。
 		if ct := req.Headers.Get("Content-Type"); isImagesEditRequest(reqPath) &&
 			strings.HasPrefix(strings.ToLower(ct), "multipart/") {
 			upstreamReq.Header.Set("Content-Type", ct)
@@ -161,40 +142,29 @@ func (g *OpenAIGateway) forwardAPIKey(ctx context.Context, req *sdk.ForwardReque
 			upstreamReq.Header.Set("Content-Type", "application/json")
 		}
 	}
-
-	// 透传白名单头
 	passHeadersForAccount(req.Headers, upstreamReq.Header, account)
 
-	// 发送请求
 	client := g.buildHTTPClient(account)
 	resp, err := client.Do(upstreamReq)
 	if err != nil {
-		return nil, fmt.Errorf("请求上游失败: %w", err)
+		// 网络层错误，无上游 HTTP 响应
+		return transientOutcome(err.Error()), fmt.Errorf("请求上游失败: %w", err)
 	}
-	defer func() {
-		_ = resp.Body.Close()
-	}()
+	defer func() { _ = resp.Body.Close() }()
 
-	// 上游返回错误时，返回 error 让核心决定是否 failover
-	if resp.StatusCode >= 500 || resp.StatusCode == 429 || resp.StatusCode == 401 || resp.StatusCode == 403 {
+	// 非 2xx 统一走 failureOutcome 归类。包含 4xx（客户端错）/ 429 / 401 / 403 / 5xx。
+	if resp.StatusCode >= 400 {
 		respBody, _ := io.ReadAll(resp.Body)
-		// 优先提取 JSON error.message，回退到截断的原始响应
-		errDetail := ""
-		if msg := gjson.GetBytes(respBody, "error.message").String(); msg != "" {
-			errDetail = msg
-		} else {
+		errDetail := gjson.GetBytes(respBody, "error.message").String()
+		if errDetail == "" {
 			errDetail = truncate(string(respBody), 200)
 		}
-		return &sdk.ForwardResult{
-			StatusCode:    resp.StatusCode,
-			Duration:      time.Since(start),
-			AccountStatus: accountStatusFromMessage(resp.StatusCode, errDetail),
-			ErrorMessage:  errDetail,
-			RetryAfter:    extractRetryAfterHeader(resp.Header),
-		}, fmt.Errorf("上游返回 %d: %s", resp.StatusCode, errDetail)
+		outcome := failureOutcome(resp.StatusCode, respBody, resp.Header.Clone(), errDetail, extractRetryAfterHeader(resp.Header))
+		outcome.Duration = time.Since(start)
+		return outcome, nil
 	}
 
-	// /v1/models 路径补齐上下文元信息（不影响其它路由）
+	// /v1/models 路径补齐上下文元信息
 	if reqMethod == http.MethodGet && strings.HasPrefix(reqPath, "/v1/models") {
 		resp = enrichModelsResponse(resp)
 	}
@@ -204,12 +174,11 @@ func (g *OpenAIGateway) forwardAPIKey(ctx context.Context, req *sdk.ForwardReque
 		StoreCodexUsage(account.ID, snapshot)
 	}
 
-	// Images API 响应体无 model 字段，另走专用处理器回填模型后再 fillCost
+	// Images API 响应体无 model 字段，另走专用处理器回填后再 fillCost
 	if isImagesRequest(reqPath) {
 		return handleImagesResponse(resp, req.Writer, start, req.Model)
 	}
 
-	// 流式 / 非流式响应处理
 	if req.Stream && req.Writer != nil {
 		return handleStreamResponse(resp, req.Writer, start)
 	}
@@ -282,13 +251,12 @@ func enrichModelsResponse(resp *http.Response) *http.Response {
 // ──────────────────────────────────────────────────────
 
 // forwardOAuth 使用 WebSocket 连接上游，将响应以 SSE 格式写回客户端
-func (g *OpenAIGateway) forwardOAuth(ctx context.Context, req *sdk.ForwardRequest) (*sdk.ForwardResult, error) {
+func (g *OpenAIGateway) forwardOAuth(ctx context.Context, req *sdk.ForwardRequest) (sdk.ForwardOutcome, error) {
 	start := time.Now()
 	account := req.Account
 	session := resolveOpenAISession(req.Headers, req.Body)
 	updateSessionStateFromRequest(session)
 
-	// 建立 WebSocket 连接，透传客户端的缓存与路由相关头
 	cfg := WSConfig{
 		Token:          account.Credentials["access_token"],
 		AccountID:      account.Credentials["chatgpt_account_id"],
@@ -300,20 +268,15 @@ func (g *OpenAIGateway) forwardOAuth(ctx context.Context, req *sdk.ForwardReques
 	}
 	conn, wsResp, err := DialWebSocket(cfg)
 	if err != nil {
-		// WS 握手失败时，根据 HTTP 状态码设置 AccountStatus，让核心正确处理账号状态
-		if wsResp != nil && (wsResp.StatusCode == 401 || wsResp.StatusCode == 403 || wsResp.StatusCode == 429) {
-			return &sdk.ForwardResult{
-				StatusCode:    wsResp.StatusCode,
-				Duration:      time.Since(start),
-				AccountStatus: accountStatusFromMessage(wsResp.StatusCode, err.Error()),
-				ErrorMessage:  err.Error(),
-			}, err
+		// WS 握手失败：按 HTTP 响应码归类。无响应则视为网络层 transient。
+		if wsResp != nil {
+			outcome := failureOutcome(wsResp.StatusCode, nil, wsResp.Header.Clone(), err.Error(), 0)
+			outcome.Duration = time.Since(start)
+			return outcome, err
 		}
-		return nil, err
+		return transientOutcome(err.Error()), err
 	}
-	defer func() {
-		_ = conn.Close()
-	}()
+	defer func() { _ = conn.Close() }()
 	if wsResp != nil {
 		if turnState := decodeTurnStateHeader(wsResp.Header); turnState != "" {
 			updateSessionStateTurnState(session.SessionKey, turnState)
@@ -323,7 +286,7 @@ func (g *OpenAIGateway) forwardOAuth(ctx context.Context, req *sdk.ForwardReques
 	// 构建 response.create 消息
 	createMsg, err := g.buildWSRequest(req, session)
 	if err != nil {
-		return nil, fmt.Errorf("构建 WebSocket 请求失败: %w", err)
+		return sdk.ForwardOutcome{}, fmt.Errorf("构建 WebSocket 请求失败: %w", err)
 	}
 
 	// 协议分叉：客户端如果走的是 /v1/chat/completions（而不是原生 /v1/responses），
@@ -389,7 +352,7 @@ func (g *OpenAIGateway) forwardOAuth(ctx context.Context, req *sdk.ForwardReques
 
 	result, err := runAttempt(createMsg, w)
 	if err != nil {
-		return nil, err
+		return sdk.ForwardOutcome{}, err
 	}
 	if session.SessionKey != "" {
 		if result.ResponseID != "" {
@@ -430,15 +393,14 @@ func (g *OpenAIGateway) forwardOAuth(ctx context.Context, req *sdk.ForwardReques
 	case lastSilent != nil && lastSilent.firstTokenMs > 0:
 		firstTokenMs = lastSilent.firstTokenMs
 	}
-	fwdResult := &sdk.ForwardResult{
-		StatusCode:            http.StatusOK,
+
+	usage := &sdk.Usage{
 		InputTokens:           result.InputTokens,
 		OutputTokens:          result.OutputTokens,
 		CachedInputTokens:     result.CachedInputTokens,
 		ReasoningOutputTokens: result.ReasoningOutputTokens,
 		ServiceTier:           normalizeOpenAIServiceTier(gjson.GetBytes(createMsg, "service_tier").String()),
 		Model:                 result.Model,
-		Duration:              elapsed,
 		FirstTokenMs:          firstTokenMs,
 	}
 	toolImageIn := result.ToolImageInputTokens
@@ -448,22 +410,39 @@ func (g *OpenAIGateway) forwardOAuth(ctx context.Context, req *sdk.ForwardReques
 	if toolImageOut == 0 && len(result.ImageGenCalls) > 0 {
 		toolImageOut = estimateImageGenOutputTokens(result.ImageGenCalls)
 	}
+
 	if result.Err != nil {
-		// 客户端侧错误（如不支持的 model、context 超长、参数无效）：
-		// 这是用户请求本身的问题，与账号无关，不能让 core 把账号惩罚停用。
-		// 显式标记 AccountStatus=OK + 4xx，core 据此既不 failover 也不计入失败。
 		var failure *responsesFailureError
-		if errors.As(result.Err, &failure) && failure.shouldReturnClientError() {
-			fwdResult.StatusCode = failure.StatusCode
-			fwdResult.AccountStatus = sdk.AccountStatusOK
-			fwdResult.ErrorMessage = failure.Message
-			return fwdResult, result.Err
+		kind := sdk.OutcomeUpstreamTransient
+		statusCode := http.StatusBadGateway
+		message := result.Err.Error()
+		var retryAfter time.Duration
+		if errors.As(result.Err, &failure) {
+			kind = failure.outcomeKind()
+			statusCode = failure.StatusCode
+			message = failure.Message
+			retryAfter = failure.RetryAfter
 		}
-		fwdResult.StatusCode = http.StatusBadGateway
-		return fwdResult, result.Err
+		// 流已开写的场景：Client 错误仍按 ClientError 透传；其它非账号错误视为 StreamAborted。
+		if req.Stream && kind != sdk.OutcomeClientError {
+			kind = sdk.OutcomeStreamAborted
+		}
+		return sdk.ForwardOutcome{
+			Kind:       kind,
+			Upstream:   sdk.UpstreamResponse{StatusCode: statusCode},
+			Reason:     message,
+			RetryAfter: retryAfter,
+			Duration:   elapsed,
+		}, result.Err
 	}
-	fillCostWithImageTool(fwdResult, toolImageIn, toolImageOut)
-	return fwdResult, nil
+
+	fillUsageCostWithImageTool(usage, toolImageIn, toolImageOut)
+	return sdk.ForwardOutcome{
+		Kind:     sdk.OutcomeSuccess,
+		Upstream: sdk.UpstreamResponse{StatusCode: http.StatusOK},
+		Usage:    usage,
+		Duration: elapsed,
+	}, nil
 }
 
 // ──────────────────────────────────────────────────────

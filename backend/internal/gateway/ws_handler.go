@@ -19,16 +19,15 @@ type wsDialResult struct {
 
 // HandleWebSocket 处理入站 WebSocket 连接（实现 sdk.GatewayPlugin）
 // 流程：客户端 WS <-> gRPC 双向流 <-> 插件 <-> 上游 WS
-func (g *OpenAIGateway) HandleWebSocket(ctx context.Context, conn sdk.WebSocketConn) (*sdk.ForwardResult, error) {
+func (g *OpenAIGateway) HandleWebSocket(ctx context.Context, conn sdk.WebSocketConn) (sdk.ForwardOutcome, error) {
 	start := time.Now()
 	info := conn.ConnectInfo()
 	if info.Account == nil {
-		return nil, fmt.Errorf("未提供账户信息")
+		return sdk.ForwardOutcome{}, fmt.Errorf("未提供账户信息")
 	}
 
 	account := info.Account
 
-	// 根据凭证类型选择上游连接方式
 	var err error
 	var dialInfo *wsDialResult
 	if account.Credentials["access_token"] != "" {
@@ -36,23 +35,31 @@ func (g *OpenAIGateway) HandleWebSocket(ctx context.Context, conn sdk.WebSocketC
 	} else if account.Credentials["api_key"] != "" {
 		dialInfo, err = g.handleWSWithAPIKey(ctx, conn, account)
 	} else {
-		return nil, fmt.Errorf("账号缺少 api_key 或 access_token")
+		return sdk.ForwardOutcome{}, fmt.Errorf("账号缺少 api_key 或 access_token")
 	}
 
-	result := &sdk.ForwardResult{
-		StatusCode: http.StatusOK,
-		Duration:   time.Since(start),
+	elapsed := time.Since(start)
+	if err == nil {
+		return sdk.ForwardOutcome{
+			Kind:     sdk.OutcomeSuccess,
+			Upstream: sdk.UpstreamResponse{StatusCode: http.StatusOK},
+			Duration: elapsed,
+		}, nil
 	}
-	if err != nil {
-		result.StatusCode = http.StatusBadGateway
-		// 如果是认证失败，设置 AccountStatus 让核心正确处理
-		if dialInfo != nil && (dialInfo.statusCode == 401 || dialInfo.statusCode == 403 || dialInfo.statusCode == 429) {
-			result.StatusCode = dialInfo.statusCode
-			result.AccountStatus = accountStatusFromMessage(dialInfo.statusCode, dialInfo.errorMessage)
-			result.ErrorMessage = dialInfo.errorMessage
-		}
+
+	// 认证 / 上游失败：按 HTTP 状态码归类
+	if dialInfo != nil {
+		outcome := failureOutcome(dialInfo.statusCode, nil, nil, dialInfo.errorMessage, 0)
+		outcome.Duration = elapsed
+		return outcome, err
 	}
-	return result, err
+	// WS 桥接中途断开，视为流式中断
+	return sdk.ForwardOutcome{
+		Kind:     sdk.OutcomeStreamAborted,
+		Upstream: sdk.UpstreamResponse{StatusCode: http.StatusBadGateway},
+		Reason:   err.Error(),
+		Duration: elapsed,
+	}, err
 }
 
 // handleWSWithOAuth 使用上游 WebSocket 直通（端到端 WS 桥接）

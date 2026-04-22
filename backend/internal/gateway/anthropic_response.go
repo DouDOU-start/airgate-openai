@@ -626,7 +626,7 @@ func translateResponsesSSEToAnthropicSSE(
 	originalRequest []byte,
 	start time.Time,
 	session openAISessionResolution,
-) (*sdk.ForwardResult, error) {
+) (sdk.ForwardOutcome, error) {
 	setAnthropicStyleResponseHeaders(w)
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
@@ -772,32 +772,46 @@ done:
 		streamErr = fmt.Errorf("读取上游 SSE 失败: %w", err)
 	}
 
-	result := &sdk.ForwardResult{
-		StatusCode:            http.StatusOK,
+	elapsed := time.Since(start)
+	usage := &sdk.Usage{
 		InputTokens:           state.InputTokens,
 		OutputTokens:          state.OutputTokens,
 		CachedInputTokens:     state.CachedInputTokens,
 		ReasoningOutputTokens: state.ReasoningOutputTokens,
 		ServiceTier:           serviceTier,
 		Model:                 billingModel,
-		Duration:              time.Since(start),
 		FirstTokenMs:          firstTokenMs,
 	}
+
 	if streamErr != nil {
 		var failure *responsesFailureError
 		if errors.As(streamErr, &failure) {
-			result.StatusCode = failure.StatusCode
-			result.AccountStatus = failure.AccountStatus
-			result.ErrorMessage = failure.Message
-			result.RetryAfter = failure.RetryAfter
-			if failure.shouldReturnClientError() {
-				return result, nil
+			kind := failure.outcomeKind()
+			// 流已开写后上游 response.failed：除 ClientError 外都按 StreamAborted 报告
+			if kind != sdk.OutcomeClientError {
+				kind = sdk.OutcomeStreamAborted
 			}
-			return result, streamErr
+			return sdk.ForwardOutcome{
+				Kind:       kind,
+				Upstream:   sdk.UpstreamResponse{StatusCode: failure.StatusCode},
+				Reason:     failure.Message,
+				RetryAfter: failure.RetryAfter,
+				Duration:   elapsed,
+			}, nil
 		}
-		result.StatusCode = http.StatusBadGateway
-		return result, streamErr
+		return sdk.ForwardOutcome{
+			Kind:     sdk.OutcomeStreamAborted,
+			Upstream: sdk.UpstreamResponse{StatusCode: http.StatusBadGateway},
+			Reason:   streamErr.Error(),
+			Duration: elapsed,
+		}, streamErr
 	}
-	fillCost(result)
-	return result, nil
+
+	fillUsageCost(usage)
+	return sdk.ForwardOutcome{
+		Kind:     sdk.OutcomeSuccess,
+		Upstream: sdk.UpstreamResponse{StatusCode: http.StatusOK},
+		Usage:    usage,
+		Duration: elapsed,
+	}, nil
 }

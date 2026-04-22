@@ -4,6 +4,8 @@ import (
 	"net/http"
 	"testing"
 	"time"
+
+	sdk "github.com/DouDOU-start/airgate-sdk"
 )
 
 func TestClassifyResponsesFailureContextWindow(t *testing.T) {
@@ -37,25 +39,25 @@ func TestClassifyResponsesFailureContinuationAnchor(t *testing.T) {
 	}
 }
 
-func TestAccountStatusFromMessageTreatsUsageLimit403AsRateLimited(t *testing.T) {
-	status := accountStatusFromMessage(403, "The usage limit has been reached. Please try again later.")
-	if status != "rate_limited" {
-		t.Fatalf("expected rate_limited, got %q", status)
+func TestClassifyHTTPFailureTreatsUsageLimit403AsRateLimited(t *testing.T) {
+	got := classifyHTTPFailure(403, "The usage limit has been reached. Please try again later.")
+	if got != sdk.OutcomeAccountRateLimited {
+		t.Fatalf("expected AccountRateLimited, got %v", got)
 	}
 }
 
-func TestAccountStatusFromMessageKeepsDisabled403AsDisabled(t *testing.T) {
-	status := accountStatusFromMessage(403, "Organization disabled due to policy violation")
-	if status != "disabled" {
-		t.Fatalf("expected disabled, got %q", status)
+func TestClassifyHTTPFailureKeepsDisabled403AsAccountDead(t *testing.T) {
+	got := classifyHTTPFailure(403, "Organization disabled due to policy violation")
+	if got != sdk.OutcomeAccountDead {
+		t.Fatalf("expected AccountDead, got %v", got)
 	}
 }
 
-func TestAccountStatusFromAnthropicBodyTreatsUsageLimit403AsRateLimited(t *testing.T) {
+func TestClassifyAnthropicBodyTreatsUsageLimit403AsRateLimited(t *testing.T) {
 	body := []byte(`{"error":{"message":"The usage limit has been reached. Try again later."}}`)
-	status := accountStatusFromAnthropicBody(403, body)
-	if status != "rate_limited" {
-		t.Fatalf("expected rate_limited, got %q", status)
+	got := classifyAnthropicBody(403, body)
+	if got != sdk.OutcomeAccountRateLimited {
+		t.Fatalf("expected AccountRateLimited, got %v", got)
 	}
 }
 
@@ -69,8 +71,8 @@ func TestClassifyWSErrorEventUsageLimitReached(t *testing.T) {
 	if failure.Kind != responsesFailureKindRateLimited {
 		t.Fatalf("expected rate_limited kind, got %q", failure.Kind)
 	}
-	if failure.AccountStatus != "rate_limited" {
-		t.Fatalf("expected AccountStatus=rate_limited, got %q", failure.AccountStatus)
+	if kind := failure.outcomeKind(); kind != sdk.OutcomeAccountRateLimited {
+		t.Fatalf("expected OutcomeAccountRateLimited, got %v", kind)
 	}
 	if failure.RetryAfter < 59*time.Minute || failure.RetryAfter > 61*time.Minute {
 		t.Fatalf("expected RetryAfter~=1h from resets_in_seconds, got %s", failure.RetryAfter)

@@ -26,23 +26,17 @@ const upstreamSSEMaxLineBytes = 8 * 1024 * 1024
 // 超过这个长度的单行/翻译输出会被打印 type 与长度，便于追踪谁在膨胀。
 const largeSSEEventThreshold = 512 * 1024
 
-// handleStreamResponse 处理 SSE 流式响应
-func handleStreamResponse(resp *http.Response, w http.ResponseWriter, start time.Time) (*sdk.ForwardResult, error) {
-	// 设置 SSE 响应头
+// handleStreamResponse 处理 SSE 流式响应。调用者保证 resp.StatusCode 是 2xx
+// （4xx/5xx 由调用者预先归类，不会进到这里）。
+func handleStreamResponse(resp *http.Response, w http.ResponseWriter, start time.Time) (sdk.ForwardOutcome, error) {
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
 	w.Header().Set("X-Accel-Buffering", "no")
-
-	// 透传上游 Codex 速率限制头
 	passCodexRateLimitHeaders(resp.Header, w.Header())
-
 	w.WriteHeader(resp.StatusCode)
 
-	result := &sdk.ForwardResult{
-		StatusCode: resp.StatusCode,
-	}
-
+	usage := &sdk.Usage{}
 	scanner := bufio.NewScanner(resp.Body)
 	scanner.Buffer(make([]byte, 64*1024), upstreamSSEMaxLineBytes)
 	var streamErr error
@@ -51,8 +45,6 @@ func handleStreamResponse(resp *http.Response, w http.ResponseWriter, start time
 
 	for scanner.Scan() {
 		line := scanner.Text()
-
-		// 写入到客户端
 		if _, err := fmt.Fprintf(w, "%s\n", line); err != nil {
 			break
 		}
@@ -60,22 +52,15 @@ func handleStreamResponse(resp *http.Response, w http.ResponseWriter, start time
 			flusher.Flush()
 		}
 
-		// 提取 SSE data 行
 		data, ok := extractSSEData(line)
 		if !ok || len(data) == 0 || data == "[DONE]" {
 			continue
 		}
-
-		// 记录首 token 延迟（首次收到含数据的 SSE 行）
 		if !firstTokenRecorded {
-			result.FirstTokenMs = time.Since(start).Milliseconds()
+			usage.FirstTokenMs = time.Since(start).Milliseconds()
 			firstTokenRecorded = true
 		}
-
-		// 解析 usage（仅在 response.completed 事件中）
-		parseSSEUsage([]byte(data), result, &toolImageIn, &toolImageOut)
-
-		// 捕获上游 SSE 失败事件
+		parseSSEUsage([]byte(data), usage, &toolImageIn, &toolImageOut)
 		if streamErr == nil {
 			streamErr = parseSSEFailureEvent([]byte(data))
 		}
@@ -84,37 +69,53 @@ func handleStreamResponse(resp *http.Response, w http.ResponseWriter, start time
 		streamErr = fmt.Errorf("读取上游 SSE 失败: %w", err)
 	}
 
-	result.Duration = time.Since(start)
+	elapsed := time.Since(start)
 	if streamErr != nil {
 		var failure *responsesFailureError
 		if errors.As(streamErr, &failure) {
-			result.StatusCode = failure.StatusCode
-			result.AccountStatus = failure.AccountStatus
-			result.ErrorMessage = failure.Message
-			result.RetryAfter = failure.RetryAfter
-			if failure.shouldReturnClientError() {
-				return result, nil
+			// 流式中断的 failure：字节已经开始写，Core 看到 StreamAborted 走错误分支
+			// 但不会罚账号；ClientError / RateLimited 在分类器里也映射到对应 Kind。
+			kind := failure.outcomeKind()
+			// 流已开写后的失败其实都是 Aborted 语义；特殊保留 ClientError / RateLimited
+			// 的原因文本，但 Kind 统一改 StreamAborted 以防 Core 试图 failover。
+			if kind != sdk.OutcomeClientError {
+				kind = sdk.OutcomeStreamAborted
 			}
-			return result, streamErr
+			return sdk.ForwardOutcome{
+				Kind:       kind,
+				Upstream:   sdk.UpstreamResponse{StatusCode: failure.StatusCode},
+				Reason:     failure.Message,
+				RetryAfter: failure.RetryAfter,
+				Duration:   elapsed,
+			}, nil
 		}
-		if result.StatusCode < http.StatusBadRequest {
-			result.StatusCode = http.StatusBadGateway
-		}
-		return result, streamErr
+		return sdk.ForwardOutcome{
+			Kind:     sdk.OutcomeStreamAborted,
+			Upstream: sdk.UpstreamResponse{StatusCode: resp.StatusCode},
+			Reason:   streamErr.Error(),
+			Duration: elapsed,
+		}, streamErr
 	}
-	fillCostWithImageTool(result, toolImageIn, toolImageOut)
-	return result, nil
+
+	fillUsageCostWithImageTool(usage, toolImageIn, toolImageOut)
+	return sdk.ForwardOutcome{
+		Kind:     sdk.OutcomeSuccess,
+		Upstream: sdk.UpstreamResponse{StatusCode: resp.StatusCode},
+		Usage:    usage,
+		Duration: elapsed,
+	}, nil
 }
 
-// handleNonStreamResponse 处理非流式响应
-func handleNonStreamResponse(resp *http.Response, w http.ResponseWriter, start time.Time) (*sdk.ForwardResult, error) {
+// handleNonStreamResponse 处理非流式响应。resp.StatusCode 预设 2xx。
+func handleNonStreamResponse(resp *http.Response, w http.ResponseWriter, start time.Time) (sdk.ForwardOutcome, error) {
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return nil, fmt.Errorf("读取上游响应失败: %w", err)
+		return sdk.ForwardOutcome{}, fmt.Errorf("读取上游响应失败: %w", err)
 	}
 
-	usage := parseUsage(body)
+	parsed := parseUsage(body)
 
+	headers := resp.Header.Clone()
 	if w != nil {
 		w.Header().Set("Content-Type", resp.Header.Get("Content-Type"))
 		passCodexRateLimitHeaders(resp.Header, w.Header())
@@ -123,24 +124,28 @@ func handleNonStreamResponse(resp *http.Response, w http.ResponseWriter, start t
 	}
 
 	elapsed := time.Since(start)
-	result := &sdk.ForwardResult{
-		StatusCode:            resp.StatusCode,
-		InputTokens:           usage.inputTokens,
-		OutputTokens:          usage.outputTokens,
-		CachedInputTokens:     usage.cachedInputTokens,
-		ReasoningOutputTokens: usage.reasoningOutputTokens,
+	usage := &sdk.Usage{
+		InputTokens:           parsed.inputTokens,
+		OutputTokens:          parsed.outputTokens,
+		CachedInputTokens:     parsed.cachedInputTokens,
+		ReasoningOutputTokens: parsed.reasoningOutputTokens,
 		ServiceTier:           normalizeOpenAIServiceTier(gjson.GetBytes(body, "service_tier").String()),
 		Model:                 gjson.GetBytes(body, "model").String(),
-		Duration:              elapsed,
 		FirstTokenMs:          elapsed.Milliseconds(),
 	}
-	// Writer 不可用时，通过 Body/Headers 返回给 Core 写响应
-	if w == nil {
-		result.Body = body
-		result.Headers = resp.Header.Clone()
+	fillUsageCostWithImageTool(usage, parsed.toolImageInputTokens, parsed.toolImageOutputTokens)
+
+	outcome := sdk.ForwardOutcome{
+		Kind:     sdk.OutcomeSuccess,
+		Upstream: sdk.UpstreamResponse{StatusCode: resp.StatusCode, Headers: headers},
+		Usage:    usage,
+		Duration: elapsed,
 	}
-	fillCostWithImageTool(result, usage.toolImageInputTokens, usage.toolImageOutputTokens)
-	return result, nil
+	// Writer 不可用时通过 Body 透传给 Core 写响应
+	if w == nil {
+		outcome.Upstream.Body = body
+	}
+	return outcome, nil
 }
 
 // ParseSSEStream 从 SSE 流中解析事件，通过 handler 回调输出，返回统一的 WSResult
@@ -268,12 +273,9 @@ func extractSSEData(line string) (string, bool) {
 	return s, true
 }
 
-// parseSSEUsage 从 SSE 数据中提取 usage 信息
-//
-// toolImageIn / toolImageOut：可选累加器指针，用于 image_generation tool
-// 的用量提取。调用方若传 nil 则忽略，否则把 response.tool_usage.image_gen.*
-// 写入指针指向的变量。
-func parseSSEUsage(data []byte, result *sdk.ForwardResult, toolImageIn, toolImageOut *int) {
+// parseSSEUsage 把 SSE 事件中的 usage 字段累加到 sdk.Usage。
+// toolImageIn/toolImageOut 可选累加器（响应 tool_usage.image_gen）。
+func parseSSEUsage(data []byte, out *sdk.Usage, toolImageIn, toolImageOut *int) {
 	eventType := gjson.GetBytes(data, "type").String()
 
 	switch eventType {
@@ -282,20 +284,18 @@ func parseSSEUsage(data []byte, result *sdk.ForwardResult, toolImageIn, toolImag
 		if !resp.Exists() {
 			return
 		}
-		result.Model = resp.Get("model").String()
-		// 从上游 response.completed 事件中提取 service_tier
+		out.Model = resp.Get("model").String()
 		if tier := normalizeOpenAIServiceTier(resp.Get("service_tier").String()); tier != "" {
-			result.ServiceTier = tier
+			out.ServiceTier = tier
 		}
 		usage := resp.Get("usage")
 		if usage.Exists() {
-			result.InputTokens = int(usage.Get("input_tokens").Int())
-			result.OutputTokens = int(usage.Get("output_tokens").Int())
-			result.CachedInputTokens = int(usage.Get("input_tokens_details.cached_tokens").Int())
-			result.ReasoningOutputTokens = int(usage.Get("output_tokens_details.reasoning_tokens").Int())
-			// 从 input_tokens 中扣除缓存部分，避免计费重复计算
-			if result.CachedInputTokens > 0 && result.InputTokens >= result.CachedInputTokens {
-				result.InputTokens -= result.CachedInputTokens
+			out.InputTokens = int(usage.Get("input_tokens").Int())
+			out.OutputTokens = int(usage.Get("output_tokens").Int())
+			out.CachedInputTokens = int(usage.Get("input_tokens_details.cached_tokens").Int())
+			out.ReasoningOutputTokens = int(usage.Get("output_tokens_details.reasoning_tokens").Int())
+			if out.CachedInputTokens > 0 && out.InputTokens >= out.CachedInputTokens {
+				out.InputTokens -= out.CachedInputTokens
 			}
 		}
 		if imgTool := resp.Get("tool_usage.image_gen"); imgTool.Exists() {
@@ -312,14 +312,13 @@ func parseSSEUsage(data []byte, result *sdk.ForwardResult, toolImageIn, toolImag
 		if !usage.Exists() {
 			return
 		}
-		result.InputTokens = int(usage.Get("prompt_tokens").Int())
-		result.OutputTokens = int(usage.Get("completion_tokens").Int())
-		result.Model = gjson.GetBytes(data, "model").String()
-		result.CachedInputTokens = int(usage.Get("prompt_tokens_details.cached_tokens").Int())
-		result.ReasoningOutputTokens = int(usage.Get("completion_tokens_details.reasoning_tokens").Int())
-		// 从 prompt_tokens 中扣除缓存部分，避免计费重复计算
-		if result.CachedInputTokens > 0 && result.InputTokens >= result.CachedInputTokens {
-			result.InputTokens -= result.CachedInputTokens
+		out.InputTokens = int(usage.Get("prompt_tokens").Int())
+		out.OutputTokens = int(usage.Get("completion_tokens").Int())
+		out.Model = gjson.GetBytes(data, "model").String()
+		out.CachedInputTokens = int(usage.Get("prompt_tokens_details.cached_tokens").Int())
+		out.ReasoningOutputTokens = int(usage.Get("completion_tokens_details.reasoning_tokens").Int())
+		if out.CachedInputTokens > 0 && out.InputTokens >= out.CachedInputTokens {
+			out.InputTokens -= out.CachedInputTokens
 		}
 	}
 }

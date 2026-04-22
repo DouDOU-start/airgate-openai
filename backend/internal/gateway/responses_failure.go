@@ -25,9 +25,27 @@ type responsesFailureError struct {
 	Kind               responsesFailureKind
 	StatusCode         int
 	AnthropicErrorType string
-	AccountStatus      sdk.AccountStatus
 	Message            string
 	RetryAfter         time.Duration
+}
+
+// outcomeKind 把内部 responsesFailureKind 映射到 SDK 的 OutcomeKind。
+// continuationAnchor 本质是客户端传了失效的 previous_response_id，归到 ClientError。
+// Unknown 兜底走 UpstreamTransient —— Core 能尝试 failover，而不是把账号标死。
+func (e *responsesFailureError) outcomeKind() sdk.OutcomeKind {
+	if e == nil {
+		return sdk.OutcomeUnknown
+	}
+	switch e.Kind {
+	case responsesFailureKindClient, responsesFailureKindContinuationAnchor:
+		return sdk.OutcomeClientError
+	case responsesFailureKindRateLimited:
+		return sdk.OutcomeAccountRateLimited
+	case responsesFailureKindServer:
+		return sdk.OutcomeUpstreamTransient
+	default:
+		return sdk.OutcomeUpstreamTransient
+	}
 }
 
 func (e *responsesFailureError) Error() string {
@@ -160,7 +178,6 @@ func classifyResponsesError(errType, errCode, msg string) *responsesFailureError
 			Kind:               responsesFailureKindRateLimited,
 			StatusCode:         http.StatusTooManyRequests,
 			AnthropicErrorType: "rate_limit_error",
-			AccountStatus:      sdk.AccountStatusRateLimited,
 			Message:            msg,
 			RetryAfter:         parseRetryDelay(msg),
 		}

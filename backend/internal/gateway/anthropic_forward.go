@@ -22,7 +22,7 @@ import (
 
 // forwardAnthropicMessage 处理 Anthropic Messages API 请求
 // 流程：原始 JSON → 验证 → 模型映射 → 一步直转 Responses API → 转发上游（含模型降级重试）
-func (g *OpenAIGateway) forwardAnthropicMessage(ctx context.Context, req *sdk.ForwardRequest) (*sdk.ForwardResult, error) {
+func (g *OpenAIGateway) forwardAnthropicMessage(ctx context.Context, req *sdk.ForwardRequest) (sdk.ForwardOutcome, error) {
 	start := time.Now()
 	body := req.Body
 	strategy := resolveAnthropicUpstreamStrategy(req.Account)
@@ -56,7 +56,13 @@ func (g *OpenAIGateway) forwardAnthropicMessage(ctx context.Context, req *sdk.Fo
 		if req.Writer != nil {
 			writeAnthropicErrorJSON(req.Writer, statusCode, errType, errMsg)
 		}
-		return &sdk.ForwardResult{StatusCode: statusCode, Duration: time.Since(start)}, nil
+		// 客户端请求本身无效（缺字段 / 格式错）
+		return sdk.ForwardOutcome{
+			Kind:     sdk.OutcomeClientError,
+			Upstream: sdk.UpstreamResponse{StatusCode: statusCode},
+			Reason:   errMsg,
+			Duration: time.Since(start),
+		}, nil
 	}
 
 	// 2. 同步 stream（model 同步已在 forwardHTTP 入口的 preprocessRequestBody 统一处理）
@@ -199,8 +205,8 @@ func (g *OpenAIGateway) forwardAnthropicMessage(ctx context.Context, req *sdk.Fo
 	return g.doAnthropicForward(ctx, req, responsesBody, replayBody, originalModel, modelName, fallbackModel, start, session)
 }
 
-// doAnthropicForward 执行 Anthropic 转发，支持模型降级重试
-// mappedModel: 映射后的 GPT 模型名，用于 Core 计费（写入 result.Model）
+// doAnthropicForward 执行 Anthropic 转发，支持模型降级重试。
+// mappedModel: 映射后的 GPT 模型名，用于 Core 计费（写入 Usage.Model）。
 func (g *OpenAIGateway) doAnthropicForward(
 	ctx context.Context,
 	req *sdk.ForwardRequest,
@@ -211,11 +217,10 @@ func (g *OpenAIGateway) doAnthropicForward(
 	fallbackModel string,
 	start time.Time,
 	session openAISessionResolution,
-) (*sdk.ForwardResult, error) {
+) (sdk.ForwardOutcome, error) {
 	hasFallback := fallbackModel != ""
 
-	// 第一次转发（有 fallback 时抑制错误写入客户端）
-	result, errBody, err := g.forwardAnthropicResponses(ctx, req, responsesBody, originalModel, mappedModel, start, req.Writer, hasFallback, session)
+	outcome, errBody, err := g.forwardAnthropicResponses(ctx, req, responsesBody, originalModel, mappedModel, start, req.Writer, hasFallback, session)
 	if err != nil {
 		if len(replayBody) > 0 {
 			var failure *responsesFailureError
@@ -224,36 +229,33 @@ func (g *OpenAIGateway) doAnthropicForward(
 					"session", session.SessionKey,
 					"digest_chain", session.DigestChain)
 				clearSessionStateResponseID(session.SessionKey)
-				result, errBody, err = g.forwardAnthropicResponses(ctx, req, replayBody, originalModel, mappedModel, start, req.Writer, hasFallback, session)
+				outcome, errBody, err = g.forwardAnthropicResponses(ctx, req, replayBody, originalModel, mappedModel, start, req.Writer, hasFallback, session)
 				if err == nil {
 					goto fallbackCheck
 				}
 			}
 		}
-		return result, err
+		return outcome, err
 	}
 
-	// 检查是否需要模型降级
 fallbackCheck:
 	if hasFallback && errBody != nil {
-		if isModelNotFoundError(result.StatusCode, errBody) {
+		if isModelNotFoundError(outcome.Upstream.StatusCode, errBody) {
 			g.logger.Info("模型降级重试",
 				"primary", gjson.GetBytes(responsesBody, "model").String(),
 				"fallback", fallbackModel,
-				"status", result.StatusCode)
+				"status", outcome.Upstream.StatusCode)
 
-			// 替换模型后重试，降级模型同时作为计费模型
 			responsesBody, _ = sjson.SetBytes(responsesBody, "model", fallbackModel)
 			fallbackStart := time.Now()
-			result, _, err = g.forwardAnthropicResponses(ctx, req, responsesBody, originalModel, fallbackModel, fallbackStart, req.Writer, false, session)
-			return result, err
+			outcome, _, err = g.forwardAnthropicResponses(ctx, req, responsesBody, originalModel, fallbackModel, fallbackStart, req.Writer, false, session)
+			return outcome, err
 		}
-
-		// 非模型错误，写回原始错误
-		return g.writeAnthropicUpstreamError(req.Writer, result.StatusCode, errBody, start)
+		// 非模型错误：写回原始错误
+		return g.writeAnthropicUpstreamError(req.Writer, outcome.Upstream.StatusCode, errBody, start)
 	}
 
-	return result, nil
+	return outcome, nil
 }
 
 func finalizeAnthropicResponsesBody(responsesBody []byte, originalBody []byte, serviceTier string, sparkOverride bool) []byte {
@@ -291,10 +293,9 @@ func injectAnthropicPromptCacheKey(responsesBody []byte, strategy anthropicUpstr
 // 统一的 Anthropic → Responses API 转发（合并 OAuth/APIKey 路径）
 // ──────────────────────────────────────────────────────
 
-// forwardAnthropicResponses 统一的 Anthropic 转发函数
-// mappedModel: 映射后的 GPT 模型名，用于 Core 计费（写入 result.Model）
-// suppressErrorWrite: true 时上游错误不写入客户端，通过 errBody 返回供降级判断
-// 返回值: result, errBody（仅 suppress 时非 nil）, error
+// forwardAnthropicResponses 统一的 Anthropic 转发。
+// suppressErrorWrite: true 时上游错误不写入客户端，通过 errBody 返回供 fallback 判断。
+// 返回值: outcome, errBody（仅 suppress 时非 nil）, error
 func (g *OpenAIGateway) forwardAnthropicResponses(
 	ctx context.Context,
 	req *sdk.ForwardRequest,
@@ -305,67 +306,58 @@ func (g *OpenAIGateway) forwardAnthropicResponses(
 	w http.ResponseWriter,
 	suppressErrorWrite bool,
 	session openAISessionResolution,
-) (*sdk.ForwardResult, []byte, error) {
+) (sdk.ForwardOutcome, []byte, error) {
 	account := req.Account
-
-	// 强制覆盖 instructions（如果分组配置了）
 	responsesBody = applyForceInstructions(responsesBody, req.Headers)
 
-	// 构建上游 HTTP 请求（OAuth/APIKey 差异化处理）
 	upstreamReq, err := g.buildAnthropicUpstreamRequest(ctx, req, account, responsesBody, session)
 	if err != nil {
-		return nil, nil, fmt.Errorf("构建上游请求失败: %w", err)
+		return sdk.ForwardOutcome{}, nil, fmt.Errorf("构建上游请求失败: %w", err)
 	}
 
-	// 发送请求
 	client := g.buildHTTPClient(account)
 	resp, err := client.Do(upstreamReq)
 	if err != nil {
-		return nil, nil, fmt.Errorf("请求上游失败: %w", err)
+		return transientOutcome(err.Error()), nil, fmt.Errorf("请求上游失败: %w", err)
 	}
-	defer func() {
-		_ = resp.Body.Close()
-	}()
+	defer func() { _ = resp.Body.Close() }()
 
-	// 错误处理
 	if resp.StatusCode >= 400 {
 		body, _ := io.ReadAll(resp.Body)
 		g.logger.Error("上游返回错误", "status", resp.StatusCode, "body", truncate(string(body), 300))
 
 		if suppressErrorWrite {
-			// fallback 模式：不写入客户端，返回错误体供调用方判断
-			return &sdk.ForwardResult{
-				StatusCode:    resp.StatusCode,
-				Duration:      time.Since(start),
-				AccountStatus: accountStatusFromAnthropicBody(resp.StatusCode, body),
-				RetryAfter:    extractRetryAfterHeader(resp.Header),
-			}, body, nil
+			// fallback 模式：不写客户端，把 body 返给调用方判断是否降级
+			msg := extractOpenAIErrorMessage(body)
+			if msg == "" {
+				msg = truncate(string(body), 200)
+			}
+			outcome := failureOutcome(resp.StatusCode, body, resp.Header.Clone(), msg, extractRetryAfterHeader(resp.Header))
+			outcome.Duration = time.Since(start)
+			return outcome, body, nil
 		}
-		result, err := g.writeAnthropicUpstreamError(w, resp.StatusCode, body, start)
-		return result, nil, err
+		outcome, err := g.writeAnthropicUpstreamError(w, resp.StatusCode, body, start)
+		return outcome, nil, err
 	}
 
-	// 捕获上游 Codex 用量头
 	if snapshot := parseCodexUsageFromHeaders(resp.Header); snapshot != nil {
 		StoreCodexUsage(account.ID, snapshot)
 	}
 
-	// 流式 / 非流式响应处理
 	isStream := gjson.GetBytes(req.Body, "stream").Bool()
 	if isStream && w != nil {
 		if turnState := decodeTurnStateHeader(resp.Header); turnState != "" {
 			updateSessionStateTurnState(session.SessionKey, turnState)
 		}
-		result, err := translateResponsesSSEToAnthropicSSE(ctx, resp, w, originalModel, mappedModel, req.Body, start, session)
-		return result, nil, err
+		outcome, err := translateResponsesSSEToAnthropicSSE(ctx, resp, w, originalModel, mappedModel, req.Body, start, session)
+		return outcome, nil, err
 	}
 
-	// 非流式：聚合 Responses SSE → Anthropic JSON
 	if turnState := decodeTurnStateHeader(resp.Header); turnState != "" {
 		updateSessionStateTurnState(session.SessionKey, turnState)
 	}
-	result, err := g.handleAnthropicNonStreamFromResponses(resp, w, originalModel, mappedModel, req.Body, start, session, req.Account.ID)
-	return result, nil, err
+	outcome, err := g.handleAnthropicNonStreamFromResponses(resp, w, originalModel, mappedModel, req.Body, start, session, req.Account.ID)
+	return outcome, nil, err
 }
 
 // buildAnthropicUpstreamRequest 构建 Anthropic 转发的上游 HTTP 请求
@@ -421,7 +413,7 @@ func (g *OpenAIGateway) buildAnthropicUpstreamRequest(
 }
 
 // handleAnthropicNonStreamFromResponses 非流式：聚合 Responses SSE → Anthropic JSON
-// mappedModel: 映射后的 GPT 模型名，用于 Core 计费（写入 result.Model）
+// mappedModel: 映射后的 GPT 模型名，用于 Core 计费（写入 Usage.Model）
 func (g *OpenAIGateway) handleAnthropicNonStreamFromResponses(
 	resp *http.Response,
 	w http.ResponseWriter,
@@ -431,34 +423,32 @@ func (g *OpenAIGateway) handleAnthropicNonStreamFromResponses(
 	start time.Time,
 	session openAISessionResolution,
 	accountID int64,
-) (*sdk.ForwardResult, error) {
+) (sdk.ForwardOutcome, error) {
 	wsResult := ParseSSEStream(resp.Body, nil)
 	if wsResult.Err != nil {
 		var failure *responsesFailureError
-		if errors.As(wsResult.Err, &failure) && failure.shouldReturnClientError() {
-			if w != nil {
+		if errors.As(wsResult.Err, &failure) {
+			if failure.shouldReturnClientError() && w != nil {
 				writeAnthropicErrorJSON(w, failure.StatusCode, failure.AnthropicErrorType, failure.Message)
 			}
-			return &sdk.ForwardResult{
-				StatusCode:    failure.StatusCode,
-				Model:         mappedModel,
-				Duration:      time.Since(start),
-				AccountStatus: failure.AccountStatus,
-				ErrorMessage:  failure.Message,
-				RetryAfter:    failure.RetryAfter,
+			return sdk.ForwardOutcome{
+				Kind:       failure.outcomeKind(),
+				Upstream:   sdk.UpstreamResponse{StatusCode: failure.StatusCode},
+				Reason:     failure.Message,
+				RetryAfter: failure.RetryAfter,
+				Duration:   time.Since(start),
 			}, nil
 		}
-		return nil, wsResult.Err
+		return sdk.ForwardOutcome{}, wsResult.Err
 	}
 	if len(wsResult.CompletedEventRaw) == 0 {
-		return nil, fmt.Errorf("未收到 response.completed 事件")
+		return sdk.ForwardOutcome{}, fmt.Errorf("未收到 response.completed 事件")
 	}
 
-	// 客户端响应体使用原始 Claude 模型名（model）
-	// 传入整份 wsResult，让转换器在 completed 事件缺少完整 output 时能回退到 delta 累积的内容
+	// 客户端响应体使用原始 Claude 模型名；传入 wsResult 兜底用 delta 累积
 	anthropicJSON := convertResponsesCompletedToAnthropicJSON(wsResult.CompletedEventRaw, originalRequest, model, &wsResult)
 	if anthropicJSON == "" {
-		return nil, fmt.Errorf("responses 非流回译失败")
+		return sdk.ForwardOutcome{}, fmt.Errorf("responses 非流回译失败")
 	}
 	if session.SessionKey != "" && wsResult.ResponseID != "" {
 		updateSessionStateResponseID(session.SessionKey, wsResult.ResponseID)
@@ -474,77 +464,77 @@ func (g *OpenAIGateway) handleAnthropicNonStreamFromResponses(
 		_, _ = w.Write([]byte(anthropicJSON))
 	}
 
-	// result.Model 使用映射后的 GPT 模型名供 Core 计费
+	// 计费 model 用映射后的 GPT 名
 	billingModel := mappedModel
 	if billingModel == "" {
 		billingModel = gjson.Get(anthropicJSON, "model").String()
 	}
-
-	// 从上游 response.completed 事件中提取 service_tier
 	serviceTier := normalizeOpenAIServiceTier(
 		gjson.GetBytes(wsResult.CompletedEventRaw, "response.service_tier").String(),
 	)
 
 	elapsed := time.Since(start)
-	result := &sdk.ForwardResult{
-		StatusCode:            http.StatusOK,
+	usage := &sdk.Usage{
 		Model:                 billingModel,
 		InputTokens:           wsResult.InputTokens,
 		OutputTokens:          wsResult.OutputTokens,
 		CachedInputTokens:     wsResult.CachedInputTokens,
 		ReasoningOutputTokens: wsResult.ReasoningOutputTokens,
 		ServiceTier:           serviceTier,
-		Duration:              elapsed,
 		FirstTokenMs:          elapsed.Milliseconds(),
 	}
-	fillCost(result)
-	return result, nil
+	fillUsageCost(usage)
+	return sdk.ForwardOutcome{
+		Kind:     sdk.OutcomeSuccess,
+		Upstream: sdk.UpstreamResponse{StatusCode: http.StatusOK},
+		Usage:    usage,
+		Duration: elapsed,
+	}, nil
 }
 
 // ──────────────────────────────────────────────────────
 // 错误处理
 // ──────────────────────────────────────────────────────
 
-// writeAnthropicUpstreamError 将上游错误写入客户端（Anthropic 格式）
+// writeAnthropicUpstreamError 将上游错误写入客户端（Anthropic 格式）并构造判决。
+//
+//   - 账号级错误（被禁用 / 限流 / 凭证失效，含 400 "organization disabled"）：
+//     不写 w — 让 Core canFailover 不被"stream already written"短路，能切账号重试。
+//   - 客户端错误：写 w（透传给客户端看到原始错误），Core 不 failover。
 func (g *OpenAIGateway) writeAnthropicUpstreamError(
 	w http.ResponseWriter,
 	statusCode int,
 	body []byte,
 	start time.Time,
-) (*sdk.ForwardResult, error) {
-	errMsg := truncate(string(body), 200)
-	if msg := extractOpenAIErrorMessage(body); msg != "" {
-		errMsg = msg
+) (sdk.ForwardOutcome, error) {
+	errMsg := extractOpenAIErrorMessage(body)
+	if errMsg == "" {
+		errMsg = truncate(string(body), 200)
 	}
 
-	errType := anthropicErrorType(statusCode)
-	accountStatus := accountStatusFromAnthropicBody(statusCode, body)
-
-	// 账号级错误（被禁用 / 限流 / 凭证失效，包括 400 "organization disabled" 这类）：
-	//   1. 不写 w — 保持 c.Writer 处于 unwritten 状态，让 Core 的 canFailover 检查不被
-	//      "stream already written" 短路，从而能正常切换账号重试。
-	//   2. 返回 error — 触发 Core 的 failover 循环和 ReportAccountError 惩罚逻辑。
-	// 客户端侧错误（请求参数有误、context 超长等）才写 w，并返回 nil 让 Core 识别为
-	// client error 不做 failover。
-	isAccountError := accountStatus != sdk.AccountStatusOK
-	if !isAccountError && w != nil {
-		writeAnthropicErrorJSON(w, statusCode, errType, errMsg)
-	}
-
-	result := &sdk.ForwardResult{
-		StatusCode:    statusCode,
-		Duration:      time.Since(start),
-		AccountStatus: accountStatus,
-		ErrorMessage:  errMsg,
-	}
+	kind := classifyAnthropicBody(statusCode, body)
+	retryAfter := time.Duration(0)
 	if statusCode == 429 {
-		result.RetryAfter = parseRetryDelay(errMsg)
+		retryAfter = parseRetryDelay(errMsg)
 	}
 
-	if isAccountError || statusCode >= 500 {
-		return result, fmt.Errorf("上游返回 %d: %s", statusCode, errMsg)
+	// 仅客户端错误才写 w 透传；账号级 / 上游错误保持 w unwritten 以便 failover。
+	if kind == sdk.OutcomeClientError && w != nil {
+		writeAnthropicErrorJSON(w, statusCode, anthropicErrorType(statusCode), errMsg)
 	}
-	return result, nil
+
+	outcome := sdk.ForwardOutcome{
+		Kind:       kind,
+		Upstream:   sdk.UpstreamResponse{StatusCode: statusCode, Body: body},
+		Reason:     errMsg,
+		RetryAfter: retryAfter,
+		Duration:   time.Since(start),
+	}
+
+	if kind == sdk.OutcomeAccountRateLimited || kind == sdk.OutcomeAccountDead || kind == sdk.OutcomeUpstreamTransient {
+		return outcome, fmt.Errorf("上游返回 %d: %s", statusCode, errMsg)
+	}
+	return outcome, nil
 }
 
 // extractOpenAIErrorMessage 从上游错误响应中提取错误消息（纯 gjson）

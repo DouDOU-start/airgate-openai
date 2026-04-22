@@ -39,29 +39,25 @@ func isImagesWebReverseModel(model string) bool {
 //
 // /v1/images/edits 目前不支持（网页端需要 attach image 的入口，协议结构不同，
 // 后续若要支持单独开一个 forwardImagesEditsViaWebReverse 入口）。
-func (g *OpenAIGateway) forwardImagesViaWebReverse(ctx context.Context, req *sdk.ForwardRequest) (*sdk.ForwardResult, error) {
+func (g *OpenAIGateway) forwardImagesViaWebReverse(ctx context.Context, req *sdk.ForwardRequest) (sdk.ForwardOutcome, error) {
 	start := time.Now()
 	account := req.Account
 
-	// 只支持文生图
 	_, reqPath := resolveAPIKeyRoute(req)
 	if isImagesEditRequest(reqPath) {
 		return webReverseImagesError(start, http.StatusBadRequest, req.Writer,
 			"gpt-image-2 暂不支持 /v1/images/edits，请使用 /v1/images/generations")
 	}
 
-	// 解析 OpenAI Images REST 请求
 	imgReq, err := parseImagesRequest(req.Body, req.Headers.Get("Content-Type"), false)
 	if err != nil {
 		return webReverseImagesError(start, http.StatusBadRequest, req.Writer,
 			fmt.Sprintf("解析 Images 请求失败: %v", err))
 	}
 
-	// 构造 imgen Client（每次请求新建，bootstrap cookie 不跨请求复用）
 	accessToken := account.Credentials["access_token"]
 	if accessToken == "" {
-		return webReverseImagesError(start, http.StatusUnauthorized, req.Writer,
-			"OAuth 账号缺少 access_token")
+		return webReverseImagesError(start, http.StatusUnauthorized, req.Writer, "OAuth 账号缺少 access_token")
 	}
 	var proxyURL *url.URL
 	if account.ProxyURL != "" {
@@ -71,33 +67,27 @@ func (g *OpenAIGateway) forwardImagesViaWebReverse(ctx context.Context, req *sdk
 	}
 	client := imgen.NewClient(accessToken, proxyURL)
 
-	// 调用生成
 	imgRes, err := client.GenerateImage(ctx, imgReq.Prompt)
 	if err != nil {
-		// 无 partial images 时按 502 报错 + 允许 Core failover（account 不一定坏）
 		if imgRes == nil || len(imgRes.Images) == 0 {
 			status := classifyWebReverseError(err)
-			return &sdk.ForwardResult{
-				StatusCode:    status,
-				Duration:      time.Since(start),
-				Model:         imagesWebReverseModel,
-				AccountStatus: accountStatusFromMessage(status, err.Error()),
-				ErrorMessage:  err.Error(),
-			}, err
+			outcome := failureOutcome(status, nil, nil, err.Error(), 0)
+			outcome.Duration = time.Since(start)
+			if outcome.Usage == nil {
+				outcome.Usage = &sdk.Usage{Model: imagesWebReverseModel}
+			}
+			return outcome, err
 		}
-		// 有部分图片已下载成功，降级为成功响应（继续下游流程）
+		// 有部分图片已下载：降级为成功响应继续下游流程
 		g.logger.Warn("imgen 生成部分失败，使用已下载图片", "err", err, "count", len(imgRes.Images))
 	}
 
-	// 构造 Images REST 响应
 	promptTokens := estimatePromptTokens(imgReq.Prompt)
-	// 网页端无 size/quality，按 medium 1024x1024 估算每张 output tokens
+	// 网页端无 size/quality，按 medium 1024×1024 估算每张 output tokens
 	perImgOutTokens := lookupImageGenOutputTokens("1024x1024", "medium")
 	outputTokens := perImgOutTokens * len(imgRes.Images)
 
 	respBody := buildWebReverseImagesResponse(imgRes, promptTokens, outputTokens)
-
-	// 写回客户端（非流式）
 	if w := req.Writer; w != nil {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
@@ -105,22 +95,25 @@ func (g *OpenAIGateway) forwardImagesViaWebReverse(ctx context.Context, req *sdk
 	}
 
 	elapsed := time.Since(start)
-	result := &sdk.ForwardResult{
-		StatusCode:    http.StatusOK,
-		InputTokens:   promptTokens,
-		OutputTokens:  outputTokens,
-		Model:         imagesWebReverseModel,
-		Duration:      elapsed,
-		FirstTokenMs:  elapsed.Milliseconds(),
-		AccountStatus: sdk.AccountStatusOK,
+	usage := &sdk.Usage{
+		InputTokens:  promptTokens,
+		OutputTokens: outputTokens,
+		Model:        imagesWebReverseModel,
+		FirstTokenMs: elapsed.Milliseconds(),
 	}
-	if w := req.Writer; w == nil {
-		// 非流式且无 writer：把 body 交给 Core 透传
-		result.Body = respBody
-		result.Headers = http.Header{"Content-Type": []string{"application/json"}}
+	fillUsageCost(usage)
+
+	outcome := sdk.ForwardOutcome{
+		Kind:     sdk.OutcomeSuccess,
+		Upstream: sdk.UpstreamResponse{StatusCode: http.StatusOK},
+		Usage:    usage,
+		Duration: elapsed,
 	}
-	fillCost(result)
-	return result, nil
+	if req.Writer == nil {
+		outcome.Upstream.Body = respBody
+		outcome.Upstream.Headers = http.Header{"Content-Type": []string{"application/json"}}
+	}
+	return outcome, nil
 }
 
 // buildWebReverseImagesResponse 按 OpenAI Images API 官方契约打包 Web 逆向响应。
@@ -158,29 +151,26 @@ func buildWebReverseImagesResponse(res *imgen.Result, promptTokens, outputTokens
 	return b
 }
 
-// webReverseImagesError 把一个错误打包成 ForwardResult，并同步写给客户端。
-//
-// 返回的 ForwardResult AccountStatus 默认 OK（= 4xx 全部视为客户端问题）。
-// 401/403 调用方应在调用前单独处理（走 accountStatusFromMessage），不进这里。
-func webReverseImagesError(start time.Time, status int, w http.ResponseWriter, msg string) (*sdk.ForwardResult, error) {
+// webReverseImagesError 把一个客户端错误（请求不合法 / 凭证缺失）打包为 ClientError Outcome，
+// 并同步写响应给客户端。调用方应在命中 401/403 等账号级错误前单独处理——这里不归类到账号状态。
+func webReverseImagesError(start time.Time, status int, w http.ResponseWriter, msg string) (sdk.ForwardOutcome, error) {
 	body := buildImagesErrorBody(status, msg)
 	if w != nil {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(status)
 		_, _ = w.Write(body)
 	}
-	result := &sdk.ForwardResult{
-		StatusCode:    status,
-		Duration:      time.Since(start),
-		Model:         imagesWebReverseModel,
-		ErrorMessage:  msg,
-		AccountStatus: sdk.AccountStatusOK,
+	outcome := sdk.ForwardOutcome{
+		Kind: sdk.OutcomeClientError,
+		Upstream: sdk.UpstreamResponse{
+			StatusCode: status,
+			Headers:    http.Header{"Content-Type": []string{"application/json"}},
+			Body:       body,
+		},
+		Reason:   msg,
+		Duration: time.Since(start),
 	}
-	if w == nil {
-		result.Body = body
-		result.Headers = http.Header{"Content-Type": []string{"application/json"}}
-	}
-	return result, fmt.Errorf("%s", msg)
+	return outcome, fmt.Errorf("%s", msg)
 }
 
 // classifyWebReverseError 根据 err.Error() 文本判定 HTTP 状态码。

@@ -91,7 +91,7 @@ func (g *OpenAIGateway) Routes() []sdk.RouteDefinition {
 	return PluginRouteDefinitions()
 }
 
-func (g *OpenAIGateway) Forward(ctx context.Context, req *sdk.ForwardRequest) (*sdk.ForwardResult, error) {
+func (g *OpenAIGateway) Forward(ctx context.Context, req *sdk.ForwardRequest) (sdk.ForwardOutcome, error) {
 	return g.forwardHTTP(ctx, req)
 }
 
@@ -663,93 +663,10 @@ func (g *OpenAIGateway) HandleRequest(ctx context.Context, _, path, _ string, _ 
 	}
 }
 
-// fillCost 根据模型定价填充 ForwardResult 的费用字段
-//
-// 使用 SDK 的 CalculateCost 统一处理 standard / priority / flex 三档
-// 以及 gpt-5.4 家族的长上下文阶梯。插件侧只负责把 Spec 翻译成 ModelInfo。
-func fillCost(result *sdk.ForwardResult) {
-	if result == nil || result.Model == "" {
-		return
-	}
-	spec := model.Lookup(result.Model)
-	modelInfo := sdk.ModelInfo{
-		InputPrice:                  spec.InputPrice,
-		OutputPrice:                 spec.OutputPrice,
-		CachedInputPrice:            spec.CachedPrice,
-		InputPricePriority:          spec.InputPricePriority,
-		OutputPricePriority:         spec.OutputPricePriority,
-		CachedInputPricePriority:    spec.CachedPricePriority,
-		InputPriceFlex:              spec.InputPriceFlex,
-		OutputPriceFlex:             spec.OutputPriceFlex,
-		CachedInputPriceFlex:        spec.CachedPriceFlex,
-		LongContextThreshold:        spec.LongContextThreshold,
-		LongContextInputMultiplier:  spec.LongContextInputMultiplier,
-		LongContextOutputMultiplier: spec.LongContextOutputMultiplier,
-		LongContextCachedMultiplier: spec.LongContextCachedMultiplier,
-	}
-	cost := sdk.CalculateCost(sdk.CostInput{
-		InputTokens:       result.InputTokens,
-		OutputTokens:      result.OutputTokens,
-		CachedInputTokens: result.CachedInputTokens,
-		ServiceTier:       result.ServiceTier,
-	}, modelInfo)
-	result.InputCost = cost.InputCost
-	result.OutputCost = cost.OutputCost
-	result.CachedInputCost = cost.CachedInputCost
-
-	// 回填标准档单价用于 usage_log 展示（$/1M token）
-	// 注：此处只写标准单价，实际计费中若命中 priority/flex/长上下文会反映在 *_cost 字段
-	result.InputPrice = spec.InputPrice
-	result.OutputPrice = spec.OutputPrice
-	result.CachedInputPrice = spec.CachedPrice
-}
-
-// imageToolCostModel 是 Responses API 的 image_generation 内置工具使用的模型，
+// imageToolCostModel 是 Responses API 的 image_generation 内置工具使用的模型。
 // 上游文档与 Codex `$imagegen` 技能均使用 gpt-image-1.5 作为实际图像生成模型。
+// 计费 helper 见 outcome.go 的 fillUsageCost / fillUsageCostWithImageTool。
 const imageToolCostModel = "gpt-image-1.5"
-
-// fillCostWithImageTool 在 fillCost 之上叠加 image_generation tool 的费用。
-//
-// 上游（Responses API）对主 model（如 gpt-5.4）与图像工具 (gpt-image-1.5)
-// 采用两套独立单价。tool_usage.image_gen.{input_tokens,output_tokens} 必须按
-// gpt-image-1.5 单价单独结算，不能直接并入主 model 的 token 总数（否则会以
-// chat 单价错算成本）。
-//
-// 本函数：
-//  1. 按主 model 用 fillCost 计算 InputCost / OutputCost / CachedInputCost
-//  2. 按 gpt-image-1.5 定价 + ServiceTier 档位计算工具图像的 input/output 费用
-//  3. 叠加到对应 *Cost 字段，同时把 tool 的 token 数累加到 Input/OutputTokens，
-//     让 usage_log 的总量反映真实用量（单价展示字段 *Price 保留主 model 单价，
-//     混合请求时 total_cost 才是权威口径）
-func fillCostWithImageTool(result *sdk.ForwardResult, toolImageInputTokens, toolImageOutputTokens int) {
-	fillCost(result)
-	if result == nil || toolImageInputTokens+toolImageOutputTokens <= 0 {
-		return
-	}
-	imageSpec := model.Lookup(imageToolCostModel)
-	if imageSpec.InputPrice == 0 && imageSpec.OutputPrice == 0 {
-		// 图像模型未在 registry 中注册，跳过叠加以免漏计变成错计 $0
-		return
-	}
-	imgModelInfo := sdk.ModelInfo{
-		InputPrice:          imageSpec.InputPrice,
-		OutputPrice:         imageSpec.OutputPrice,
-		CachedInputPrice:    imageSpec.CachedPrice,
-		InputPricePriority:  imageSpec.InputPricePriority,
-		OutputPricePriority: imageSpec.OutputPricePriority,
-		InputPriceFlex:      imageSpec.InputPriceFlex,
-		OutputPriceFlex:     imageSpec.OutputPriceFlex,
-	}
-	toolCost := sdk.CalculateCost(sdk.CostInput{
-		InputTokens:  toolImageInputTokens,
-		OutputTokens: toolImageOutputTokens,
-		ServiceTier:  result.ServiceTier,
-	}, imgModelInfo)
-	result.InputCost += toolCost.InputCost
-	result.OutputCost += toolCost.OutputCost
-	result.InputTokens += toolImageInputTokens
-	result.OutputTokens += toolImageOutputTokens
-}
 
 func jsonError(msg string) []byte {
 	b, _ := json.Marshal(map[string]string{"error": msg})

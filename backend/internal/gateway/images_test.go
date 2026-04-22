@@ -43,9 +43,9 @@ func TestIsImagesRequest(t *testing.T) {
 }
 
 // TestHandleImagesResponse_TokenAttribution 覆盖官方响应格式：
-//   - usage.input_tokens / output_tokens 落入 ForwardResult
+//   - usage.input_tokens / output_tokens 落入 Outcome.Usage
 //   - cached tokens 从 input 中扣减，避免重复计费
-//   - fillCost 根据 gpt-image-1.5 定价填充费用
+//   - fillUsageCost 根据 gpt-image-1.5 定价填充费用
 func TestHandleImagesResponse_TokenAttribution(t *testing.T) {
 	body := `{
 		"created": 1713833628,
@@ -64,39 +64,41 @@ func TestHandleImagesResponse_TokenAttribution(t *testing.T) {
 	}
 	w := httptest.NewRecorder()
 
-	result, err := handleImagesResponse(resp, w, time.Now(), "gpt-image-1.5")
+	outcome, err := handleImagesResponse(resp, w, time.Now(), "gpt-image-1.5")
 	if err != nil {
 		t.Fatalf("handleImagesResponse returned err: %v", err)
 	}
-
-	if result.Model != "gpt-image-1.5" {
-		t.Errorf("Model = %q, want gpt-image-1.5", result.Model)
+	if outcome.Kind != sdk.OutcomeSuccess {
+		t.Fatalf("Kind = %v, want Success", outcome.Kind)
 	}
-	if result.InputTokens != 40 {
-		t.Errorf("InputTokens = %d, want 40 (50 - 10 cached)", result.InputTokens)
+	u := outcome.Usage
+	if u == nil {
+		t.Fatal("Usage = nil, want non-nil")
 	}
-	if result.OutputTokens != 4160 {
-		t.Errorf("OutputTokens = %d, want 4160", result.OutputTokens)
+	if u.Model != "gpt-image-1.5" {
+		t.Errorf("Model = %q, want gpt-image-1.5", u.Model)
 	}
-	if result.CachedInputTokens != 10 {
-		t.Errorf("CachedInputTokens = %d, want 10", result.CachedInputTokens)
+	if u.InputTokens != 40 {
+		t.Errorf("InputTokens = %d, want 40 (50 - 10 cached)", u.InputTokens)
+	}
+	if u.OutputTokens != 4160 {
+		t.Errorf("OutputTokens = %d, want 4160", u.OutputTokens)
+	}
+	if u.CachedInputTokens != 10 {
+		t.Errorf("CachedInputTokens = %d, want 10", u.CachedInputTokens)
 	}
 
 	// gpt-image-1.5 standard: input=$5/1M, cached=$1.25/1M, output=$40/1M
-	// InputCost = 40/1e6 * 5 = 0.0002
-	// CachedInputCost = 10/1e6 * 1.25 = 0.0000125
-	// OutputCost = 4160/1e6 * 40 = 0.1664
-	if !almostEqual(result.InputCost, 0.0002, 1e-9) {
-		t.Errorf("InputCost = %v, want 0.0002", result.InputCost)
+	if !almostEqual(u.InputCost, 0.0002, 1e-9) {
+		t.Errorf("InputCost = %v, want 0.0002", u.InputCost)
 	}
-	if !almostEqual(result.CachedInputCost, 0.0000125, 1e-9) {
-		t.Errorf("CachedInputCost = %v, want 0.0000125", result.CachedInputCost)
+	if !almostEqual(u.CachedInputCost, 0.0000125, 1e-9) {
+		t.Errorf("CachedInputCost = %v, want 0.0000125", u.CachedInputCost)
 	}
-	if !almostEqual(result.OutputCost, 0.1664, 1e-9) {
-		t.Errorf("OutputCost = %v, want 0.1664", result.OutputCost)
+	if !almostEqual(u.OutputCost, 0.1664, 1e-9) {
+		t.Errorf("OutputCost = %v, want 0.1664", u.OutputCost)
 	}
 
-	// 客户端侧响应体应原样透传
 	if w.Code != http.StatusOK {
 		t.Errorf("writer status = %d, want 200", w.Code)
 	}
@@ -107,8 +109,7 @@ func TestHandleImagesResponse_TokenAttribution(t *testing.T) {
 }
 
 // TestHandleImagesResponse_FallbackModelWhenBodyLacksModel 验证 Images 响应里
-// 没有 model 字段时，会回退到请求侧传入的 fallbackModel。否则 fillCost 查不到
-// 定价，账单会失真。
+// 没有 model 字段时，会回退到请求侧传入的 fallbackModel，避免 fillUsageCost 查不到定价。
 func TestHandleImagesResponse_FallbackModelWhenBodyLacksModel(t *testing.T) {
 	body := `{"data":[{"url":"https://example/a.png"}],"usage":{"input_tokens":10,"output_tokens":100}}`
 	resp := &http.Response{
@@ -117,44 +118,40 @@ func TestHandleImagesResponse_FallbackModelWhenBodyLacksModel(t *testing.T) {
 		Body:       ioNopCloserFromString(body),
 	}
 
-	result, err := handleImagesResponse(resp, nil, time.Now(), "gpt-image-1")
+	outcome, err := handleImagesResponse(resp, nil, time.Now(), "gpt-image-1")
 	if err != nil {
 		t.Fatalf("handleImagesResponse returned err: %v", err)
 	}
-	if result.Model != "gpt-image-1" {
-		t.Fatalf("Model = %q, want gpt-image-1 (fallback)", result.Model)
+	if outcome.Usage == nil || outcome.Usage.Model != "gpt-image-1" {
+		t.Fatalf("Usage.Model = %q, want gpt-image-1 (fallback)", outcome.Usage.Model)
 	}
-	// Writer 为 nil 时应把 body/header 直接带回给 core
-	if len(result.Body) != len(body) {
-		t.Errorf("ForwardResult.Body len = %d, want %d", len(result.Body), len(body))
+	// Writer 为 nil 时 Upstream.Body/Headers 应带回给 core
+	if len(outcome.Upstream.Body) != len(body) {
+		t.Errorf("Upstream.Body len = %d, want %d", len(outcome.Upstream.Body), len(body))
 	}
-	if result.Headers.Get("Content-Type") != "application/json" {
-		t.Errorf("ForwardResult.Headers Content-Type not preserved")
+	if outcome.Upstream.Headers.Get("Content-Type") != "application/json" {
+		t.Errorf("Upstream.Headers Content-Type not preserved")
 	}
-	// output 非零则 OutputCost 应大于零
-	if result.OutputCost <= 0 {
-		t.Errorf("OutputCost = %v, want > 0", result.OutputCost)
+	if outcome.Usage.OutputCost <= 0 {
+		t.Errorf("OutputCost = %v, want > 0", outcome.Usage.OutputCost)
 	}
 }
 
-// TestFillCost_GPTImage1_Priority 覆盖 gpt-image-1 的 priority 档：
-// priority 按 std() 约定 = standard × 2。
-func TestFillCost_GPTImage1_Priority(t *testing.T) {
-	result := &sdk.ForwardResult{
+// TestFillUsageCost_GPTImage1_Priority priority 档 ≈ standard × 2。
+func TestFillUsageCost_GPTImage1_Priority(t *testing.T) {
+	usage := &sdk.Usage{
 		Model:        "gpt-image-1",
 		InputTokens:  100,
 		OutputTokens: 1000,
 		ServiceTier:  "priority",
 	}
-	fillCost(result)
+	fillUsageCost(usage)
 	// priority: input=$10/1M, output=$80/1M
-	// InputCost = 100/1e6 * 10 = 0.001
-	// OutputCost = 1000/1e6 * 80 = 0.08
-	if !almostEqual(result.InputCost, 0.001, 1e-9) {
-		t.Errorf("InputCost = %v, want 0.001", result.InputCost)
+	if !almostEqual(usage.InputCost, 0.001, 1e-9) {
+		t.Errorf("InputCost = %v, want 0.001", usage.InputCost)
 	}
-	if !almostEqual(result.OutputCost, 0.08, 1e-9) {
-		t.Errorf("OutputCost = %v, want 0.08", result.OutputCost)
+	if !almostEqual(usage.OutputCost, 0.08, 1e-9) {
+		t.Errorf("OutputCost = %v, want 0.08", usage.OutputCost)
 	}
 }
 
@@ -198,72 +195,64 @@ func TestParseSSEUsage_ToolImageGen(t *testing.T) {
 			"tool_usage":{"image_gen":{"input_tokens":8,"output_tokens":4160}}
 		}
 	}`)
-	var result sdk.ForwardResult
+	usage := &sdk.Usage{}
 	var toolIn, toolOut int
-	parseSSEUsage(data, &result, &toolIn, &toolOut)
-	if result.Model != "gpt-5.4" {
-		t.Errorf("Model = %q, want gpt-5.4", result.Model)
+	parseSSEUsage(data, usage, &toolIn, &toolOut)
+	if usage.Model != "gpt-5.4" {
+		t.Errorf("Model = %q, want gpt-5.4", usage.Model)
 	}
-	if result.InputTokens != 100 || result.OutputTokens != 50 {
-		t.Errorf("Input/Output = %d/%d, want 100/50", result.InputTokens, result.OutputTokens)
+	if usage.InputTokens != 100 || usage.OutputTokens != 50 {
+		t.Errorf("Input/Output = %d/%d, want 100/50", usage.InputTokens, usage.OutputTokens)
 	}
 	if toolIn != 8 || toolOut != 4160 {
 		t.Errorf("toolIn/Out = %d/%d, want 8/4160", toolIn, toolOut)
 	}
 }
 
-// TestFillCostWithImageTool 叠加计费：主 model (gpt-5.4) 的 chat token 按
-// 其单价、tool_usage 的图像 token 按 gpt-image-1.5 单价分别结算，最后合到
-// InputCost/OutputCost 里。
-func TestFillCostWithImageTool(t *testing.T) {
-	result := &sdk.ForwardResult{
+// TestFillUsageCostWithImageTool 叠加计费：主 model (gpt-5.4) 的 chat token 按
+// 其单价、tool_usage 的图像 token 按 gpt-image-1.5 单价分别结算。
+func TestFillUsageCostWithImageTool(t *testing.T) {
+	usage := &sdk.Usage{
 		Model:        "gpt-5.4",
 		InputTokens:  1000,
 		OutputTokens: 500,
 	}
-	fillCostWithImageTool(result, 10, 4160)
+	fillUsageCostWithImageTool(usage, 10, 4160)
 
-	// 主 model (gpt-5.4 standard): input=$2.5/1M, output=$15/1M
-	// chatInputCost  = 1000/1e6 * 2.5 = 0.0025
-	// chatOutputCost = 500/1e6  * 15  = 0.0075
-	// image tool (gpt-image-1.5 standard): input=$5/1M, output=$40/1M
-	// imgInputCost   = 10/1e6  * 5   = 0.00005
-	// imgOutputCost  = 4160/1e6 * 40 = 0.1664
-	// total InputCost  = 0.00255
-	// total OutputCost = 0.1739
-	if !almostEqual(result.InputCost, 0.00255, 1e-9) {
-		t.Errorf("InputCost = %v, want 0.00255", result.InputCost)
+	// 主 gpt-5.4 standard: input=$2.5/1M, output=$15/1M
+	// image tool gpt-image-1.5 standard: input=$5/1M, output=$40/1M
+	// total InputCost  = 0.0025 + 0.00005  = 0.00255
+	// total OutputCost = 0.0075 + 0.1664   = 0.1739
+	if !almostEqual(usage.InputCost, 0.00255, 1e-9) {
+		t.Errorf("InputCost = %v, want 0.00255", usage.InputCost)
 	}
-	if !almostEqual(result.OutputCost, 0.1739, 1e-9) {
-		t.Errorf("OutputCost = %v, want 0.1739", result.OutputCost)
+	if !almostEqual(usage.OutputCost, 0.1739, 1e-9) {
+		t.Errorf("OutputCost = %v, want 0.1739", usage.OutputCost)
 	}
-	// Tokens 累加：主 + 图像 tool
-	if result.InputTokens != 1010 {
-		t.Errorf("InputTokens = %d, want 1010 (1000 + 10)", result.InputTokens)
+	if usage.InputTokens != 1010 {
+		t.Errorf("InputTokens = %d, want 1010 (1000 + 10)", usage.InputTokens)
 	}
-	if result.OutputTokens != 4660 {
-		t.Errorf("OutputTokens = %d, want 4660 (500 + 4160)", result.OutputTokens)
+	if usage.OutputTokens != 4660 {
+		t.Errorf("OutputTokens = %d, want 4660 (500 + 4160)", usage.OutputTokens)
 	}
-	// 单价展示字段保留主 model（混合调用下 total_cost 才是权威）
-	if !almostEqual(result.InputPrice, 2.5, 1e-9) {
-		t.Errorf("InputPrice = %v, want 2.5 (gpt-5.4 standard)", result.InputPrice)
+	if !almostEqual(usage.InputPrice, 2.5, 1e-9) {
+		t.Errorf("InputPrice = %v, want 2.5 (gpt-5.4 standard)", usage.InputPrice)
 	}
 }
 
-// TestFillCostWithImageTool_NoToolUsage 退化为普通 fillCost 时行为不变。
-func TestFillCostWithImageTool_NoToolUsage(t *testing.T) {
-	result := &sdk.ForwardResult{
+// TestFillUsageCostWithImageTool_NoToolUsage 退化为 fillUsageCost 行为不变。
+func TestFillUsageCostWithImageTool_NoToolUsage(t *testing.T) {
+	usage := &sdk.Usage{
 		Model:        "gpt-5.4",
 		InputTokens:  1000,
 		OutputTokens: 500,
 	}
-	fillCostWithImageTool(result, 0, 0)
-	if result.InputTokens != 1000 || result.OutputTokens != 500 {
+	fillUsageCostWithImageTool(usage, 0, 0)
+	if usage.InputTokens != 1000 || usage.OutputTokens != 500 {
 		t.Errorf("token counts mutated when no image tool usage")
 	}
-	// 仅 gpt-5.4 standard pricing
-	if !almostEqual(result.InputCost, 0.0025, 1e-9) {
-		t.Errorf("InputCost = %v, want 0.0025", result.InputCost)
+	if !almostEqual(usage.InputCost, 0.0025, 1e-9) {
+		t.Errorf("InputCost = %v, want 0.0025", usage.InputCost)
 	}
 }
 
@@ -558,32 +547,30 @@ func TestBuildImagesRESTResponse(t *testing.T) {
 }
 
 // TestBuildImagesRESTResponse_ChainedCostParity 验证 AirGate 套 AirGate 时两级
-// 金额一致：下一级拿到 body 按 gpt-image-1.5 单价重算，应等于本级 fillCost 结果。
+// 金额一致：下一级拿到 body 按 gpt-image-1.5 单价重算，应等于本级结果。
 func TestBuildImagesRESTResponse_ChainedCostParity(t *testing.T) {
 	promptTokens := 12
 	imageOut := 1056
 	ws := WSResult{ImageGenCalls: []ImageGenCall{{Result: "X"}}}
 	body := buildImagesRESTResponse(ws, promptTokens, imageOut)
 
-	// 本级成本：用 fillCost 按 gpt-image-1.5 算
-	inner := &sdk.ForwardResult{
+	inner := &sdk.Usage{
 		Model:        "gpt-image-1.5",
 		InputTokens:  promptTokens,
 		OutputTokens: imageOut,
 	}
-	fillCost(inner)
+	fillUsageCost(inner)
 	innerCost := inner.InputCost + inner.OutputCost
 
-	// 下一级：从 body 读 usage + model，再按 fillCost 算
 	var got map[string]any
 	_ = json.Unmarshal(body, &got)
 	u := got["usage"].(map[string]any)
-	outer := &sdk.ForwardResult{
+	outer := &sdk.Usage{
 		Model:        got["model"].(string),
 		InputTokens:  int(u["input_tokens"].(float64)),
 		OutputTokens: int(u["output_tokens"].(float64)),
 	}
-	fillCost(outer)
+	fillUsageCost(outer)
 	outerCost := outer.InputCost + outer.OutputCost
 
 	if innerCost != outerCost {
@@ -634,7 +621,7 @@ func TestEstimateImageGenOutputTokens(t *testing.T) {
 }
 
 // TestForwardImagesViaResponsesTool_EmptyPrompt 客户端传空 prompt 时，
-// 翻译层应在未建立 WS 连接的情况下返回 400 + AccountStatus=OK，不伤账号状态。
+// 翻译层应在未建立 WS 连接的情况下返回 ClientError + 400，不伤账号状态。
 func TestForwardImagesViaResponsesTool_EmptyPrompt(t *testing.T) {
 	g := &OpenAIGateway{}
 	w := httptest.NewRecorder()
@@ -644,15 +631,15 @@ func TestForwardImagesViaResponsesTool_EmptyPrompt(t *testing.T) {
 		Headers: http.Header{},
 		Writer:  w,
 	}
-	result, err := g.forwardImagesViaResponsesTool(t.Context(), req)
+	outcome, err := g.forwardImagesViaResponsesTool(t.Context(), req)
 	if err != nil {
 		t.Fatalf("expected nil err for client-side issue, got %v", err)
 	}
-	if result.StatusCode != http.StatusBadRequest {
-		t.Errorf("StatusCode = %d, want 400", result.StatusCode)
+	if outcome.Kind != sdk.OutcomeClientError {
+		t.Errorf("Kind = %v, want OutcomeClientError", outcome.Kind)
 	}
-	if result.AccountStatus != sdk.AccountStatusOK {
-		t.Errorf("AccountStatus = %q, want OK (not a failure)", result.AccountStatus)
+	if outcome.Upstream.StatusCode != http.StatusBadRequest {
+		t.Errorf("Upstream.StatusCode = %d, want 400", outcome.Upstream.StatusCode)
 	}
 	if w.Code != http.StatusBadRequest {
 		t.Errorf("writer status = %d, want 400", w.Code)
