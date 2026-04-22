@@ -44,9 +44,36 @@ func (c *Client) conversationInit() error {
 
 // ---------- Step 2: /f/conversation/prepare 预校验 ----------
 
-func (c *Client) prepareConversation(prompt, chatToken, proofToken, convID, parentID string) (conduitToken string, err error) {
+func (c *Client) prepareConversation(prompt, chatToken, proofToken, convID, parentID string, imgs []*UploadedFile) (conduitToken string, err error) {
 	if parentID == "" {
 		parentID = uuid.New().String()
+	}
+
+	var contentPayload map[string]any
+	var systemHints []string
+	if len(imgs) > 0 {
+		parts := make([]any, 0, len(imgs)+1)
+		for _, img := range imgs {
+			parts = append(parts, map[string]any{
+				"content_type":  "image_asset_pointer",
+				"asset_pointer": "sediment://" + img.FileID,
+				"size_bytes":    img.Size,
+				"width":         img.Width,
+				"height":        img.Height,
+			})
+		}
+		parts = append(parts, prompt)
+		contentPayload = map[string]any{
+			"content_type": "multimodal_text",
+			"parts":        parts,
+		}
+		systemHints = []string{}
+	} else {
+		contentPayload = map[string]any{
+			"content_type": "text",
+			"parts":        []string{prompt},
+		}
+		systemHints = []string{"picture_v2"}
 	}
 
 	payload := map[string]any{
@@ -58,19 +85,16 @@ func (c *Client) prepareConversation(prompt, chatToken, proofToken, convID, pare
 		"timezone_offset_min":   -480,
 		"timezone":              "Asia/Shanghai",
 		"conversation_mode":     map[string]string{"kind": "primary_assistant"},
-		"system_hints":          []string{"picture_v2"},
+		"system_hints":          systemHints,
 		"supports_buffering":    true,
 		"supported_encodings":   []string{"v1"},
 		"client_contextual_info": map[string]any{
 			"app_name": "chatgpt.com",
 		},
 		"partial_query": map[string]any{
-			"id":     uuid.New().String(),
-			"author": map[string]string{"role": "user"},
-			"content": map[string]any{
-				"content_type": "text",
-				"parts":        []string{prompt},
-			},
+			"id":      uuid.New().String(),
+			"author":  map[string]string{"role": "user"},
+			"content": contentPayload,
 		},
 	}
 	if convID != "" {
@@ -115,13 +139,68 @@ type StreamResult struct {
 	ImageRefs      []string
 }
 
-func (c *Client) streamConversation(prompt, chatToken, conduitToken, proofToken, convID, parentID string) (*StreamResult, error) {
+func (c *Client) streamConversation(prompt, chatToken, conduitToken, proofToken, convID, parentID string, imgs []*UploadedFile) (*StreamResult, error) {
 	msgID := uuid.New().String()
 	parentMsgID := parentID
 	if parentMsgID == "" {
 		parentMsgID = uuid.New().String()
 	}
 	createTime := float64(time.Now().UnixMilli()) / 1000.0
+
+	var contentPayload map[string]any
+	var msgMetadata map[string]any
+	var systemHints []string
+
+	if len(imgs) > 0 {
+		parts := make([]any, 0, len(imgs)+1)
+		for _, img := range imgs {
+			parts = append(parts, map[string]any{
+				"content_type":  "image_asset_pointer",
+				"asset_pointer": "sediment://" + img.FileID,
+				"size_bytes":    img.Size,
+				"width":         img.Width,
+				"height":        img.Height,
+			})
+		}
+		parts = append(parts, prompt)
+		contentPayload = map[string]any{
+			"content_type": "multimodal_text",
+			"parts":        parts,
+		}
+		attachments := make([]map[string]any, 0, len(imgs))
+		for _, img := range imgs {
+			attachments = append(attachments, map[string]any{
+				"id":           img.FileID,
+				"size":         img.Size,
+				"name":         img.FileName,
+				"mime_type":    img.MimeType,
+				"width":        img.Width,
+				"height":       img.Height,
+				"source":       "local",
+				"is_big_paste": false,
+			})
+		}
+		msgMetadata = map[string]any{
+			"attachments":               attachments,
+			"selected_github_repos":     []any{},
+			"selected_all_github_repos": false,
+			"serialization_metadata":    map[string]any{"custom_symbol_offsets": []any{}},
+		}
+		systemHints = []string{}
+	} else {
+		contentPayload = map[string]any{
+			"content_type": "text",
+			"parts":        []string{prompt},
+		}
+		msgMetadata = map[string]any{
+			"developer_mode_connector_ids": []any{},
+			"selected_github_repos":        []any{},
+			"selected_all_github_repos":    false,
+			"system_hints":                 []string{"picture_v2"},
+			"serialization_metadata":       map[string]any{"custom_symbol_offsets": []any{}},
+		}
+		systemHints = []string{"picture_v2"}
+	}
 
 	payload := map[string]any{
 		"action": "next",
@@ -130,24 +209,13 @@ func (c *Client) streamConversation(prompt, chatToken, conduitToken, proofToken,
 				"id":          msgID,
 				"author":      map[string]string{"role": "user"},
 				"create_time": createTime,
-				"content": map[string]any{
-					"content_type": "text",
-					"parts":        []string{prompt},
-				},
-				"metadata": map[string]any{
-					"developer_mode_connector_ids": []any{},
-					"selected_github_repos":        []any{},
-					"selected_all_github_repos":    false,
-					"system_hints":                 []string{"picture_v2"},
-					"serialization_metadata": map[string]any{
-						"custom_symbol_offsets": []any{},
-					},
-				},
+				"content":     contentPayload,
+				"metadata":    msgMetadata,
 			},
 		},
 		"parent_message_id":                    parentMsgID,
 		"model":                                "auto",
-		"system_hints":                         []string{"picture_v2"},
+		"system_hints":                         systemHints,
 		"force_parallel_switch":                "auto",
 		"client_prepare_state":                 "sent",
 		"timezone_offset_min":                  -480,

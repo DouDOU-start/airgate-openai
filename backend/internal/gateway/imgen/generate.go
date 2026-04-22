@@ -34,7 +34,7 @@ type Result struct {
 //
 // 失败时返回 partial result：已经成功下载的图片会在 Result.Images 里，
 // error 指明哪一步失败。
-func (c *Client) GenerateImage(ctx context.Context, prompt string) (*Result, error) {
+func (c *Client) GenerateImage(ctx context.Context, prompt string, images []ImageInput) (*Result, error) {
 	prompt = strings.TrimSpace(prompt)
 	if prompt == "" {
 		return nil, fmt.Errorf("prompt 为空")
@@ -63,6 +63,23 @@ func (c *Client) GenerateImage(ctx context.Context, prompt string) (*Result, err
 		return nil, err
 	}
 
+	// Step 0.8: 上传参考图片（/edits 场景）
+	var uploaded []*UploadedFile
+	for i, img := range images {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		uf, err := c.uploadFile(img)
+		if err != nil {
+			return nil, fmt.Errorf("上传第 %d 张图片失败: %w", i+1, err)
+		}
+		uploaded = append(uploaded, uf)
+	}
+
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
 	// Step 1: chat requirements
 	cr, err := c.getChatRequirements()
 	if err != nil {
@@ -74,7 +91,7 @@ func (c *Client) GenerateImage(ctx context.Context, prompt string) (*Result, err
 	}
 
 	// Step 2: prepare（失败不致命，缺 conduit_token 也能跑）
-	conduitToken, err := c.prepareConversation(prompt, cr.ChatToken, cr.ProofToken, "", "")
+	conduitToken, err := c.prepareConversation(prompt, cr.ChatToken, cr.ProofToken, "", "", uploaded)
 	if err != nil {
 		log.Printf("[imgen] prepare 失败（继续尝试）: %v", err)
 	}
@@ -84,7 +101,7 @@ func (c *Client) GenerateImage(ctx context.Context, prompt string) (*Result, err
 	}
 
 	// Step 3: SSE 流式对话
-	sr, err := c.streamConversation(prompt, cr.ChatToken, conduitToken, cr.ProofToken, "", "")
+	sr, err := c.streamConversation(prompt, cr.ChatToken, conduitToken, cr.ProofToken, "", "", uploaded)
 	if err != nil {
 		return nil, fmt.Errorf("流式会话失败: %w", err)
 	}

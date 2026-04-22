@@ -15,6 +15,47 @@ import (
 	"github.com/DouDOU-start/airgate-openai/backend/internal/gateway/imgen"
 )
 
+// decodeImageRefs 把 parseImagesRequest 返回的 data URL / http URL 字符串列表
+// 转为 imgen.ImageInput 切片（内存中的原始二进制）。
+// 目前只支持 data URL（base64 编码）；http(s) URL 会跳过并 log 警告。
+func decodeImageRefs(refs []string) ([]imgen.ImageInput, error) {
+	if len(refs) == 0 {
+		return nil, nil
+	}
+	out := make([]imgen.ImageInput, 0, len(refs))
+	for _, ref := range refs {
+		if !strings.HasPrefix(ref, "data:") {
+			continue
+		}
+		// data:image/png;base64,iVBOR...
+		commaIdx := strings.Index(ref, ",")
+		if commaIdx < 0 {
+			continue
+		}
+		header := ref[:commaIdx] // "data:image/png;base64"
+		b64 := ref[commaIdx+1:]
+		data, err := base64.StdEncoding.DecodeString(b64)
+		if err != nil {
+			data, err = base64.RawStdEncoding.DecodeString(b64)
+			if err != nil {
+				return nil, fmt.Errorf("base64 解码失败: %w", err)
+			}
+		}
+		mime := ""
+		if strings.HasPrefix(header, "data:") {
+			mime = strings.TrimPrefix(header, "data:")
+			if semi := strings.Index(mime, ";"); semi >= 0 {
+				mime = mime[:semi]
+			}
+		}
+		out = append(out, imgen.ImageInput{
+			Data:     data,
+			MimeType: mime,
+		})
+	}
+	return out, nil
+}
+
 // imagesWebReverseModel 专用于触发 chatgpt.com 网页端逆向通道的 model id。
 // 客户端在 /v1/images/generations 的 body 里把 "model" 设成这个值，OAuth 账号
 // 就会走 forwardImagesViaWebReverse，绕开 Responses API + image_generation tool。
@@ -35,7 +76,8 @@ func isImagesWebReverseModel(model string) bool {
 // 支持的字段（/v1/images/generations）：
 //   - prompt：必填
 //   - n：忽略，chatgpt.com 一次只返回 1 张（灰度桶可能返回 2 张，都算终稿）
-//   - size / quality / background / output_format：忽略，Web 逆向不支持这些参数
+//   - size：通过在 prompt 前注入尺寸提示引导模型输出对应分辨率
+//   - quality / background / output_format：忽略，Web 逆向不支持这些参数
 //
 // /v1/images/edits 目前不支持（网页端需要 attach image 的入口，协议结构不同，
 // 后续若要支持单独开一个 forwardImagesEditsViaWebReverse 入口）。
@@ -44,15 +86,21 @@ func (g *OpenAIGateway) forwardImagesViaWebReverse(ctx context.Context, req *sdk
 	account := req.Account
 
 	_, reqPath := resolveAPIKeyRoute(req)
-	if isImagesEditRequest(reqPath) {
-		return webReverseImagesError(start, http.StatusBadRequest, req.Writer,
-			"gpt-image-2 暂不支持 /v1/images/edits，请使用 /v1/images/generations")
-	}
+	isEdit := isImagesEditRequest(reqPath)
 
-	imgReq, err := parseImagesRequest(req.Body, req.Headers.Get("Content-Type"), false)
+	imgReq, err := parseImagesRequest(req.Body, req.Headers.Get("Content-Type"), isEdit)
 	if err != nil {
 		return webReverseImagesError(start, http.StatusBadRequest, req.Writer,
 			fmt.Sprintf("解析 Images 请求失败: %v", err))
+	}
+
+	var imageInputs []imgen.ImageInput
+	if isEdit && len(imgReq.Images) > 0 {
+		imageInputs, err = decodeImageRefs(imgReq.Images)
+		if err != nil {
+			return webReverseImagesError(start, http.StatusBadRequest, req.Writer,
+				fmt.Sprintf("解码参考图片失败: %v", err))
+		}
 	}
 
 	accessToken := account.Credentials["access_token"]
@@ -67,7 +115,8 @@ func (g *OpenAIGateway) forwardImagesViaWebReverse(ctx context.Context, req *sdk
 	}
 	client := imgen.NewClient(accessToken, proxyURL)
 
-	imgRes, err := client.GenerateImage(ctx, imgReq.Prompt)
+	prompt := applyWebReverseSizeHint(imgReq.Prompt, imgReq.Size)
+	imgRes, err := client.GenerateImage(ctx, prompt, imageInputs)
 	if err != nil {
 		if imgRes == nil || len(imgRes.Images) == 0 {
 			status := classifyWebReverseError(err)
@@ -83,8 +132,15 @@ func (g *OpenAIGateway) forwardImagesViaWebReverse(ctx context.Context, req *sdk
 	}
 
 	promptTokens := estimatePromptTokens(imgReq.Prompt)
-	// 网页端无 size/quality，按 medium 1024×1024 估算每张 output tokens
-	perImgOutTokens := lookupImageGenOutputTokens("1024x1024", "medium")
+	sizeForTokens := imgReq.Size
+	if sizeForTokens == "" {
+		sizeForTokens = "1024x1024"
+	}
+	qualityForTokens := imgReq.Quality
+	if qualityForTokens == "" {
+		qualityForTokens = "medium"
+	}
+	perImgOutTokens := lookupImageGenOutputTokens(sizeForTokens, qualityForTokens)
 	outputTokens := perImgOutTokens * len(imgRes.Images)
 
 	respBody := buildWebReverseImagesResponse(imgRes, promptTokens, outputTokens)
@@ -171,6 +227,23 @@ func webReverseImagesError(start time.Time, status int, w http.ResponseWriter, m
 		Duration: time.Since(start),
 	}
 	return outcome, fmt.Errorf("%s", msg)
+}
+
+// webReverseSizeHints 把 OpenAI API 的 size 参数映射为 prompt 前缀提示。
+var webReverseSizeHints = map[string]string{
+	"1024x1024": "Generate a square image (1024x1024). ",
+	"1024x1536": "Generate a portrait image (1024x1536). ",
+	"1536x1024": "Generate a landscape image (1536x1024). ",
+	"512x512":   "Generate a square image (512x512). ",
+	"256x256":   "Generate a small square image (256x256). ",
+}
+
+func applyWebReverseSizeHint(prompt, size string) string {
+	size = strings.ToLower(strings.TrimSpace(size))
+	if hint, ok := webReverseSizeHints[size]; ok {
+		return hint + prompt
+	}
+	return prompt
 }
 
 // classifyWebReverseError 根据 err.Error() 文本判定 HTTP 状态码。
