@@ -49,6 +49,24 @@ func (g *OpenAIGateway) forwardHTTP(ctx context.Context, req *sdk.ForwardRequest
 
 	account := req.Account
 
+	if isImagesRequest(reqPath) && !isImageEnabled(req.Headers) {
+		body := jsonError("当前分组未开启图片生成功能")
+		if req.Writer != nil {
+			req.Writer.Header().Set("Content-Type", "application/json")
+			req.Writer.WriteHeader(http.StatusForbidden)
+			_, _ = req.Writer.Write(body)
+		}
+		return sdk.ForwardOutcome{
+			Kind: sdk.OutcomeClientError,
+			Upstream: sdk.UpstreamResponse{
+				StatusCode: http.StatusForbidden,
+				Headers:    http.Header{"Content-Type": []string{"application/json"}},
+				Body:       body,
+			},
+			Reason: "分组未开启 image_enabled",
+		}, nil
+	}
+
 	if account.Credentials["api_key"] != "" {
 		return g.forwardAPIKey(ctx, req)
 	}
@@ -63,6 +81,12 @@ func (g *OpenAIGateway) forwardHTTP(ctx context.Context, req *sdk.ForwardRequest
 	}
 	reason := "账号缺少 api_key 或 access_token"
 	return accountDeadOutcome(reason), fmt.Errorf("%s", reason)
+}
+
+// isImageEnabled 检查分组是否开启了图片生成功能。
+// Core 通过 X-Airgate-Plugin-Openai-Image-Enabled 头传递分组的 plugin_settings。
+func isImageEnabled(headers http.Header) bool {
+	return strings.EqualFold(headers.Get("X-Airgate-Plugin-Openai-Image-Enabled"), "true")
 }
 
 // isModelsListingRequest 判断当前请求是否为 GET /v1/models。
@@ -432,13 +456,7 @@ func (g *OpenAIGateway) forwardOAuth(ctx context.Context, req *sdk.ForwardReques
 		Model:                 result.Model,
 		FirstTokenMs:          firstTokenMs,
 	}
-	toolImageIn := result.ToolImageInputTokens
-	toolImageOut := result.ToolImageOutputTokens
-	// ChatGPT OAuth 下 tool_usage.image_gen 永远为 0；只要流里出现了
-	// image_generation_call output item，就按 size×quality 估算 token 计入账单。
-	if toolImageOut == 0 && len(result.ImageGenCalls) > 0 {
-		toolImageOut = estimateImageGenOutputTokens(result.ImageGenCalls)
-	}
+	numImages := len(result.ImageGenCalls)
 
 	if result.Err != nil {
 		var failure *responsesFailureError
@@ -465,7 +483,7 @@ func (g *OpenAIGateway) forwardOAuth(ctx context.Context, req *sdk.ForwardReques
 		}, result.Err
 	}
 
-	fillUsageCostWithImageTool(usage, toolImageIn, toolImageOut)
+	fillUsageCostWithImageTool(usage, numImages)
 	return sdk.ForwardOutcome{
 		Kind:     sdk.OutcomeSuccess,
 		Upstream: sdk.UpstreamResponse{StatusCode: http.StatusOK},

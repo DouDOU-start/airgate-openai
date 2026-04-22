@@ -134,6 +134,16 @@ func estimatePromptTokens(prompt string) int {
 	return (runes + 2) / 3
 }
 
+// estimateImageCountFromTokens 从 image output token 数反推生成的图片张数。
+// 用于 API Key 直通路径，该路径没有显式的图片计数。
+// 1024×1024 medium ≈ 1056 tokens/张，取 1000 做除数向上取整。
+func estimateImageCountFromTokens(outputTokens int) int {
+	if outputTokens <= 0 {
+		return 0
+	}
+	return (outputTokens + 999) / 1000
+}
+
 // imagesRequest 归一化后的 Images API 请求（同时承载 /generations 与 /edits）。
 // /generations 只需要 Prompt；/edits 额外携带 Images（参考图）与可选 Mask（inpainting 掩膜）。
 type imagesRequest struct {
@@ -524,14 +534,9 @@ func (g *OpenAIGateway) forwardImagesViaResponsesTool(ctx context.Context, req *
 		}, fmt.Errorf("image_generation_call 为空 (n=%d)", n)
 	}
 
-	// ChatGPT OAuth 下 tool_usage.image_gen.output_tokens 永远 0；用 size×quality→tokens 换算。
-	toolOut := wsResult.ToolImageOutputTokens
-	if toolOut == 0 {
-		toolOut = estimateImageGenOutputTokens(wsResult.ImageGenCalls)
-	}
-	usage.OutputTokens = toolOut
+	numImages := len(wsResult.ImageGenCalls)
 
-	respBody := buildImagesRESTResponse(wsResult, promptTokens, toolOut)
+	respBody := buildImagesRESTResponse(wsResult, promptTokens, 0)
 	outcome := sdk.ForwardOutcome{
 		Kind:     sdk.OutcomeSuccess,
 		Upstream: sdk.UpstreamResponse{StatusCode: http.StatusOK},
@@ -547,7 +552,7 @@ func (g *OpenAIGateway) forwardImagesViaResponsesTool(ctx context.Context, req *
 		outcome.Upstream.Headers = http.Header{"Content-Type": []string{"application/json"}}
 	}
 
-	fillUsageCost(usage)
+	fillUsageCostPerImage(usage, numImages)
 	return outcome, nil
 }
 
@@ -643,6 +648,11 @@ func handleImagesResponse(resp *http.Response, w http.ResponseWriter, start time
 		modelName = fallbackModel
 	}
 
+	numImages := int(gjson.GetBytes(body, "data.#").Int())
+	if numImages <= 0 {
+		numImages = 1
+	}
+
 	elapsed := time.Since(start)
 	usage := &sdk.Usage{
 		InputTokens:       parsed.inputTokens,
@@ -651,7 +661,7 @@ func handleImagesResponse(resp *http.Response, w http.ResponseWriter, start time
 		Model:             modelName,
 		FirstTokenMs:      elapsed.Milliseconds(),
 	}
-	fillUsageCost(usage)
+	fillUsageCostPerImage(usage, numImages)
 
 	outcome := sdk.ForwardOutcome{
 		Kind:     sdk.OutcomeSuccess,

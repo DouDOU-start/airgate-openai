@@ -102,34 +102,33 @@ func fillUsageCost(usage *sdk.Usage) {
 	usage.CachedInputPrice = spec.CachedPrice
 }
 
-// fillUsageCostWithImageTool 叠加 Responses API image_generation 工具的独立单价。
-// 主 model（gpt-5.4 等）用 fillUsageCost 算；image_generation 工具的输入 / 输出 token
-// 按 gpt-image-1.5 定价单独计算后叠加到 *Cost 字段。
-func fillUsageCostWithImageTool(usage *sdk.Usage, toolImageInputTokens, toolImageOutputTokens int) {
+// fillUsageCostPerImage 按张计费模式填充 Usage。
+// 用于 /v1/images/generations 和 /v1/images/edits 等专用图像端点，
+// usage.Model 必须是注册了 ImagePrice 的模型。
+func fillUsageCostPerImage(usage *sdk.Usage, numImages int) {
+	if usage == nil || usage.Model == "" || numImages <= 0 {
+		return
+	}
+	spec := model.Lookup(usage.Model)
+	if spec.ImagePrice <= 0 {
+		fillUsageCost(usage)
+		return
+	}
+	usage.OutputCost = float64(numImages) * spec.ImagePrice
+	usage.InputCost = 0
+	usage.OutputPrice = spec.ImagePrice
+}
+
+// fillUsageCostWithImageTool 先按主 model 定价算 token 成本，再叠加图像按张费用。
+// numImages 是本次请求实际生成的图片张数（0 表示无图像工具调用）。
+func fillUsageCostWithImageTool(usage *sdk.Usage, numImages int) {
 	fillUsageCost(usage)
-	if usage == nil || toolImageInputTokens+toolImageOutputTokens <= 0 {
+	if usage == nil || numImages <= 0 {
 		return
 	}
 	imageSpec := model.Lookup(imageToolCostModel)
-	if imageSpec.InputPrice == 0 && imageSpec.OutputPrice == 0 {
-		return // 未注册的 image 模型：跳过叠加避免漏计变成错计 $0
+	if imageSpec.ImagePrice <= 0 {
+		return
 	}
-	imgModelInfo := sdk.ModelInfo{
-		InputPrice:          imageSpec.InputPrice,
-		OutputPrice:         imageSpec.OutputPrice,
-		CachedInputPrice:    imageSpec.CachedPrice,
-		InputPricePriority:  imageSpec.InputPricePriority,
-		OutputPricePriority: imageSpec.OutputPricePriority,
-		InputPriceFlex:      imageSpec.InputPriceFlex,
-		OutputPriceFlex:     imageSpec.OutputPriceFlex,
-	}
-	toolCost := sdk.CalculateCost(sdk.CostInput{
-		InputTokens:  toolImageInputTokens,
-		OutputTokens: toolImageOutputTokens,
-		ServiceTier:  usage.ServiceTier,
-	}, imgModelInfo)
-	usage.InputCost += toolCost.InputCost
-	usage.OutputCost += toolCost.OutputCost
-	usage.InputTokens += toolImageInputTokens
-	usage.OutputTokens += toolImageOutputTokens
+	usage.OutputCost += float64(numImages) * imageSpec.ImagePrice
 }

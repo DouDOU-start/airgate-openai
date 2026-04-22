@@ -131,19 +131,9 @@ func (g *OpenAIGateway) forwardImagesViaWebReverse(ctx context.Context, req *sdk
 		g.logger.Warn("imgen 生成部分失败，使用已下载图片", "err", err, "count", len(imgRes.Images))
 	}
 
-	promptTokens := estimatePromptTokens(imgReq.Prompt)
-	sizeForTokens := imgReq.Size
-	if sizeForTokens == "" {
-		sizeForTokens = "1024x1024"
-	}
-	qualityForTokens := imgReq.Quality
-	if qualityForTokens == "" {
-		qualityForTokens = "medium"
-	}
-	perImgOutTokens := lookupImageGenOutputTokens(sizeForTokens, qualityForTokens)
-	outputTokens := perImgOutTokens * len(imgRes.Images)
+	numImages := len(imgRes.Images)
 
-	respBody := buildWebReverseImagesResponse(imgRes, promptTokens, outputTokens)
+	respBody := buildWebReverseImagesResponse(imgRes, 0, 0)
 	if w := req.Writer; w != nil {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
@@ -152,12 +142,10 @@ func (g *OpenAIGateway) forwardImagesViaWebReverse(ctx context.Context, req *sdk
 
 	elapsed := time.Since(start)
 	usage := &sdk.Usage{
-		InputTokens:  promptTokens,
-		OutputTokens: outputTokens,
 		Model:        imagesWebReverseModel,
 		FirstTokenMs: elapsed.Milliseconds(),
 	}
-	fillUsageCost(usage)
+	fillUsageCostPerImage(usage, numImages)
 
 	outcome := sdk.ForwardOutcome{
 		Kind:     sdk.OutcomeSuccess,

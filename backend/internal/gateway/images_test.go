@@ -88,15 +88,12 @@ func TestHandleImagesResponse_TokenAttribution(t *testing.T) {
 		t.Errorf("CachedInputTokens = %d, want 10", u.CachedInputTokens)
 	}
 
-	// gpt-image-1.5 standard: input=$5/1M, cached=$1.25/1M, output=$40/1M
-	if !almostEqual(u.InputCost, 0.0002, 1e-9) {
-		t.Errorf("InputCost = %v, want 0.0002", u.InputCost)
+	// 按张计费：data 数组有 1 张图 × $0.20 = 0.20
+	if !almostEqual(u.InputCost, 0, 1e-9) {
+		t.Errorf("InputCost = %v, want 0 (per-image billing)", u.InputCost)
 	}
-	if !almostEqual(u.CachedInputCost, 0.0000125, 1e-9) {
-		t.Errorf("CachedInputCost = %v, want 0.0000125", u.CachedInputCost)
-	}
-	if !almostEqual(u.OutputCost, 0.1664, 1e-9) {
-		t.Errorf("OutputCost = %v, want 0.1664", u.OutputCost)
+	if !almostEqual(u.OutputCost, 0.20, 1e-9) {
+		t.Errorf("OutputCost = %v, want 0.20 (1 image × $0.20)", u.OutputCost)
 	}
 
 	if w.Code != http.StatusOK {
@@ -137,21 +134,18 @@ func TestHandleImagesResponse_FallbackModelWhenBodyLacksModel(t *testing.T) {
 	}
 }
 
-// TestFillUsageCost_GPTImage1_Priority priority 档 ≈ standard × 2。
-func TestFillUsageCost_GPTImage1_Priority(t *testing.T) {
+// TestFillUsageCostPerImage 按张计费。
+func TestFillUsageCostPerImage(t *testing.T) {
 	usage := &sdk.Usage{
-		Model:        "gpt-image-1",
-		InputTokens:  100,
-		OutputTokens: 1000,
-		ServiceTier:  "priority",
+		Model: "gpt-image-1",
 	}
-	fillUsageCost(usage)
-	// priority: input=$10/1M, output=$80/1M
-	if !almostEqual(usage.InputCost, 0.001, 1e-9) {
-		t.Errorf("InputCost = %v, want 0.001", usage.InputCost)
+	fillUsageCostPerImage(usage, 3)
+	// 3 张 × $0.20 = 0.60
+	if !almostEqual(usage.OutputCost, 0.60, 1e-9) {
+		t.Errorf("OutputCost = %v, want 0.60", usage.OutputCost)
 	}
-	if !almostEqual(usage.OutputCost, 0.08, 1e-9) {
-		t.Errorf("OutputCost = %v, want 0.08", usage.OutputCost)
+	if !almostEqual(usage.InputCost, 0, 1e-9) {
+		t.Errorf("InputCost = %v, want 0", usage.InputCost)
 	}
 }
 
@@ -210,30 +204,24 @@ func TestParseSSEUsage_ToolImageGen(t *testing.T) {
 }
 
 // TestFillUsageCostWithImageTool 叠加计费：主 model (gpt-5.4) 的 chat token 按
-// 其单价、tool_usage 的图像 token 按 gpt-image-1.5 单价分别结算。
+// 其单价、image tool 按张计费 $0.20/张。
 func TestFillUsageCostWithImageTool(t *testing.T) {
 	usage := &sdk.Usage{
 		Model:        "gpt-5.4",
 		InputTokens:  1000,
 		OutputTokens: 500,
 	}
-	fillUsageCostWithImageTool(usage, 10, 4160)
+	fillUsageCostWithImageTool(usage, 1)
 
-	// 主 gpt-5.4 standard: input=$2.5/1M, output=$15/1M
-	// image tool gpt-image-1.5 standard: input=$5/1M, output=$40/1M
-	// total InputCost  = 0.0025 + 0.00005  = 0.00255
-	// total OutputCost = 0.0075 + 0.1664   = 0.1739
-	if !almostEqual(usage.InputCost, 0.00255, 1e-9) {
-		t.Errorf("InputCost = %v, want 0.00255", usage.InputCost)
+	// 主 gpt-5.4 standard: input=$2.5/1M → 0.0025, output=$15/1M → 0.0075
+	// image tool: 1 张 × $0.20 = 0.20
+	// total InputCost  = 0.0025
+	// total OutputCost = 0.0075 + 0.20 = 0.2075
+	if !almostEqual(usage.InputCost, 0.0025, 1e-9) {
+		t.Errorf("InputCost = %v, want 0.0025", usage.InputCost)
 	}
-	if !almostEqual(usage.OutputCost, 0.1739, 1e-9) {
-		t.Errorf("OutputCost = %v, want 0.1739", usage.OutputCost)
-	}
-	if usage.InputTokens != 1010 {
-		t.Errorf("InputTokens = %d, want 1010 (1000 + 10)", usage.InputTokens)
-	}
-	if usage.OutputTokens != 4660 {
-		t.Errorf("OutputTokens = %d, want 4660 (500 + 4160)", usage.OutputTokens)
+	if !almostEqual(usage.OutputCost, 0.2075, 1e-9) {
+		t.Errorf("OutputCost = %v, want 0.2075", usage.OutputCost)
 	}
 	if !almostEqual(usage.InputPrice, 2.5, 1e-9) {
 		t.Errorf("InputPrice = %v, want 2.5 (gpt-5.4 standard)", usage.InputPrice)
@@ -247,7 +235,7 @@ func TestFillUsageCostWithImageTool_NoToolUsage(t *testing.T) {
 		InputTokens:  1000,
 		OutputTokens: 500,
 	}
-	fillUsageCostWithImageTool(usage, 0, 0)
+	fillUsageCostWithImageTool(usage, 0)
 	if usage.InputTokens != 1000 || usage.OutputTokens != 500 {
 		t.Errorf("token counts mutated when no image tool usage")
 	}

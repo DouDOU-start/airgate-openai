@@ -41,7 +41,7 @@ func handleStreamResponse(resp *http.Response, w http.ResponseWriter, start time
 	scanner.Buffer(make([]byte, 64*1024), upstreamSSEMaxLineBytes)
 	var streamErr error
 	firstTokenRecorded := false
-	var toolImageIn, toolImageOut int
+	var toolImageIn, toolImageOut int // kept for SSE parsing compatibility
 
 	for scanner.Scan() {
 		line := scanner.Text()
@@ -97,7 +97,8 @@ func handleStreamResponse(resp *http.Response, w http.ResponseWriter, start time
 		}, streamErr
 	}
 
-	fillUsageCostWithImageTool(usage, toolImageIn, toolImageOut)
+	numImages := estimateImageCountFromTokens(toolImageOut)
+	fillUsageCostWithImageTool(usage, numImages)
 	return sdk.ForwardOutcome{
 		Kind:     sdk.OutcomeSuccess,
 		Upstream: sdk.UpstreamResponse{StatusCode: resp.StatusCode},
@@ -134,7 +135,7 @@ func handleNonStreamResponse(resp *http.Response, w http.ResponseWriter, start t
 		Model:                 gjson.GetBytes(body, "model").String(),
 		FirstTokenMs:          elapsed.Milliseconds(),
 	}
-	fillUsageCostWithImageTool(usage, parsed.toolImageInputTokens, parsed.toolImageOutputTokens)
+	fillUsageCostWithImageTool(usage, estimateImageCountFromTokens(parsed.toolImageOutputTokens))
 
 	outcome := sdk.ForwardOutcome{
 		Kind:     sdk.OutcomeSuccess,
