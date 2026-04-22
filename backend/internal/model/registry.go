@@ -102,20 +102,46 @@ var registry = map[string]Spec{
 	"gpt-image-2": std("GPT Image 2 (Web Reverse)", 32000, 0, 5.0, 1.25, 40.0),
 }
 
-// DefaultSpec 未注册模型的兜底值
-var DefaultSpec = Spec{
-	Name:            "Unknown",
-	ContextWindow:   272000,
-	MaxOutputTokens: 128000,
-}
+// DefaultSpec 未注册模型的最终兜底值。按 gpt-5.4 标准档计价——宁可略高也不能 0。
+// （0 价格会导致免费流量，之前一个 bug 来源。）
+var DefaultSpec = withLongCtx(std("Unknown (billed as gpt-5.4)", 272000, 128000, 2.5, 0.25, 15.0))
 
-// Lookup 查询模型元数据，未找到返回默认值
+// Lookup 查询模型元数据。未命中注册表时按关键字推断到最接近的系列，仍无法匹配再落 DefaultSpec。
+//
+// 这避免了"客户端请求未知模型 → Spec 全 0 → cost=0 免费使用"的坑：只要能看出系列
+// （mini / codex / image / gpt-5 等），就按对应系列定价；彻底不认识的兜底到 GPT-5.4 标准价。
 func Lookup(modelID string) Spec {
 	id := strings.ToLower(strings.TrimSpace(modelID))
 	if spec, ok := registry[id]; ok {
 		return spec
 	}
+	if spec, ok := fallbackByKeyword(id); ok {
+		return spec
+	}
 	return DefaultSpec
+}
+
+// fallbackByKeyword 从模型 ID 关键字推断最接近的已注册系列。未命中返回 (_, false)。
+func fallbackByKeyword(id string) (Spec, bool) {
+	if id == "" {
+		return Spec{}, false
+	}
+	// 顺序敏感：先细分（codex / mini / image）后粗分（gpt-5 / gpt-4）
+	switch {
+	case strings.Contains(id, "codex"):
+		return registry["gpt-5.3-codex"], true
+	case strings.Contains(id, "image"):
+		return registry["gpt-image-1.5"], true
+	case strings.Contains(id, "mini") || strings.Contains(id, "nano"):
+		return registry["gpt-5.4-mini"], true
+	case strings.Contains(id, "gpt-5") || strings.HasPrefix(id, "gpt5") ||
+		strings.Contains(id, "o1") || strings.Contains(id, "o3") || strings.Contains(id, "o4"):
+		return registry["gpt-5.4"], true
+	case strings.Contains(id, "gpt-4") || strings.HasPrefix(id, "gpt4"):
+		// gpt-4 系列未显式注册，按 gpt-5.4 标准价计（偏保守）
+		return registry["gpt-5.4"], true
+	}
+	return Spec{}, false
 }
 
 // IsKnown 判断给定 model ID 是否在注册表内（大小写不敏感、忽略首尾空白）。
