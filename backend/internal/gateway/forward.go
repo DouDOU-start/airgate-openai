@@ -61,7 +61,8 @@ func (g *OpenAIGateway) forwardHTTP(ctx context.Context, req *sdk.ForwardRequest
 		}
 		return g.forwardOAuth(ctx, req)
 	}
-	return sdk.ForwardOutcome{}, fmt.Errorf("账号缺少 api_key 或 access_token")
+	reason := "账号缺少 api_key 或 access_token"
+	return accountDeadOutcome(reason), fmt.Errorf("%s", reason)
 }
 
 // isModelsListingRequest 判断当前请求是否为 GET /v1/models。
@@ -128,7 +129,8 @@ func (g *OpenAIGateway) forwardAPIKey(ctx context.Context, req *sdk.ForwardReque
 
 	upstreamReq, err := http.NewRequestWithContext(ctx, reqMethod, targetURL, bodyReader)
 	if err != nil {
-		return sdk.ForwardOutcome{}, fmt.Errorf("构建上游请求失败: %w", err)
+		reason := fmt.Sprintf("构建上游请求失败: %v", err)
+		return transientOutcome(reason), fmt.Errorf("%s", reason)
 	}
 
 	setAuthHeaders(upstreamReq, account)
@@ -286,7 +288,8 @@ func (g *OpenAIGateway) forwardOAuth(ctx context.Context, req *sdk.ForwardReques
 	// 构建 response.create 消息
 	createMsg, err := g.buildWSRequest(req, session)
 	if err != nil {
-		return sdk.ForwardOutcome{}, fmt.Errorf("构建 WebSocket 请求失败: %w", err)
+		reason := fmt.Sprintf("构建 WebSocket 请求失败: %v", err)
+		return transientOutcome(reason), fmt.Errorf("%s", reason)
 	}
 
 	// 协议分叉：客户端如果走的是 /v1/chat/completions（而不是原生 /v1/responses），
@@ -352,7 +355,7 @@ func (g *OpenAIGateway) forwardOAuth(ctx context.Context, req *sdk.ForwardReques
 
 	result, err := runAttempt(createMsg, w)
 	if err != nil {
-		return sdk.ForwardOutcome{}, err
+		return transientOutcome(err.Error()), err
 	}
 	if session.SessionKey != "" {
 		if result.ResponseID != "" {

@@ -54,6 +54,15 @@ func transientOutcome(reason string) sdk.ForwardOutcome {
 	}
 }
 
+// accountDeadOutcome 账号级确定性失败（凭证缺失、账号配置错误等），核心会把账号打入 disabled。
+func accountDeadOutcome(reason string) sdk.ForwardOutcome {
+	return sdk.ForwardOutcome{
+		Kind:     sdk.OutcomeAccountDead,
+		Upstream: sdk.UpstreamResponse{StatusCode: http.StatusUnauthorized},
+		Reason:   reason,
+	}
+}
+
 // fillUsageCost 用主 model 定价填充 Usage 的成本字段。
 //
 // 使用 SDK.CalculateCost 统一处理 standard / priority / flex 三档和 gpt-5.4 家族的长上下文阶梯。

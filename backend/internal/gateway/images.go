@@ -458,7 +458,8 @@ func (g *OpenAIGateway) forwardImagesViaResponsesTool(ctx context.Context, req *
 	}
 
 	if err := conn.WriteJSON(json.RawMessage(createMsg)); err != nil {
-		return sdk.ForwardOutcome{}, fmt.Errorf("发送 WebSocket 消息失败: %w", err)
+		reason := fmt.Sprintf("发送 WebSocket 消息失败: %v", err)
+		return transientOutcome(reason), fmt.Errorf("%s", reason)
 	}
 
 	handler := &imagesSilentHandler{accountID: account.ID, start: start}
@@ -622,7 +623,8 @@ func buildImagesErrorBody(status int, message string) []byte {
 func handleImagesResponse(resp *http.Response, w http.ResponseWriter, start time.Time, fallbackModel string) (sdk.ForwardOutcome, error) {
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return sdk.ForwardOutcome{}, fmt.Errorf("读取 Images 响应失败: %w", err)
+		reason := fmt.Sprintf("读取 Images 响应失败: %v", err)
+		return transientOutcome(reason), fmt.Errorf("%s", reason)
 	}
 
 	parsed := parseUsage(body)

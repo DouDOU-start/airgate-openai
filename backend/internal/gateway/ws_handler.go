@@ -23,7 +23,8 @@ func (g *OpenAIGateway) HandleWebSocket(ctx context.Context, conn sdk.WebSocketC
 	start := time.Now()
 	info := conn.ConnectInfo()
 	if info.Account == nil {
-		return sdk.ForwardOutcome{}, fmt.Errorf("未提供账户信息")
+		reason := "未提供账户信息"
+		return transientOutcome(reason), fmt.Errorf("%s", reason)
 	}
 
 	account := info.Account
@@ -35,7 +36,8 @@ func (g *OpenAIGateway) HandleWebSocket(ctx context.Context, conn sdk.WebSocketC
 	} else if account.Credentials["api_key"] != "" {
 		dialInfo, err = g.handleWSWithAPIKey(ctx, conn, account)
 	} else {
-		return sdk.ForwardOutcome{}, fmt.Errorf("账号缺少 api_key 或 access_token")
+		reason := "账号缺少 api_key 或 access_token"
+		return accountDeadOutcome(reason), fmt.Errorf("%s", reason)
 	}
 
 	elapsed := time.Since(start)

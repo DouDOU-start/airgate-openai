@@ -312,7 +312,8 @@ func (g *OpenAIGateway) forwardAnthropicResponses(
 
 	upstreamReq, err := g.buildAnthropicUpstreamRequest(ctx, req, account, responsesBody, session)
 	if err != nil {
-		return sdk.ForwardOutcome{}, nil, fmt.Errorf("构建上游请求失败: %w", err)
+		reason := fmt.Sprintf("构建上游请求失败: %v", err)
+		return transientOutcome(reason), nil, fmt.Errorf("%s", reason)
 	}
 
 	client := g.buildHTTPClient(account)
@@ -439,16 +440,19 @@ func (g *OpenAIGateway) handleAnthropicNonStreamFromResponses(
 				Duration:   time.Since(start),
 			}, nil
 		}
-		return sdk.ForwardOutcome{}, wsResult.Err
+		// 非 *responsesFailureError 的 err（典型：SSE EOF 提前断流）→ UpstreamTransient，可 failover。
+		return transientOutcome(wsResult.Err.Error()), wsResult.Err
 	}
 	if len(wsResult.CompletedEventRaw) == 0 {
-		return sdk.ForwardOutcome{}, fmt.Errorf("未收到 response.completed 事件")
+		reason := "未收到 response.completed 事件"
+		return transientOutcome(reason), fmt.Errorf("%s", reason)
 	}
 
 	// 客户端响应体使用原始 Claude 模型名；传入 wsResult 兜底用 delta 累积
 	anthropicJSON := convertResponsesCompletedToAnthropicJSON(wsResult.CompletedEventRaw, originalRequest, model, &wsResult)
 	if anthropicJSON == "" {
-		return sdk.ForwardOutcome{}, fmt.Errorf("responses 非流回译失败")
+		reason := "responses 非流回译失败"
+		return transientOutcome(reason), fmt.Errorf("%s", reason)
 	}
 	if session.SessionKey != "" && wsResult.ResponseID != "" {
 		updateSessionStateResponseID(session.SessionKey, wsResult.ResponseID)

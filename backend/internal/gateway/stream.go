@@ -110,7 +110,8 @@ func handleStreamResponse(resp *http.Response, w http.ResponseWriter, start time
 func handleNonStreamResponse(resp *http.Response, w http.ResponseWriter, start time.Time) (sdk.ForwardOutcome, error) {
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return sdk.ForwardOutcome{}, fmt.Errorf("读取上游响应失败: %w", err)
+		reason := fmt.Sprintf("读取上游响应失败: %v", err)
+		return transientOutcome(reason), fmt.Errorf("%s", reason)
 	}
 
 	parsed := parseUsage(body)
