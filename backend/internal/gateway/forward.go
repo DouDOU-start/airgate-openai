@@ -170,9 +170,17 @@ func (g *OpenAIGateway) forwardAPIKey(ctx context.Context, req *sdk.ForwardReque
 	}
 	passHeadersForAccount(req.Headers, upstreamReq.Header, account)
 
+	var ka *imageKeepAlive
+	if isImagesRequest(reqPath) {
+		ka = startImageKeepAlive(req.Writer)
+	}
+
 	client := g.buildHTTPClient(account)
 	resp, err := client.Do(upstreamReq)
 	if err != nil {
+		if ka != nil {
+			ka.Finish(http.StatusBadGateway, buildImagesErrorBody(http.StatusBadGateway, err.Error()))
+		}
 		// 网络层错误，无上游 HTTP 响应
 		return transientOutcome(err.Error()), fmt.Errorf("请求上游失败: %w", err)
 	}
@@ -181,6 +189,9 @@ func (g *OpenAIGateway) forwardAPIKey(ctx context.Context, req *sdk.ForwardReque
 	// 非 2xx 统一走 failureOutcome 归类。包含 4xx（客户端错）/ 429 / 401 / 403 / 5xx。
 	if resp.StatusCode >= 400 {
 		respBody, _ := io.ReadAll(resp.Body)
+		if ka != nil {
+			ka.Finish(resp.StatusCode, respBody)
+		}
 		errDetail := gjson.GetBytes(respBody, "error.message").String()
 		if errDetail == "" {
 			errDetail = truncate(string(respBody), 200)
@@ -202,7 +213,7 @@ func (g *OpenAIGateway) forwardAPIKey(ctx context.Context, req *sdk.ForwardReque
 
 	// Images API 响应体无 model 字段，另走专用处理器回填后再 fillCost
 	if isImagesRequest(reqPath) {
-		return handleImagesResponse(resp, req.Writer, start, req.Model)
+		return handleImagesResponse(resp, req.Writer, ka, start, req.Model)
 	}
 
 	if req.Stream && req.Writer != nil {

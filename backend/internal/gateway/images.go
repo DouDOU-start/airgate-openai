@@ -472,6 +472,8 @@ func (g *OpenAIGateway) forwardImagesViaResponsesTool(ctx context.Context, req *
 		return transientOutcome(reason), fmt.Errorf("%s", reason)
 	}
 
+	ka := startImageKeepAlive(req.Writer)
+
 	handler := &imagesSilentHandler{accountID: account.ID, start: start}
 	wsResult := ReceiveWSResponse(ctx, conn, handler)
 	if wsResult.ResponseID != "" && session.SessionKey != "" {
@@ -491,10 +493,8 @@ func (g *OpenAIGateway) forwardImagesViaResponsesTool(ctx context.Context, req *
 		var failure *responsesFailureError
 		if errors.As(wsResult.Err, &failure) && failure.shouldReturnClientError() {
 			body := buildImagesErrorBody(failure.StatusCode, failure.Message)
-			if req.Writer != nil {
-				req.Writer.Header().Set("Content-Type", "application/json")
-				req.Writer.WriteHeader(failure.StatusCode)
-				_, _ = req.Writer.Write(body)
+			if ka != nil {
+				ka.Finish(failure.StatusCode, body)
 			}
 			return sdk.ForwardOutcome{
 				Kind: sdk.OutcomeClientError,
@@ -507,6 +507,9 @@ func (g *OpenAIGateway) forwardImagesViaResponsesTool(ctx context.Context, req *
 				Duration: elapsed,
 			}, wsResult.Err
 		}
+		if ka != nil {
+			ka.Stop()
+		}
 		return sdk.ForwardOutcome{
 			Kind:     sdk.OutcomeUpstreamTransient,
 			Upstream: sdk.UpstreamResponse{StatusCode: http.StatusBadGateway},
@@ -517,10 +520,8 @@ func (g *OpenAIGateway) forwardImagesViaResponsesTool(ctx context.Context, req *
 
 	if len(wsResult.ImageGenCalls) == 0 {
 		body := buildImagesErrorBody(http.StatusBadGateway, "上游未返回图像结果")
-		if req.Writer != nil {
-			req.Writer.Header().Set("Content-Type", "application/json")
-			req.Writer.WriteHeader(http.StatusBadGateway)
-			_, _ = req.Writer.Write(body)
+		if ka != nil {
+			ka.Finish(http.StatusBadGateway, body)
 		}
 		return sdk.ForwardOutcome{
 			Kind: sdk.OutcomeUpstreamTransient,
@@ -543,10 +544,8 @@ func (g *OpenAIGateway) forwardImagesViaResponsesTool(ctx context.Context, req *
 		Usage:    usage,
 		Duration: elapsed,
 	}
-	if req.Writer != nil {
-		req.Writer.Header().Set("Content-Type", "application/json")
-		req.Writer.WriteHeader(http.StatusOK)
-		_, _ = req.Writer.Write(respBody)
+	if ka != nil {
+		ka.Finish(http.StatusOK, respBody)
 	} else {
 		outcome.Upstream.Body = respBody
 		outcome.Upstream.Headers = http.Header{"Content-Type": []string{"application/json"}}
@@ -625,17 +624,22 @@ func buildImagesErrorBody(status int, message string) []byte {
 // 计费字段复用 parseUsage：gpt-image-1 / gpt-image-1.5 返回的
 // usage.input_tokens / usage.output_tokens / usage.input_tokens_details.cached_tokens
 // 与 Responses API 字段同构，parseUsage 已经处理了 cached token 扣减。
-func handleImagesResponse(resp *http.Response, w http.ResponseWriter, start time.Time, fallbackModel string) (sdk.ForwardOutcome, error) {
+func handleImagesResponse(resp *http.Response, w http.ResponseWriter, ka *imageKeepAlive, start time.Time, fallbackModel string) (sdk.ForwardOutcome, error) {
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		reason := fmt.Sprintf("读取 Images 响应失败: %v", err)
+		if ka != nil {
+			ka.Finish(http.StatusBadGateway, buildImagesErrorBody(http.StatusBadGateway, reason))
+		}
 		return transientOutcome(reason), fmt.Errorf("%s", reason)
 	}
 
 	parsed := parseUsage(body)
 	headers := resp.Header.Clone()
 
-	if w != nil {
+	if ka != nil {
+		ka.Finish(resp.StatusCode, body)
+	} else if w != nil {
 		if ct := resp.Header.Get("Content-Type"); ct != "" {
 			w.Header().Set("Content-Type", ct)
 		}

@@ -115,11 +115,16 @@ func (g *OpenAIGateway) forwardImagesViaWebReverse(ctx context.Context, req *sdk
 	}
 	client := imgen.NewClient(accessToken, proxyURL)
 
+	ka := startImageKeepAlive(req.Writer)
+
 	prompt := applyWebReverseSizeHint(imgReq.Prompt, imgReq.Size)
 	imgRes, err := client.GenerateImage(ctx, prompt, imageInputs)
 	if err != nil {
 		if imgRes == nil || len(imgRes.Images) == 0 {
 			status := classifyWebReverseError(err)
+			if ka != nil {
+				ka.Finish(status, buildImagesErrorBody(status, err.Error()))
+			}
 			outcome := failureOutcome(status, nil, nil, err.Error(), 0)
 			outcome.Duration = time.Since(start)
 			if outcome.Usage == nil {
@@ -134,10 +139,8 @@ func (g *OpenAIGateway) forwardImagesViaWebReverse(ctx context.Context, req *sdk
 	numImages := len(imgRes.Images)
 
 	respBody := buildWebReverseImagesResponse(imgRes, 0, 0)
-	if w := req.Writer; w != nil {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write(respBody)
+	if ka != nil {
+		ka.Finish(http.StatusOK, respBody)
 	}
 
 	elapsed := time.Since(start)
