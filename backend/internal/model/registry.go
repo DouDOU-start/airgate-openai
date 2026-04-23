@@ -162,8 +162,25 @@ func IsKnown(modelID string) bool {
 	return ok
 }
 
-// AllSpecs 返回所有注册模型的 SDK ModelInfo 列表（按 ID 排序）
-func AllSpecs() []sdk.ModelInfo {
+// AllSpecs 返回注册模型的 SDK ModelInfo 列表（按 ID 排序）。
+// imageOnly=true 只返回图像模型（ImagePrice > 0），false 只返回对话模型。
+func AllSpecs(imageOnly bool) []sdk.ModelInfo {
+	models := make([]sdk.ModelInfo, 0, len(registry))
+	for id, spec := range registry {
+		isImage := spec.ImagePrice > 0
+		if imageOnly != isImage {
+			continue
+		}
+		models = append(models, toModelInfo(id, spec))
+	}
+	sort.Slice(models, func(i, j int) bool {
+		return models[i].ID < models[j].ID
+	})
+	return models
+}
+
+// AllModels 返回所有注册模型（不过滤），用于插件 manifest 注册。
+func AllModels() []sdk.ModelInfo {
 	models := make([]sdk.ModelInfo, 0, len(registry))
 	for id, spec := range registry {
 		models = append(models, toModelInfo(id, spec))

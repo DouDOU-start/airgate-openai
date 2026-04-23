@@ -35,8 +35,9 @@ func (g *OpenAIGateway) forwardHTTP(ctx context.Context, req *sdk.ForwardRequest
 	}
 
 	// GET /v1/models：用插件内置模型清单本地返回。
+	// image_enabled=true 只返回图像模型，false 只返回对话模型。
 	if isModelsListingRequest(req) {
-		return buildLocalModelsResponse(), nil
+		return buildLocalModelsResponse(isImageEnabled(req.Headers)), nil
 	}
 
 	// 统一预处理请求体。multipart 请求（images/edits 上传图片）body 是二进制，
@@ -105,8 +106,9 @@ func isModelsListingRequest(req *sdk.ForwardRequest) bool {
 }
 
 // buildLocalModelsResponse 用插件内置模型注册表合成 OpenAI 兼容的 /v1/models 响应。
-func buildLocalModelsResponse() sdk.ForwardOutcome {
-	specs := model.AllSpecs()
+// imageOnly=true 只返回图像模型，false 只返回对话模型。
+func buildLocalModelsResponse(imageOnly bool) sdk.ForwardOutcome {
+	specs := model.AllSpecs(imageOnly)
 	data := make([]map[string]any, 0, len(specs))
 	created := time.Now().Unix()
 	for _, spec := range specs {

@@ -84,7 +84,7 @@ func (g *OpenAIGateway) Platform() string {
 }
 
 func (g *OpenAIGateway) Models() []sdk.ModelInfo {
-	return model.AllSpecs()
+	return model.AllModels()
 }
 
 func (g *OpenAIGateway) Routes() []sdk.RouteDefinition {
