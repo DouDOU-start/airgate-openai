@@ -50,7 +50,8 @@ func (g *OpenAIGateway) forwardHTTP(ctx context.Context, req *sdk.ForwardRequest
 
 	account := req.Account
 
-	if isImagesRequest(reqPath) && !isImageEnabled(req.Headers) {
+	needsImage := isImagesRequest(reqPath) || isChatCompatImageModel(req.Model)
+	if needsImage && !isImageEnabled(req.Headers) {
 		body := jsonError("当前分组未开启图片生成功能")
 		if req.Writer != nil {
 			req.Writer.Header().Set("Content-Type", "application/json")
@@ -66,6 +67,12 @@ func (g *OpenAIGateway) forwardHTTP(ctx context.Context, req *sdk.ForwardRequest
 			},
 			Reason: "分组未开启 image_enabled",
 		}, nil
+	}
+
+	// 兼容下游平台（new-api 等）把图像模型误路由到 /v1/chat/completions：
+	// 自动转为 Images API 处理，响应包装回 Chat Completions 格式。
+	if !isImagesRequest(reqPath) && isChatCompatImageModel(req.Model) {
+		return g.forwardChatCompletionsAsImages(ctx, req)
 	}
 
 	if account.Credentials["api_key"] != "" {

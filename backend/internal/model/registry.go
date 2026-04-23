@@ -150,6 +150,11 @@ func fallbackByKeyword(id string) (Spec, bool) {
 	return Spec{}, false
 }
 
+// IsImageOnly 判断给定 model 是否为纯图像生成模型（ImagePrice > 0）。
+func IsImageOnly(modelID string) bool {
+	return Lookup(modelID).ImagePrice > 0
+}
+
 // IsKnown 判断给定 model ID 是否在注册表内（大小写不敏感、忽略首尾空白）。
 // 用于请求入口的 model 兜底：未注册的 model 会被换成默认值，
 // 避免把"不支持的模型"推到上游账号。
