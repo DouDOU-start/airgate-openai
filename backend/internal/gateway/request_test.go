@@ -5,6 +5,8 @@ import (
 	"net/http"
 	"testing"
 
+	"github.com/tidwall/gjson"
+
 	sdk "github.com/DouDOU-start/airgate-sdk"
 )
 
@@ -168,6 +170,44 @@ func TestApplyOpenAIWireServiceTier_FastRemoved(t *testing.T) {
 	}
 	if _, ok := payload["service_tier"]; ok {
 		t.Fatalf("service_tier should be removed for fast, got %v", payload["service_tier"])
+	}
+}
+
+func TestWrapAsResponsesAPIPreservesChatImageURL(t *testing.T) {
+	body := []byte(`{"messages":[{"role":"user","content":[{"type":"text","text":"describe this"},{"type":"image_url","image_url":{"url":"data:image/png;base64,AAA"}}]}]}`)
+	result, err := wrapAsResponsesAPI(body, "gpt-5.4")
+	if err != nil {
+		t.Fatalf("wrapAsResponsesAPI: %v", err)
+	}
+
+	content := gjson.GetBytes(result, "input.0.content")
+	if got := content.Get("0.type").String(); got != "input_text" {
+		t.Fatalf("first content type = %q, want input_text", got)
+	}
+	if got := content.Get("1.type").String(); got != "input_image" {
+		t.Fatalf("second content type = %q, want input_image", got)
+	}
+	if got := content.Get("1.image_url").String(); got != "data:image/png;base64,AAA" {
+		t.Fatalf("image_url = %q", got)
+	}
+}
+
+func TestNormalizeResponsesInputPreservesChatImageURL(t *testing.T) {
+	body := []byte(`{"model":"gpt-5.4","messages":[{"role":"user","content":[{"type":"text","text":"describe this"},{"type":"image_url","image_url":{"url":"data:image/png;base64,AAA"}}]}]}`)
+	result := normalizeResponsesInput(body, "/v1/responses")
+
+	if gjson.GetBytes(result, "messages").Exists() {
+		t.Fatalf("messages should be removed after conversion: %s", result)
+	}
+	content := gjson.GetBytes(result, "input.0.content")
+	if got := content.Get("0.type").String(); got != "input_text" {
+		t.Fatalf("first content type = %q, want input_text", got)
+	}
+	if got := content.Get("1.type").String(); got != "input_image" {
+		t.Fatalf("second content type = %q, want input_image", got)
+	}
+	if got := content.Get("1.image_url").String(); got != "data:image/png;base64,AAA" {
+		t.Fatalf("image_url = %q", got)
 	}
 }
 

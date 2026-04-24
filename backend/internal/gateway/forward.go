@@ -35,7 +35,7 @@ func (g *OpenAIGateway) forwardHTTP(ctx context.Context, req *sdk.ForwardRequest
 	}
 
 	// GET /v1/models：用插件内置模型清单本地返回。
-	// image_enabled=true 只返回图像模型，false 只返回对话模型。
+	// image_enabled=true 时只返回图像模型，false 时只返回对话模型。
 	if isModelsListingRequest(req) {
 		return buildLocalModelsResponse(isImageEnabled(req.Headers)), nil
 	}
@@ -118,17 +118,26 @@ func isModelsListingRequest(req *sdk.ForwardRequest) bool {
 }
 
 // buildLocalModelsResponse 用插件内置模型注册表合成 OpenAI 兼容的 /v1/models 响应。
-// imageOnly=true 只返回图像模型，false 只返回对话模型。
+// imageOnly=true 时只返回图像模型，false 时只返回对话模型。
 func buildLocalModelsResponse(imageOnly bool) sdk.ForwardOutcome {
-	specs := model.AllSpecs(imageOnly)
+	specs := model.AllSpecs(true)
 	data := make([]map[string]any, 0, len(specs))
 	created := time.Now().Unix()
 	for _, spec := range specs {
+		isImage := model.IsImageOnly(spec.ID)
+		if imageOnly != isImage {
+			continue
+		}
 		entry := map[string]any{
-			"id":       spec.ID,
-			"object":   "model",
-			"created":  created,
-			"owned_by": "airgate",
+			"id":           spec.ID,
+			"object":       "model",
+			"created":      created,
+			"owned_by":     "airgate",
+			"capabilities": []string{"chat", "reasoning"},
+		}
+		if isImage {
+			entry["capabilities"] = []string{"image_generation"}
+			entry["image_only"] = true
 		}
 		if spec.ContextWindow > 0 {
 			entry["context_window"] = spec.ContextWindow

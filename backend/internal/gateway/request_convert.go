@@ -203,27 +203,8 @@ func convertChatMessagesToResponsesInput(messages []gjson.Result) ([]any, string
 				"type":    "function_call_output",
 				"call_id": callID,
 			}
-			if content := msg.Get("content"); content.Exists() && content.IsArray() {
-				var outputParts []map[string]any
-				for _, part := range content.Array() {
-					ptype := part.Get("type").String()
-					switch ptype {
-					case "text":
-						if text := part.Get("text").String(); text != "" {
-							outputParts = append(outputParts, map[string]any{"type": "input_text", "text": text})
-						}
-					case "image_url":
-						url := part.Get("image_url.url").String()
-						if url != "" {
-							outputParts = append(outputParts, map[string]any{"type": "input_image", "image_url": url})
-						}
-					}
-				}
-				if len(outputParts) > 0 {
-					item["output"] = outputParts
-				} else {
-					item["output"] = extractChatMessageText(msg)
-				}
+			if outputParts := convertChatContentToResponsesParts(msg, "input_text"); len(outputParts) > 0 {
+				item["output"] = outputParts
 			} else {
 				item["output"] = extractChatMessageText(msg)
 			}
@@ -255,20 +236,50 @@ func convertChatMessagesToResponsesInput(messages []gjson.Result) ([]any, string
 
 		default:
 			// user 及其他角色
-			content := extractChatMessageText(msg)
-			if content == "" {
+			contentParts := convertChatContentToResponsesParts(msg, "input_text")
+			if len(contentParts) == 0 {
 				continue
 			}
 			input = append(input, map[string]any{
-				"type": "message",
-				"role": "user",
-				"content": []map[string]string{
-					{"type": "input_text", "text": content},
-				},
+				"type":    "message",
+				"role":    "user",
+				"content": contentParts,
 			})
 		}
 	}
 	return input, strings.Join(instructionsParts, "\n\n")
+}
+
+func convertChatContentToResponsesParts(msg gjson.Result, textType string) []map[string]any {
+	content := msg.Get("content")
+	if !content.Exists() {
+		return nil
+	}
+	if content.Type == gjson.String {
+		text := content.String()
+		if text == "" {
+			return nil
+		}
+		return []map[string]any{{"type": textType, "text": text}}
+	}
+	if !content.IsArray() {
+		return nil
+	}
+
+	var parts []map[string]any
+	for _, part := range content.Array() {
+		switch part.Get("type").String() {
+		case "text":
+			if text := part.Get("text").String(); text != "" {
+				parts = append(parts, map[string]any{"type": textType, "text": text})
+			}
+		case "image_url":
+			if url := part.Get("image_url.url").String(); url != "" {
+				parts = append(parts, map[string]any{"type": "input_image", "image_url": url})
+			}
+		}
+	}
+	return parts
 }
 
 // messagesHaveToolCalls 检查消息历史中是否存在工具调用（判断是否处于工具循环中）

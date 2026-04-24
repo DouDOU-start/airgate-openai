@@ -174,6 +174,13 @@ func (s *chatCompletionsStreamWriter) translateEvent(eventType string, data []by
 		}
 		return [][]byte{s.makeDeltaChunk(map[string]any{"content": delta})}
 
+	case "response.reasoning_summary_text.delta":
+		delta := gjson.GetBytes(data, "delta").String()
+		if delta == "" {
+			return nil
+		}
+		return [][]byte{s.makeDeltaChunk(map[string]any{"reasoning_content": delta})}
+
 	case "response.output_item.added":
 		itemType := gjson.GetBytes(data, "item.type").String()
 		if itemType != "function_call" {

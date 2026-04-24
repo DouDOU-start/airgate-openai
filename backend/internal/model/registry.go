@@ -182,12 +182,12 @@ func IsKnown(modelID string) bool {
 }
 
 // AllSpecs 返回注册模型的 SDK ModelInfo 列表（按 ID 排序）。
-// imageOnly=true 只返回图像模型（ImagePrice > 0），false 只返回对话模型。
-func AllSpecs(imageOnly bool) []sdk.ModelInfo {
+// includeImages=true 时返回对话模型和图像模型，false 时只返回对话模型。
+func AllSpecs(includeImages bool) []sdk.ModelInfo {
 	models := make([]sdk.ModelInfo, 0, len(registry))
 	for id, spec := range registry {
 		isImage := spec.ImagePrice > 0
-		if imageOnly != isImage {
+		if isImage && !includeImages {
 			continue
 		}
 		models = append(models, toModelInfo(id, spec))
