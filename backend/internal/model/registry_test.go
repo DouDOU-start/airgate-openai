@@ -42,8 +42,17 @@ func TestLookup_ByKeyword(t *testing.T) {
 
 // TestLookup_KnownModelUnchanged 已注册模型不受关键词兜底影响。
 func TestLookup_KnownModelUnchanged(t *testing.T) {
-	spec := Lookup("gpt-5.4")
-	if spec.InputPrice != 2.5 || spec.OutputPrice != 15.0 {
-		t.Errorf("gpt-5.4 定价变化: In=%v Out=%v", spec.InputPrice, spec.OutputPrice)
-	}
+	t.Run("gpt-5.5", func(t *testing.T) {
+		spec := Lookup("gpt-5.5")
+		if spec.InputPrice != 5.0 || spec.OutputPrice != 30.0 || spec.CachedPrice != 0.5 {
+			t.Errorf("gpt-5.5 定价变化: In=%v Out=%v Cached=%v", spec.InputPrice, spec.OutputPrice, spec.CachedPrice)
+		}
+	})
+
+	t.Run("gpt-5.4", func(t *testing.T) {
+		spec := Lookup("gpt-5.4")
+		if spec.InputPrice != 2.5 || spec.OutputPrice != 15.0 {
+			t.Errorf("gpt-5.4 定价变化: In=%v Out=%v", spec.InputPrice, spec.OutputPrice)
+		}
+	})
 }

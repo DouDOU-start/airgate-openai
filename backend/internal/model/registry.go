@@ -91,6 +91,8 @@ func withLongCtx(s Spec) Spec {
 // registry 全局模型注册表（按模型 ID 索引）
 // ─── 新增模型只需在此处加一行 ───
 var registry = map[string]Spec{
+	"gpt-5.5": std("GPT 5.5", 272000, 128000, 5.0, 0.5, 30.0),
+
 	// ── GPT-5.4（唯一具备长上下文阶梯的家族）──
 	"gpt-5.4": withLongCtx(std("GPT 5.4", 272000, 128000, 2.5, 0.25, 15.0)),
 

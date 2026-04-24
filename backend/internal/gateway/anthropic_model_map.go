@@ -23,7 +23,7 @@ type anthropicModelMapping struct {
 var (
 	defaultClaudeTargetModel = normalizeMappedModelID(
 		firstNonEmptyEnv("AIRGATE_DEFAULT_CLAUDE_MODEL"),
-		"gpt-5.4",
+		"gpt-5.5",
 	)
 	opusTargetModel = resolveRoleTargetModel(
 		defaultClaudeTargetModel,
@@ -45,19 +45,19 @@ var (
 		"gpt-5.4-mini",
 		"AIRGATE_MODEL_HAIKU_FALLBACK",
 	)
-	// opusFallbackModel Opus 降级模型：普通账号不支持 gpt-5.4 时回退
+	// opusFallbackModel Opus 降级模型：普通账号不支持 gpt-5.5 时回退
 	opusFallbackModel = resolveRoleTargetModel(
-		"gpt-5.2",
+		"gpt-5.4",
 		"AIRGATE_MODEL_OPUS_FALLBACK",
 	)
 	// sonnetFallbackModel Sonnet 降级模型
 	sonnetFallbackModel = resolveRoleTargetModel(
-		"gpt-5.2",
+		"gpt-5.4",
 		"AIRGATE_MODEL_SONNET_FALLBACK",
 	)
 	// defaultFallbackModel 兜底降级模型
 	defaultFallbackModel = resolveRoleTargetModel(
-		"gpt-5.2",
+		"gpt-5.4",
 		"AIRGATE_MODEL_DEFAULT_FALLBACK",
 	)
 	// sparkTargetModel 简单操作加速模型（Read/Grep/Glob 结果处理时自动路由）
@@ -79,11 +79,11 @@ var (
 // anthropicModelMappings Claude 模型名 → OpenAI 模型映射表
 // 精确匹配优先，通配符匹配其次
 var anthropicModelMappings = map[string]anthropicModelMapping{
-	// Opus → 最高推理，普通账号降级到 gpt-5.2
+	// Opus → 最高推理，普通账号降级到 gpt-5.4
 	"claude-opus-4-6": {OpenAIModel: opusTargetModel, FallbackModel: opusFallbackModel, ReasoningEffort: "xhigh"},
 	"claude-opus-4-5": {OpenAIModel: opusTargetModel, FallbackModel: opusFallbackModel, ReasoningEffort: "xhigh"},
 
-	// Sonnet → 高推理，普通账号降级到 gpt-5.2
+	// Sonnet → 高推理，普通账号降级到 gpt-5.4
 	"claude-sonnet-4-6": {OpenAIModel: sonnetTargetModel, FallbackModel: sonnetFallbackModel, ReasoningEffort: "high"},
 	"claude-sonnet-4-5": {OpenAIModel: sonnetTargetModel, FallbackModel: sonnetFallbackModel, ReasoningEffort: "high"},
 
@@ -113,7 +113,7 @@ var anthropicWildcardMappings = []struct {
 	{"claude-", anthropicModelMapping{OpenAIModel: defaultClaudeTargetModel, FallbackModel: defaultFallbackModel, ReasoningEffort: ""}},
 }
 
-// defaultModelMapping 兜底映射：不认识的模型统一用 gpt-5.4，普通账号降级到 gpt-5.2
+// defaultModelMapping 兜底映射：不认识的模型统一用 gpt-5.5，普通账号降级到 gpt-5.4
 var defaultModelMapping = anthropicModelMapping{OpenAIModel: defaultClaudeTargetModel, FallbackModel: defaultFallbackModel, ReasoningEffort: ""}
 
 func resolveRoleTargetModel(fallback string, keys ...string) string {
