@@ -42,6 +42,67 @@ func TestIsImagesRequest(t *testing.T) {
 	}
 }
 
+func TestShouldUseImagesWebReverse(t *testing.T) {
+	cases := []struct {
+		name    string
+		account *sdk.Account
+		model   string
+		want    bool
+	}{
+		{
+			name: "free oauth with gpt-image-2",
+			account: &sdk.Account{Credentials: map[string]string{
+				"access_token": "token",
+				"plan_type":    "free",
+			}},
+			model: "gpt-image-2",
+			want:  true,
+		},
+		{
+			name: "plus oauth with gpt-image-2",
+			account: &sdk.Account{Credentials: map[string]string{
+				"access_token": "token",
+				"plan_type":    "plus",
+			}},
+			model: "gpt-image-2",
+			want:  false,
+		},
+		{
+			name: "oauth without plan type",
+			account: &sdk.Account{Credentials: map[string]string{
+				"access_token": "token",
+			}},
+			model: "gpt-image-2",
+			want:  false,
+		},
+		{
+			name: "free oauth with other model",
+			account: &sdk.Account{Credentials: map[string]string{
+				"access_token": "token",
+				"plan_type":    "free",
+			}},
+			model: "gpt-image-1",
+			want:  false,
+		},
+		{
+			name: "apikey account",
+			account: &sdk.Account{Credentials: map[string]string{
+				"api_key": "sk-test",
+			}},
+			model: "gpt-image-2",
+			want:  false,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := shouldUseImagesWebReverse(tc.account, tc.model); got != tc.want {
+				t.Fatalf("shouldUseImagesWebReverse() = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
 // TestHandleImagesResponse_TokenAttribution 覆盖官方响应格式：
 //   - usage.input_tokens / output_tokens 落入 Outcome.Usage
 //   - cached tokens 从 input 中扣减，避免重复计费
@@ -481,13 +542,14 @@ func TestEstimatePromptTokens(t *testing.T) {
 
 // TestBuildImagesRESTResponse 把 WSResult 打包回 OpenAI Images REST 响应格式。
 // 计费口径对齐 OpenAI 官方：usage.input_tokens = prompt tokens、output_tokens = 图像 tokens、
-// root 级 model = gpt-image-1.5。instructions / 工具包装的 chat tokens 不暴露。
+// root 级 model 使用实际响应的图像模型。instructions / 工具包装的 chat tokens 不暴露。
 func TestBuildImagesRESTResponse(t *testing.T) {
 	ws := WSResult{
 		InputTokens:           4808, // chat text tokens (内层吸收，不对外)
 		OutputTokens:          40,   // chat output tokens (内层吸收，不对外)
 		ToolImageInputTokens:  0,
 		ToolImageOutputTokens: 4160,
+		ToolImageModel:        "gpt-image-2",
 		ImageGenCalls: []ImageGenCall{
 			{Result: "PNG_BASE64_A", RevisedPrompt: "revised a"},
 			{Result: "PNG_BASE64_B"},
@@ -495,14 +557,14 @@ func TestBuildImagesRESTResponse(t *testing.T) {
 	}
 	promptTokens := 12
 	imageOut := 4160
-	body := buildImagesRESTResponse(ws, promptTokens, imageOut)
+	body := buildImagesRESTResponse(ws, promptTokens, imageOut, imageGenerationBillingModel(ws.ToolImageModel, "dall-e-3"))
 
 	var got map[string]any
 	if err := json.Unmarshal(body, &got); err != nil {
 		t.Fatalf("unmarshal: %v", err)
 	}
-	if got["model"] != "gpt-image-1.5" {
-		t.Errorf("root model = %v, want gpt-image-1.5", got["model"])
+	if got["model"] != "gpt-image-2" {
+		t.Errorf("root model = %v, want gpt-image-2", got["model"])
 	}
 	data, _ := got["data"].([]any)
 	if len(data) != 2 {
@@ -535,15 +597,15 @@ func TestBuildImagesRESTResponse(t *testing.T) {
 }
 
 // TestBuildImagesRESTResponse_ChainedCostParity 验证 AirGate 套 AirGate 时两级
-// 金额一致：下一级拿到 body 按 gpt-image-1.5 单价重算，应等于本级结果。
+// 金额一致：下一级拿到 body 按 root model 单价重算，应等于本级结果。
 func TestBuildImagesRESTResponse_ChainedCostParity(t *testing.T) {
 	promptTokens := 12
 	imageOut := 1056
 	ws := WSResult{ImageGenCalls: []ImageGenCall{{Result: "X"}}}
-	body := buildImagesRESTResponse(ws, promptTokens, imageOut)
+	body := buildImagesRESTResponse(ws, promptTokens, imageOut, "gpt-image-2")
 
 	inner := &sdk.Usage{
-		Model:        "gpt-image-1.5",
+		Model:        "gpt-image-2",
 		InputTokens:  promptTokens,
 		OutputTokens: imageOut,
 	}

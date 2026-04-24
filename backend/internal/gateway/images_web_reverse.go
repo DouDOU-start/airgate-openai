@@ -62,12 +62,19 @@ func decodeImageRefs(refs []string) ([]imgen.ImageInput, error) {
 const imagesWebReverseModel = "gpt-image-2"
 
 // isImagesWebReverseModel 判断请求是否显式指定了 gpt-image-2。
-//
-// 对 OAuth 账号 + Images 请求：
-//   - model == gpt-image-2 → 走 Web 逆向（本文件）
-//   - 其它 / 为空 → 走 Responses tool（现有逻辑）
 func isImagesWebReverseModel(model string) bool {
 	return strings.EqualFold(strings.TrimSpace(model), imagesWebReverseModel)
+}
+
+// shouldUseImagesWebReverse 只允许 free OAuth 账号走网页端逆向生图。
+func shouldUseImagesWebReverse(account *sdk.Account, model string) bool {
+	if account == nil || account.Credentials["access_token"] == "" {
+		return false
+	}
+	if !isImagesWebReverseModel(model) {
+		return false
+	}
+	return strings.EqualFold(strings.TrimSpace(account.Credentials["plan_type"]), "free")
 }
 
 // forwardImagesViaWebReverse 把一个 OpenAI Images REST 请求翻译成 imgen
@@ -93,6 +100,13 @@ func (g *OpenAIGateway) forwardImagesViaWebReverse(ctx context.Context, req *sdk
 		return webReverseImagesError(start, http.StatusBadRequest, req.Writer,
 			fmt.Sprintf("解析 Images 请求失败: %v", err))
 	}
+	g.logger.Info("Images WebReverse request",
+		"path", reqPath,
+		"request_model", imgReq.Model,
+		"is_edit", isEdit,
+		"size", imgReq.Size,
+		"n", imgReq.N,
+	)
 
 	var imageInputs []imgen.ImageInput
 	if isEdit && len(imgReq.Images) > 0 {
@@ -137,6 +151,13 @@ func (g *OpenAIGateway) forwardImagesViaWebReverse(ctx context.Context, req *sdk
 	}
 
 	numImages := len(imgRes.Images)
+	g.logger.Info("Images WebReverse result",
+		"path", reqPath,
+		"request_model", imgReq.Model,
+		"model_slug", imgRes.ModelSlug,
+		"conversation_id", imgRes.ConversationID,
+		"num_images", numImages,
+	)
 
 	respBody := buildWebReverseImagesResponse(imgRes, 0, 0)
 	if ka != nil {

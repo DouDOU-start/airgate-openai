@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"mime"
 	"mime/multipart"
 	"net/http"
@@ -132,6 +133,16 @@ func estimatePromptTokens(prompt string) int {
 		return 0
 	}
 	return (runes + 2) / 3
+}
+
+func imageGenerationBillingModel(responseModel, requestModel string) string {
+	for _, candidate := range []string{responseModel, requestModel} {
+		m := strings.TrimSpace(candidate)
+		if strings.HasPrefix(strings.ToLower(m), "gpt-image-") {
+			return m
+		}
+	}
+	return imageToolCostModel
 }
 
 // estimateImageCountFromTokens 从 image output token 数反推生成的图片张数。
@@ -389,8 +400,7 @@ func buildImagesToolCreateMsg(
 		return nil, 0, 0, err
 	}
 	// input token 估算：文本 prompt + 每张参考图按 size 低质档估算（~272 tokens/1024²），
-	// 与 image_generation tool 输入图像的 token 级别一致。计费仍走 gpt-image-1.5
-	// input 单价（$5/1M），V1 近似即可。
+	// 与 image_generation tool 输入图像的 token 级别一致。
 	inputTokens := estimatePromptTokens(req.Prompt) + estimateImageInputTokens(len(req.Images), req.Size)
 	return msg, req.N, inputTokens, nil
 }
@@ -422,6 +432,32 @@ func (g *OpenAIGateway) forwardImagesViaResponsesTool(ctx context.Context, req *
 	_, reqPath := resolveAPIKeyRoute(req)
 	isEdit := isImagesEditRequest(reqPath)
 	contentType := req.Headers.Get("Content-Type")
+	imgReq, err := parseImagesRequest(req.Body, contentType, isEdit)
+	if err != nil {
+		body := jsonError(err.Error())
+		if req.Writer != nil {
+			req.Writer.Header().Set("Content-Type", "application/json")
+			req.Writer.WriteHeader(http.StatusBadRequest)
+			_, _ = req.Writer.Write(body)
+		}
+		return sdk.ForwardOutcome{
+			Kind: sdk.OutcomeClientError,
+			Upstream: sdk.UpstreamResponse{
+				StatusCode: http.StatusBadRequest,
+				Headers:    http.Header{"Content-Type": []string{"application/json"}},
+				Body:       body,
+			},
+			Reason:   err.Error(),
+			Duration: time.Since(start),
+		}, nil
+	}
+	g.logger.Info("Images OAuth request",
+		"path", reqPath,
+		"request_model", imgReq.Model,
+		"is_edit", isEdit,
+		"size", imgReq.Size,
+		"n", imgReq.N,
+	)
 	createMsg, n, promptTokens, err := buildImagesToolCreateMsg(req.Body, contentType, isEdit, session)
 	if err != nil {
 		body := jsonError(err.Error())
@@ -481,13 +517,6 @@ func (g *OpenAIGateway) forwardImagesViaResponsesTool(ctx context.Context, req *
 	}
 
 	elapsed := time.Since(start)
-	// 计费按 OpenAI Images API 官方口径：prompt tokens + 图像输出 tokens，统一按 gpt-image-1.5。
-	// 上游 instructions / 工具调用包装产生的额外 chat tokens 由内层吸收（OAuth 订阅账号无逐 token 成本）。
-	usage := &sdk.Usage{
-		InputTokens:  promptTokens,
-		Model:        imageToolCostModel,
-		FirstTokenMs: handler.firstTokenMs,
-	}
 
 	if wsResult.Err != nil {
 		var failure *responsesFailureError
@@ -536,8 +565,24 @@ func (g *OpenAIGateway) forwardImagesViaResponsesTool(ctx context.Context, req *
 	}
 
 	numImages := len(wsResult.ImageGenCalls)
+	// 计费按 OpenAI Images API 官方口径：prompt tokens + 图像输出 tokens。
+	// 上游 instructions / 工具调用包装产生的额外 chat tokens 由内层吸收（OAuth 订阅账号无逐 token 成本）。
+	billingModel := imageGenerationBillingModel(wsResult.ToolImageModel, imgReq.Model)
+	usage := &sdk.Usage{
+		InputTokens:  promptTokens,
+		Model:        billingModel,
+		FirstTokenMs: handler.firstTokenMs,
+	}
+	g.logger.Info("Images OAuth result",
+		"path", reqPath,
+		"request_model", imgReq.Model,
+		"tool_model", wsResult.ToolImageModel,
+		"billing_model", billingModel,
+		"chat_model", imagesOAuthChatModel,
+		"num_images", numImages,
+	)
 
-	respBody := buildImagesRESTResponse(wsResult, promptTokens, 0)
+	respBody := buildImagesRESTResponse(wsResult, promptTokens, 0, billingModel)
 	outcome := sdk.ForwardOutcome{
 		Kind:     sdk.OutcomeSuccess,
 		Upstream: sdk.UpstreamResponse{StatusCode: http.StatusOK},
@@ -556,12 +601,15 @@ func (g *OpenAIGateway) forwardImagesViaResponsesTool(ctx context.Context, req *
 }
 
 // buildImagesRESTResponse 按 OpenAI Images API 官方契约打包响应。
-// 计费口径：prompt tokens + image output tokens，全部按 gpt-image-1.5 单价。
+// 计费口径：prompt tokens + image output tokens，按实际响应的图像模型记录。
 // instructions / 工具调用包装产生的额外 chat tokens 由内层吸收，不出现在对外 usage。
 // 这样：
 //  1. 客户端拿到的 usage 数字语义与 OpenAI 原生 Images API 完全一致
 //  2. 外层再套一层 AirGate 时，两级按同一口径独立计算，金额零偏差
-func buildImagesRESTResponse(wsResult WSResult, promptTokens, imageOutputTokens int) []byte {
+func buildImagesRESTResponse(wsResult WSResult, promptTokens, imageOutputTokens int, responseModel string) []byte {
+	if responseModel == "" {
+		responseModel = imageToolCostModel
+	}
 	data := make([]map[string]any, 0, len(wsResult.ImageGenCalls))
 	for _, call := range wsResult.ImageGenCalls {
 		item := map[string]any{
@@ -580,8 +628,8 @@ func buildImagesRESTResponse(wsResult WSResult, promptTokens, imageOutputTokens 
 	payload := map[string]any{
 		"created": time.Now().Unix(),
 		"data":    data,
-		// root 级 model，供下一级 handleImagesResponse 做 fillCost 查价。
-		"model": imageToolCostModel,
+		// root 级 model，供下一级 handleImagesResponse 做 fillCost 查价和 usage 记录。
+		"model": responseModel,
 	}
 	if promptTokens+imageOutputTokens > 0 {
 		payload["usage"] = map[string]any{
@@ -656,6 +704,7 @@ func handleImagesResponse(resp *http.Response, w http.ResponseWriter, ka *imageK
 	if numImages <= 0 {
 		numImages = 1
 	}
+	log.Printf("[images] native result request_model=%q response_model=%q num_images=%d", fallbackModel, modelName, numImages)
 
 	elapsed := time.Since(start)
 	usage := &sdk.Usage{

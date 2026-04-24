@@ -10,13 +10,49 @@ import (
 
 func normalizeOpenAIServiceTier(tier string) string {
 	switch strings.ToLower(strings.TrimSpace(tier)) {
-	case "fast", "priority":
+	case "priority":
 		return "priority"
 	case "flex":
 		return "flex"
 	default:
 		return ""
 	}
+}
+
+func normalizeOpenAIWireServiceTier(tier string) string {
+	switch normalizeOpenAIServiceTier(tier) {
+	case "priority":
+		return "priority"
+	case "flex":
+		return "flex"
+	default:
+		return ""
+	}
+}
+
+func applyOpenAIWireServiceTier(body []byte) []byte {
+	if len(body) == 0 {
+		return body
+	}
+	tierNode := gjson.GetBytes(body, "service_tier")
+	if !tierNode.Exists() {
+		return body
+	}
+	if tier := normalizeOpenAIWireServiceTier(tierNode.String()); tier != "" {
+		result, _ := sjson.SetBytes(body, "service_tier", tier)
+		return result
+	}
+	result, _ := sjson.DeleteBytes(body, "service_tier")
+	return result
+}
+
+func firstNonEmptyTier(tiers ...string) string {
+	for _, tier := range tiers {
+		if normalized := normalizeOpenAIServiceTier(tier); normalized != "" {
+			return normalized
+		}
+	}
+	return ""
 }
 
 // wrapAsResponsesAPI 将请求包装为 Responses API 格式（模拟客户端模式）
@@ -109,9 +145,9 @@ func ensureResponsesDefaultsWithTier(body []byte, reqServiceTierOverride string)
 	}
 
 	// 仅在请求或分组明确指定时才传 service_tier
-	if tier := normalizeOpenAIServiceTier(gjson.GetBytes(result, "service_tier").String()); tier != "" {
+	if tier := normalizeOpenAIWireServiceTier(gjson.GetBytes(result, "service_tier").String()); tier != "" {
 		result, _ = sjson.SetBytes(result, "service_tier", tier)
-	} else if tier := normalizeOpenAIServiceTier(reqServiceTierOverride); tier != "" {
+	} else if tier := normalizeOpenAIWireServiceTier(reqServiceTierOverride); tier != "" {
 		result, _ = sjson.SetBytes(result, "service_tier", tier)
 	} else if gjson.GetBytes(result, "service_tier").Exists() {
 		result, _ = sjson.DeleteBytes(result, "service_tier")

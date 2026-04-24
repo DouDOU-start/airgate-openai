@@ -28,7 +28,7 @@ const largeSSEEventThreshold = 512 * 1024
 
 // handleStreamResponse 处理 SSE 流式响应。调用者保证 resp.StatusCode 是 2xx
 // （4xx/5xx 由调用者预先归类，不会进到这里）。
-func handleStreamResponse(resp *http.Response, w http.ResponseWriter, start time.Time) (sdk.ForwardOutcome, error) {
+func handleStreamResponse(resp *http.Response, w http.ResponseWriter, start time.Time, reqServiceTier string) (sdk.ForwardOutcome, error) {
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
@@ -36,7 +36,7 @@ func handleStreamResponse(resp *http.Response, w http.ResponseWriter, start time
 	passCodexRateLimitHeaders(resp.Header, w.Header())
 	w.WriteHeader(resp.StatusCode)
 
-	usage := &sdk.Usage{}
+	usage := &sdk.Usage{ServiceTier: reqServiceTier}
 	scanner := bufio.NewScanner(resp.Body)
 	scanner.Buffer(make([]byte, 64*1024), upstreamSSEMaxLineBytes)
 	var streamErr error
@@ -108,7 +108,7 @@ func handleStreamResponse(resp *http.Response, w http.ResponseWriter, start time
 }
 
 // handleNonStreamResponse 处理非流式响应。resp.StatusCode 预设 2xx。
-func handleNonStreamResponse(resp *http.Response, w http.ResponseWriter, start time.Time) (sdk.ForwardOutcome, error) {
+func handleNonStreamResponse(resp *http.Response, w http.ResponseWriter, start time.Time, reqServiceTier string) (sdk.ForwardOutcome, error) {
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		reason := fmt.Sprintf("读取上游响应失败: %v", err)
@@ -131,7 +131,7 @@ func handleNonStreamResponse(resp *http.Response, w http.ResponseWriter, start t
 		OutputTokens:          parsed.outputTokens,
 		CachedInputTokens:     parsed.cachedInputTokens,
 		ReasoningOutputTokens: parsed.reasoningOutputTokens,
-		ServiceTier:           normalizeOpenAIServiceTier(gjson.GetBytes(body, "service_tier").String()),
+		ServiceTier:           firstNonEmptyTier(reqServiceTier, normalizeOpenAIServiceTier(gjson.GetBytes(body, "service_tier").String())),
 		Model:                 gjson.GetBytes(body, "model").String(),
 		FirstTokenMs:          elapsed.Milliseconds(),
 	}
@@ -287,8 +287,8 @@ func parseSSEUsage(data []byte, out *sdk.Usage, toolImageIn, toolImageOut *int) 
 			return
 		}
 		out.Model = resp.Get("model").String()
-		if tier := normalizeOpenAIServiceTier(resp.Get("service_tier").String()); tier != "" {
-			out.ServiceTier = tier
+		if out.ServiceTier == "" {
+			out.ServiceTier = normalizeOpenAIServiceTier(resp.Get("service_tier").String())
 		}
 		usage := resp.Get("usage")
 		if usage.Exists() {

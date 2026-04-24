@@ -16,10 +16,10 @@ import (
 //
 // 定价对齐 OpenAI 官方规则：
 //   - 标准档：Input / Cached / Output
-//   - Priority 档：*Priority 字段（≈ 标准 × 2），缺省时 SDK 以 × 2 兜底
+//   - Priority 档：*Priority 字段（通常标准 × 2；gpt-5.5 为 × 2.5），缺省时 SDK 以 × 2 兜底
 //   - Flex / Batch 档：*Flex 字段（= 标准 × 0.5），缺省时 SDK 以 × 0.5 兜底
 //   - 长上下文档（仅 gpt-5.4 家族）：完整 input_tokens 超过 LongContextThreshold
-//     且非 priority 档时，整次请求全量按倍率计费
+//     时，整次请求全量按倍率计费
 type Spec struct {
 	Name            string
 	ContextWindow   int
@@ -38,6 +38,11 @@ type Spec struct {
 	CachedPricePriority float64
 	OutputPricePriority float64
 
+	// Fast 档单价（$/1M tokens）。当前未使用，保持零值。
+	InputPriceFast  float64
+	CachedPriceFast float64
+	OutputPriceFast float64
+
 	// Flex / Batch 档单价（$/1M tokens）。零值表示未配置，由 SDK 以标准 × 0.5 兜底。
 	InputPriceFlex  float64
 	CachedPriceFlex float64
@@ -50,7 +55,7 @@ type Spec struct {
 	LongContextCachedMultiplier float64
 }
 
-// std 快捷构造一个三档（standard / priority / flex）价格齐全的 Spec，
+// std 快捷构造 standard / priority / flex 价格齐全的 Spec，
 // 倍率按 OpenAI 官方：priority = 2×standard，flex = 0.5×standard。
 func std(name string, ctx, maxOut int, input, cached, output float64) Spec {
 	return Spec{
@@ -67,6 +72,13 @@ func std(name string, ctx, maxOut int, input, cached, output float64) Spec {
 		CachedPriceFlex:     cached * 0.5,
 		OutputPriceFlex:     output * 0.5,
 	}
+}
+
+func withPriorityMultiplier(s Spec, multiplier float64) Spec {
+	s.InputPricePriority = s.InputPrice * multiplier
+	s.CachedPricePriority = s.CachedPrice * multiplier
+	s.OutputPricePriority = s.OutputPrice * multiplier
+	return s
 }
 
 // imgSpec 构造按张计费的图像模型 Spec。
@@ -91,7 +103,7 @@ func withLongCtx(s Spec) Spec {
 // registry 全局模型注册表（按模型 ID 索引）
 // ─── 新增模型只需在此处加一行 ───
 var registry = map[string]Spec{
-	"gpt-5.5": std("GPT 5.5", 272000, 128000, 5.0, 0.5, 30.0),
+	"gpt-5.5": withPriorityMultiplier(std("GPT 5.5", 400000, 128000, 5.0, 0.5, 30.0), 2.5),
 
 	// ── GPT-5.4（唯一具备长上下文阶梯的家族）──
 	"gpt-5.4": withLongCtx(std("GPT 5.4", 272000, 128000, 2.5, 0.25, 15.0)),
@@ -211,6 +223,9 @@ func toModelInfo(id string, spec Spec) sdk.ModelInfo {
 		InputPricePriority:          spec.InputPricePriority,
 		OutputPricePriority:         spec.OutputPricePriority,
 		CachedInputPricePriority:    spec.CachedPricePriority,
+		InputPriceFast:              spec.InputPriceFast,
+		OutputPriceFast:             spec.OutputPriceFast,
+		CachedInputPriceFast:        spec.CachedPriceFast,
 		InputPriceFlex:              spec.InputPriceFlex,
 		OutputPriceFlex:             spec.OutputPriceFlex,
 		CachedInputPriceFlex:        spec.CachedPriceFlex,

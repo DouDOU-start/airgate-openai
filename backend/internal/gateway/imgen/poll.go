@@ -174,14 +174,18 @@ func (c *Client) pollForImages(conversationID string, maxAttempts int) ([]string
 		_, _ = c.streamStatus(conversationID)
 
 		// Fallback：mapping
-		refs := c.readMappingRefs(conversationID)
+		refs, modelSlug := c.readMappingRefsAndModel(conversationID)
 		if len(refs) == 0 {
 			continue
 		}
 
 		for _, r := range refs {
 			if strings.HasPrefix(r, "file-service://") {
-				log.Printf("[imgen] mapping 命中（file-service 直出，共 %d ref）", len(refs))
+				if modelSlug != "" {
+					log.Printf("[imgen] mapping 命中（file-service 直出，共 %d ref，model_slug=%s）", len(refs), modelSlug)
+				} else {
+					log.Printf("[imgen] mapping 命中（file-service 直出，共 %d ref）", len(refs))
+				}
 				return refs, nil
 			}
 		}
@@ -192,7 +196,11 @@ func (c *Client) pollForImages(conversationID string, maxAttempts int) ([]string
 		if sig == lastFallbackSig && sig != "" {
 			stableCount++
 			if stableCount >= stableRounds {
-				log.Printf("[imgen] mapping 命中（sediment 稳定 %d 轮，%d ref）", stableRounds, len(refs))
+				if modelSlug != "" {
+					log.Printf("[imgen] mapping 命中（sediment 稳定 %d 轮，%d ref，model_slug=%s）", stableRounds, len(refs), modelSlug)
+				} else {
+					log.Printf("[imgen] mapping 命中（sediment 稳定 %d 轮，%d ref）", stableRounds, len(refs))
+				}
 				return refs, nil
 			}
 		} else {
@@ -204,33 +212,35 @@ func (c *Client) pollForImages(conversationID string, maxAttempts int) ([]string
 	return nil, fmt.Errorf("轮询 %d 次未拿到图片 asset_pointer", maxAttempts)
 }
 
-// readMappingRefs fallback 用：从 conversation mapping 里提取所有 image tool
-// 消息的 asset_pointer。
-func (c *Client) readMappingRefs(conversationID string) []string {
+func (c *Client) readMappingRefsAndModel(conversationID string) ([]string, string) {
 	req, err := c.newReq("GET", "/backend-api/conversation/"+conversationID, nil)
 	if err != nil {
-		return nil
+		return nil, ""
 	}
 	resp, err := c.http.Do(req)
 	if err != nil {
-		return nil
+		return nil, ""
 	}
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != 200 {
-		return nil
+		return nil, ""
 	}
 	body, _ := io.ReadAll(resp.Body)
 	var conv map[string]any
 	if json.Unmarshal(body, &conv) != nil {
-		return nil
+		return nil, ""
 	}
 	mapping, _ := conv["mapping"].(map[string]any)
 	tools := extractImageToolMsgs(mapping)
 
 	var refs []string
+	var modelSlug string
 	seenF := map[string]bool{}
 	seenS := map[string]bool{}
 	for _, t := range tools {
+		if t.ModelSlug != "" {
+			modelSlug = t.ModelSlug
+		}
 		for _, f := range t.FileIDs {
 			if !seenF[f] {
 				seenF[f] = true
@@ -244,11 +254,8 @@ func (c *Client) readMappingRefs(conversationID string) []string {
 			}
 		}
 	}
-	return refs
+	return refs, modelSlug
 }
-
-// hasFileService / filterFileService 两个小工具在 GenerateImage 里决定"优先用
-// file-service 终稿，没有再退到 sediment"。
 
 func hasFileService(refs []string) bool {
 	for _, r := range refs {

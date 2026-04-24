@@ -1,6 +1,7 @@
 package gateway
 
 import (
+	"encoding/json"
 	"net/http"
 	"testing"
 
@@ -130,5 +131,48 @@ func TestDropPreviousResponseIDFromJSON(t *testing.T) {
 	}
 	if string(next) == `{"model":"gpt-5.4","previous_response_id":"resp_old","input":[]}` {
 		t.Fatalf("expected updated payload")
+	}
+}
+
+func TestNormalizeOpenAIServiceTier_FastIsInvalid(t *testing.T) {
+	if got := normalizeOpenAIServiceTier("fast"); got != "" {
+		t.Fatalf("normalizeOpenAIServiceTier(fast) = %q, want empty", got)
+	}
+}
+
+func TestNormalizeOpenAIWireServiceTier_FastIsInvalid(t *testing.T) {
+	if got := normalizeOpenAIWireServiceTier("fast"); got != "" {
+		t.Fatalf("normalizeOpenAIWireServiceTier(fast) = %q, want empty", got)
+	}
+}
+
+func TestEnsureResponsesDefaultsWithTier_FastIgnored(t *testing.T) {
+	body := []byte(`{"model":"gpt-5.5","input":"hi"}`)
+	result := ensureResponsesDefaultsWithTier(body, "fast")
+
+	var payload map[string]any
+	if err := json.Unmarshal(result, &payload); err != nil {
+		t.Fatalf("unmarshal result: %v", err)
+	}
+	if _, ok := payload["service_tier"]; ok {
+		t.Fatalf("service_tier should be omitted for fast, got %v", payload["service_tier"])
+	}
+}
+
+func TestApplyOpenAIWireServiceTier_FastRemoved(t *testing.T) {
+	result := applyOpenAIWireServiceTier([]byte(`{"model":"gpt-5.5","input":"hi","service_tier":"fast"}`))
+
+	var payload map[string]any
+	if err := json.Unmarshal(result, &payload); err != nil {
+		t.Fatalf("unmarshal result: %v", err)
+	}
+	if _, ok := payload["service_tier"]; ok {
+		t.Fatalf("service_tier should be removed for fast, got %v", payload["service_tier"])
+	}
+}
+
+func TestFirstNonEmptyTier_RequestFastFallsBackToUpstreamPriority(t *testing.T) {
+	if got := firstNonEmptyTier("fast", "priority"); got != "priority" {
+		t.Fatalf("firstNonEmptyTier(fast, priority) = %q, want %q", got, "priority")
 	}
 }

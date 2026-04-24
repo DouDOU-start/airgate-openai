@@ -18,6 +18,7 @@ type Image struct {
 // Result GenerateImage 返回结果。
 type Result struct {
 	ConversationID string  // chatgpt.com 会话 id（这次新创建的）
+	ModelSlug      string  // conversation.mapping 中 image_gen tool 的最终 model_slug
 	Images         []Image // 下载成功的图像产物
 }
 
@@ -130,8 +131,16 @@ func (c *Client) GenerateImage(ctx context.Context, prompt string, images []Imag
 		return nil, fmt.Errorf("未获取到任何图片（可能原因: PoW 未通过 / AT 过期 / 触发风控）")
 	}
 
+	modelSlug := ""
+	if sr.ConversationID != "" {
+		_, modelSlug = c.readMappingRefsAndModel(sr.ConversationID)
+		if modelSlug != "" {
+			log.Printf("[imgen] 最终 model_slug=%s", modelSlug)
+		}
+	}
+
 	// Step 5: 下载
-	result := &Result{ConversationID: sr.ConversationID}
+	result := &Result{ConversationID: sr.ConversationID, ModelSlug: modelSlug}
 	for _, ref := range imageRefs {
 		if err := ctx.Err(); err != nil {
 			return result, err

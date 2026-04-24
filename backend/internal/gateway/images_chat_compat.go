@@ -118,10 +118,10 @@ func (g *OpenAIGateway) forwardChatCompletionsAsImages(ctx context.Context, req 
 func (g *OpenAIGateway) dispatchImageRequest(ctx context.Context, origReq *sdk.ForwardRequest, imageReq *sdk.ForwardRequest) (sdk.ForwardOutcome, error) {
 	account := origReq.Account
 	if account.Credentials["api_key"] != "" {
-		return g.forwardAPIKey(ctx, imageReq)
+		return g.forwardAPIKey(ctx, imageReq, "")
 	}
 	if account.Credentials["access_token"] != "" {
-		if isImagesWebReverseModel(origReq.Model) {
+		if shouldUseImagesWebReverse(account, origReq.Model) {
 			return g.forwardImagesViaWebReverse(ctx, imageReq)
 		}
 		return g.forwardImagesViaResponsesTool(ctx, imageReq)

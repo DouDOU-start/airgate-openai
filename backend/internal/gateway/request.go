@@ -343,7 +343,7 @@ func (g *OpenAIGateway) buildWSRequest(req *sdk.ForwardRequest, session openAISe
 		return nil, err
 	}
 	// applyForceInstructions 已在 forwardHTTP 入口统一处理
-	return body, nil
+	return applyOpenAIWireServiceTier(body), nil
 }
 
 // applyForceInstructions 若请求头中指定了 X-Airgate-Force-Instructions 则强制覆盖 instructions 字段。

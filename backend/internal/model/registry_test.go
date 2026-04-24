@@ -47,6 +47,15 @@ func TestLookup_KnownModelUnchanged(t *testing.T) {
 		if spec.InputPrice != 5.0 || spec.OutputPrice != 30.0 || spec.CachedPrice != 0.5 {
 			t.Errorf("gpt-5.5 定价变化: In=%v Out=%v Cached=%v", spec.InputPrice, spec.OutputPrice, spec.CachedPrice)
 		}
+		if spec.ContextWindow != 400000 {
+			t.Errorf("gpt-5.5 ContextWindow = %v, want 400000", spec.ContextWindow)
+		}
+		if spec.InputPricePriority != 12.5 || spec.OutputPricePriority != 75.0 || spec.CachedPricePriority != 1.25 {
+			t.Errorf("gpt-5.5 priority 定价变化: In=%v Out=%v Cached=%v", spec.InputPricePriority, spec.OutputPricePriority, spec.CachedPricePriority)
+		}
+		if spec.InputPriceFast != 0 || spec.OutputPriceFast != 0 || spec.CachedPriceFast != 0 {
+			t.Errorf("gpt-5.5 不应配置 fast 定价: In=%v Out=%v Cached=%v", spec.InputPriceFast, spec.OutputPriceFast, spec.CachedPriceFast)
+		}
 	})
 
 	t.Run("gpt-5.4", func(t *testing.T) {

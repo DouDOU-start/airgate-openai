@@ -57,6 +57,11 @@ type modelInfo struct {
 	OutputPricePriority      float64 `yaml:"output_price_priority,omitempty"`
 	CachedInputPricePriority float64 `yaml:"cached_input_price_priority,omitempty"`
 
+	// Fast 档单价（$/1M tokens）
+	InputPriceFast       float64 `yaml:"input_price_fast,omitempty"`
+	OutputPriceFast      float64 `yaml:"output_price_fast,omitempty"`
+	CachedInputPriceFast float64 `yaml:"cached_input_price_fast,omitempty"`
+
 	// Flex / Batch 档单价（$/1M tokens）
 	InputPriceFlex       float64 `yaml:"input_price_flex,omitempty"`
 	OutputPriceFlex      float64 `yaml:"output_price_flex,omitempty"`
@@ -192,6 +197,9 @@ func convertModels(models []sdk.ModelInfo) []modelInfo {
 			InputPricePriority:          m.InputPricePriority,
 			OutputPricePriority:         m.OutputPricePriority,
 			CachedInputPricePriority:    m.CachedInputPricePriority,
+			InputPriceFast:              m.InputPriceFast,
+			OutputPriceFast:             m.OutputPriceFast,
+			CachedInputPriceFast:        m.CachedInputPriceFast,
 			InputPriceFlex:              m.InputPriceFlex,
 			OutputPriceFlex:             m.OutputPriceFlex,
 			CachedInputPriceFlex:        m.CachedInputPriceFlex,

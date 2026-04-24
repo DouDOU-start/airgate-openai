@@ -136,14 +136,14 @@ gateway:
       cached_input_price_flex: 0.0375
     - id: gpt-5.5
       name: GPT 5.5
-      context_window: 272000
+      context_window: 400000
       max_output_tokens: 128000
       input_price: 5
       output_price: 30
       cached_input_price: 0.5
-      input_price_priority: 10
-      output_price_priority: 60
-      cached_input_price_priority: 1
+      input_price_priority: 12.5
+      output_price_priority: 75
+      cached_input_price_priority: 1.25
       input_price_flex: 2.5
       output_price_flex: 15
       cached_input_price_flex: 0.25

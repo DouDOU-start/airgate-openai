@@ -43,9 +43,14 @@ func (g *OpenAIGateway) forwardHTTP(ctx context.Context, req *sdk.ForwardRequest
 	// 统一预处理请求体。multipart 请求（images/edits 上传图片）body 是二进制，
 	// 不能按 JSON 处理否则会被 sjson 覆盖丢失数据。
 	_, reqPath := resolveAPIKeyRoute(req)
+	var reqServiceTier string
 	if !strings.HasPrefix(req.Headers.Get("Content-Type"), "multipart/") {
 		req.Body = preprocessRequestBody(req.Body, req.Model, reqPath)
 		req.Body = applyForceInstructions(req.Body, req.Headers)
+		reqServiceTier = normalizeOpenAIServiceTier(gjson.GetBytes(req.Body, "service_tier").String())
+		if req.Account.Credentials["api_key"] != "" && req.Account.Credentials["access_token"] == "" {
+			req.Body = applyOpenAIWireServiceTier(req.Body)
+		}
 	}
 
 	account := req.Account
@@ -76,11 +81,11 @@ func (g *OpenAIGateway) forwardHTTP(ctx context.Context, req *sdk.ForwardRequest
 	}
 
 	if account.Credentials["api_key"] != "" {
-		return g.forwardAPIKey(ctx, req)
+		return g.forwardAPIKey(ctx, req, reqServiceTier)
 	}
 	if account.Credentials["access_token"] != "" {
 		if isImagesRequest(reqPath) {
-			if isImagesWebReverseModel(req.Model) {
+			if shouldUseImagesWebReverse(account, req.Model) {
 				return g.forwardImagesViaWebReverse(ctx, req)
 			}
 			return g.forwardImagesViaResponsesTool(ctx, req)
@@ -148,7 +153,7 @@ func buildLocalModelsResponse(imageOnly bool) sdk.ForwardOutcome {
 // API Key 模式：HTTP/SSE 直连上游
 // ──────────────────────────────────────────────────────
 
-func (g *OpenAIGateway) forwardAPIKey(ctx context.Context, req *sdk.ForwardRequest) (sdk.ForwardOutcome, error) {
+func (g *OpenAIGateway) forwardAPIKey(ctx context.Context, req *sdk.ForwardRequest, reqServiceTier string) (sdk.ForwardOutcome, error) {
 	start := time.Now()
 	account := req.Account
 
@@ -226,9 +231,9 @@ func (g *OpenAIGateway) forwardAPIKey(ctx context.Context, req *sdk.ForwardReque
 	}
 
 	if req.Stream && req.Writer != nil {
-		return handleStreamResponse(resp, req.Writer, start)
+		return handleStreamResponse(resp, req.Writer, start, reqServiceTier)
 	}
-	return handleNonStreamResponse(resp, req.Writer, start)
+	return handleNonStreamResponse(resp, req.Writer, start, reqServiceTier)
 }
 
 func enrichModelsResponse(resp *http.Response) *http.Response {
@@ -472,7 +477,7 @@ func (g *OpenAIGateway) forwardOAuth(ctx context.Context, req *sdk.ForwardReques
 		OutputTokens:          result.OutputTokens,
 		CachedInputTokens:     result.CachedInputTokens,
 		ReasoningOutputTokens: result.ReasoningOutputTokens,
-		ServiceTier:           normalizeOpenAIServiceTier(gjson.GetBytes(createMsg, "service_tier").String()),
+		ServiceTier:           normalizeOpenAIServiceTier(gjson.GetBytes(req.Body, "service_tier").String()),
 		Model:                 result.Model,
 		FirstTokenMs:          firstTokenMs,
 	}

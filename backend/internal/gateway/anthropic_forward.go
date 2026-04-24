@@ -260,7 +260,7 @@ fallbackCheck:
 
 func finalizeAnthropicResponsesBody(responsesBody []byte, originalBody []byte, serviceTier string, sparkOverride bool) []byte {
 	result := responsesBody
-	if tier := normalizeOpenAIServiceTier(serviceTier); tier != "" {
+	if tier := normalizeOpenAIWireServiceTier(serviceTier); tier != "" {
 		result, _ = sjson.SetBytes(result, "service_tier", tier)
 	}
 	if hasWebSearchTool(originalBody) {
@@ -345,19 +345,20 @@ func (g *OpenAIGateway) forwardAnthropicResponses(
 		StoreCodexUsage(account.ID, snapshot)
 	}
 
+	serviceTier := firstNonEmptyTier(req.Headers.Get("X-Airgate-Service-Tier"), gjson.GetBytes(req.Body, "service_tier").String())
 	isStream := gjson.GetBytes(req.Body, "stream").Bool()
 	if isStream && w != nil {
 		if turnState := decodeTurnStateHeader(resp.Header); turnState != "" {
 			updateSessionStateTurnState(session.SessionKey, turnState)
 		}
-		outcome, err := translateResponsesSSEToAnthropicSSE(ctx, resp, w, originalModel, mappedModel, req.Body, start, session)
+		outcome, err := translateResponsesSSEToAnthropicSSE(ctx, resp, w, originalModel, mappedModel, req.Body, serviceTier, start, session)
 		return outcome, nil, err
 	}
 
 	if turnState := decodeTurnStateHeader(resp.Header); turnState != "" {
 		updateSessionStateTurnState(session.SessionKey, turnState)
 	}
-	outcome, err := g.handleAnthropicNonStreamFromResponses(resp, w, originalModel, mappedModel, req.Body, start, session, req.Account.ID)
+	outcome, err := g.handleAnthropicNonStreamFromResponses(resp, w, originalModel, mappedModel, req.Body, serviceTier, start, session, req.Account.ID)
 	return outcome, nil, err
 }
 
@@ -421,6 +422,7 @@ func (g *OpenAIGateway) handleAnthropicNonStreamFromResponses(
 	model string,
 	mappedModel string,
 	originalRequest []byte,
+	requestServiceTier string,
 	start time.Time,
 	session openAISessionResolution,
 	accountID int64,
@@ -473,7 +475,8 @@ func (g *OpenAIGateway) handleAnthropicNonStreamFromResponses(
 	if billingModel == "" {
 		billingModel = gjson.Get(anthropicJSON, "model").String()
 	}
-	serviceTier := normalizeOpenAIServiceTier(
+	serviceTier := firstNonEmptyTier(
+		requestServiceTier,
 		gjson.GetBytes(wsResult.CompletedEventRaw, "response.service_tier").String(),
 	)
 

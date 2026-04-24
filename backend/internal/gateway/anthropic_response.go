@@ -624,6 +624,7 @@ func translateResponsesSSEToAnthropicSSE(
 	model string,
 	mappedModel string,
 	originalRequest []byte,
+	requestServiceTier string,
 	start time.Time,
 	session openAISessionResolution,
 ) (sdk.ForwardOutcome, error) {
@@ -644,7 +645,7 @@ func translateResponsesSSEToAnthropicSSE(
 
 	var streamErr error
 	var firstTokenMs int64
-	var serviceTier string // 从上游 response.completed 事件中提取
+	serviceTier := firstNonEmptyTier(requestServiceTier)
 	skipCurrentOutput := false
 	firstTokenRecorded := false
 
@@ -689,9 +690,8 @@ func translateResponsesSSEToAnthropicSSE(
 				}
 			}
 			if eventType == "response.completed" || eventType == "response.done" {
-				// 从上游 response.completed 事件中提取 service_tier
-				if tier := normalizeOpenAIServiceTier(gjson.Get(data, "response.service_tier").String()); tier != "" {
-					serviceTier = tier
+				if serviceTier == "" {
+					serviceTier = normalizeOpenAIServiceTier(gjson.Get(data, "response.service_tier").String())
 				}
 				usageNode := gjson.Get(data, "response.usage")
 				slog.Info("[Anthropic←Responses] 上游 usage",
