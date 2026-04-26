@@ -86,10 +86,14 @@ func (g *OpenAIGateway) forwardChatCompletionsAsImages(ctx context.Context, req 
 		if sseKA != nil {
 			sseKA.Stop()
 			errMsg := outcome.Reason
+			if errMsg == "" && err != nil {
+				errMsg = err.Error()
+			}
 			if errMsg == "" {
 				errMsg = "image generation failed"
 			}
-			writeSSEError(req.Writer, errMsg)
+			g.logger.Warn("图片生成流式失败，已脱敏响应", "kind", outcome.Kind, "status_code", outcome.Upstream.StatusCode, "error", errMsg)
+			writeSSEError(req.Writer, sanitizedImageSSEErrorMessage)
 		}
 		return outcome, err
 	}
@@ -113,6 +117,8 @@ func (g *OpenAIGateway) forwardChatCompletionsAsImages(ctx context.Context, req 
 	}
 	return outcome, nil
 }
+
+const sanitizedImageSSEErrorMessage = "请求暂时无法完成，请稍后重试"
 
 // dispatchImageRequest 根据账号凭证类型分发到对应的图像生成管线。
 func (g *OpenAIGateway) dispatchImageRequest(ctx context.Context, origReq *sdk.ForwardRequest, imageReq *sdk.ForwardRequest) (sdk.ForwardOutcome, error) {
@@ -191,11 +197,9 @@ func buildChatCompatImagePayload(chatBody []byte, modelID, prompt string, imageR
 	}
 	payload["n"] = n
 
-	size := gjson.GetBytes(chatBody, "size").String()
-	if size == "" {
-		size = "1024x1024"
+	if size := gjson.GetBytes(chatBody, "size").String(); size != "" {
+		payload["size"] = normalizeImageSizeForUpstream(size)
 	}
-	payload["size"] = size
 
 	if v := gjson.GetBytes(chatBody, "quality").String(); v != "" {
 		payload["quality"] = v
@@ -390,10 +394,10 @@ func writeSSEDone(w http.ResponseWriter) {
 	}
 }
 
-func writeSSEError(w http.ResponseWriter, message string) {
+func writeSSEError(w http.ResponseWriter, _ string) {
 	errEvent, _ := json.Marshal(map[string]any{
 		"error": map[string]any{
-			"message": message,
+			"message": sanitizedImageSSEErrorMessage,
 			"type":    "server_error",
 		},
 	})

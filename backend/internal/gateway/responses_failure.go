@@ -102,10 +102,13 @@ func classifyResponsesFailure(data []byte) *responsesFailureError {
 // 与 response.failed 共用同一套关键词分类，确保客户端侧的错误（unsupported model
 // 等）被识别成 Kind=Client，避免归罪到账号。
 func classifyWSErrorEvent(data []byte) *responsesFailureError {
-	if gjson.GetBytes(data, "type").String() != "error" {
+	errNode := gjson.GetBytes(data, "error")
+	if !errNode.Exists() {
 		return nil
 	}
-	errNode := gjson.GetBytes(data, "error")
+	if eventType := gjson.GetBytes(data, "type").String(); eventType != "" && eventType != "error" {
+		return nil
+	}
 	msg := strings.TrimSpace(errNode.Get("message").String())
 	if msg == "" {
 		msg = strings.TrimSpace(string(data))

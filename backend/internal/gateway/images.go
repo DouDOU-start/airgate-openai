@@ -36,7 +36,7 @@ const imagesOAuthChatModel = "gpt-5.4"
 //     "prompt 被改了"。
 //   - 这里用极简指令把 gpt-5.4 的角色压缩成"透传路由"，只会补合规改写（如真实人物
 //     换成匿名替身，这是 OpenAI 侧硬编码的安全策略，instruction 拦不住）。
-const imagesPassthroughInstructions = "Forward the user's message verbatim as the prompt argument to the image_generation tool. Do not rewrite, elaborate, or add details about style, composition, lighting, color, mood, or any elements the user did not explicitly request. Do not answer with text."
+const imagesPassthroughInstructions = "Use the user's image description and appended Image API constraints as the image_generation prompt. Preserve the user's original description verbatim; do not rewrite, elaborate, or add details about style, composition, lighting, color, mood, or any elements the user did not explicitly request. Treat Image API constraints as generation parameters, not visible text. Do not answer with text."
 
 // imageGenOutputTokenTable 按 OpenAI 官方 image_generation tool 的 token 换算表，
 // 用于 ChatGPT OAuth 账号（上游 tool_usage.image_gen 永远为 0）时估算 output token。
@@ -318,6 +318,70 @@ func normalizeImageRef(s string) string {
 	return "data:image/png;base64," + s
 }
 
+func normalizedImageOutputFormat(format string) string {
+	f := strings.ToLower(strings.TrimSpace(format))
+	if f == "" {
+		return "png"
+	}
+	return f
+}
+
+func buildImagesToolPrompt(req *imagesRequest, isEdit bool) string {
+	lines := imageAPIConstraintLines(req, isEdit)
+	if len(lines) == 0 {
+		return req.Prompt
+	}
+	var b strings.Builder
+	b.WriteString(req.Prompt)
+	b.WriteString("\n\nImage API constraints:\n")
+	for _, line := range lines {
+		b.WriteString("- ")
+		b.WriteString(line)
+		b.WriteByte('\n')
+	}
+	return strings.TrimRight(b.String(), "\n")
+}
+
+func buildImagesToolInstructions(req *imagesRequest, isEdit bool) string {
+	lines := imageAPIConstraintLines(req, isEdit)
+	if len(lines) == 0 {
+		return imagesPassthroughInstructions
+	}
+	return imagesPassthroughInstructions + "\nHonor these Image API constraints when invoking image_generation: " + strings.Join(lines, " ")
+}
+
+func imageAPIConstraintLines(req *imagesRequest, isEdit bool) []string {
+	if req == nil {
+		return nil
+	}
+	lines := make([]string, 0, 6)
+	if size := cleanImageConstraintValue(normalizeImageSizeForUpstream(req.Size)); size != "" {
+		lines = append(lines, "Generate the image at "+size+" pixels.")
+	}
+	if quality := cleanImageConstraintValue(req.Quality); quality != "" {
+		lines = append(lines, "Use image quality setting "+quality+".")
+	}
+	if background := cleanImageConstraintValue(req.Background); background != "" {
+		lines = append(lines, "Use background setting "+background+".")
+	}
+	if model := cleanImageConstraintValue(req.Model); strings.HasPrefix(strings.ToLower(model), "gpt-image-") {
+		lines = append(lines, "Use requested image model "+model+".")
+	}
+	if isEdit {
+		if fidelity := cleanImageConstraintValue(req.InputFidelity); fidelity != "" {
+			lines = append(lines, "Use input_fidelity setting "+fidelity+" for the reference images.")
+		}
+		if req.Mask != "" {
+			lines = append(lines, "Use the attached mask image as the edit mask; change only masked areas and preserve unmasked areas.")
+		}
+	}
+	return lines
+}
+
+func cleanImageConstraintValue(value string) string {
+	return strings.Join(strings.Fields(strings.TrimSpace(value)), " ")
+}
+
 // buildImagesToolCreateMsg 把 Images REST 请求体翻译成 Responses API 的
 // response.create 消息（tools 数组带一个 image_generation 项）。
 // 返回：上游消息 bytes；n（当前固定 1）；prompt 估算的 token 数（用于计费）。
@@ -339,45 +403,28 @@ func buildImagesToolCreateMsg(
 		return nil, 0, 0, fmt.Errorf("OAuth 模式下 n 只能为 1（REST→tools 翻译路径暂不支持多图）")
 	}
 	tool := map[string]any{
-		"type": "image_generation",
+		"type":          "image_generation",
+		"output_format": normalizedImageOutputFormat(req.OutputFormat),
 	}
-	if req.Size != "" {
-		tool["size"] = req.Size
-	}
-	if req.Quality != "" {
-		tool["quality"] = req.Quality
-	}
-	if req.Background != "" {
-		tool["background"] = req.Background
-	}
-	// 客户端 model 字段若是 gpt-image-* 系列，透传到 tool 内部模型；否则让上游默认（gpt-image-1.5）。
-	// 这样客户端可以主动尝试 gpt-image-2 等新模型而不用改插件代码。
-	if strings.HasPrefix(strings.ToLower(req.Model), "gpt-image-") {
-		tool["model"] = req.Model
-	}
-	if req.OutputFormat != "" {
-		tool["output_format"] = req.OutputFormat
-	}
-	// /edits 独有字段：input_fidelity 控制参考图还原度；mask 走 tool 的 input_image_mask。
-	if isEdit {
-		if req.InputFidelity != "" {
-			tool["input_fidelity"] = req.InputFidelity
-		}
-		if req.Mask != "" {
-			tool["input_image_mask"] = map[string]any{"image_url": req.Mask}
-		}
-	}
+	prompt := buildImagesToolPrompt(req, isEdit)
+	instructions := buildImagesToolInstructions(req, isEdit)
 
 	// input 必须是 list 形式（与 normalizeResponsesInput 的 string→list 包装一致），
 	// 否则上游返回 "Input must be a list"。/edits 在同一条 user message 的 content
 	// 里把 input_text 与 input_image 并列，image_generation tool 会拿去做图生图。
 	content := []map[string]any{
-		{"type": "input_text", "text": req.Prompt},
+		{"type": "input_text", "text": prompt},
 	}
 	for _, url := range req.Images {
 		content = append(content, map[string]any{
 			"type":      "input_image",
 			"image_url": url,
+		})
+	}
+	if isEdit && req.Mask != "" {
+		content = append(content, map[string]any{
+			"type":      "input_image",
+			"image_url": req.Mask,
 		})
 	}
 	inputList := []map[string]any{
@@ -389,9 +436,10 @@ func buildImagesToolCreateMsg(
 	}
 	payload := map[string]any{
 		"model":        imagesOAuthChatModel,
-		"instructions": imagesPassthroughInstructions,
+		"instructions": instructions,
 		"input":        inputList,
 		"tools":        []any{tool},
+		"tool_choice":  "auto",
 		"stream":       true,
 		"store":        false,
 	}
@@ -401,7 +449,11 @@ func buildImagesToolCreateMsg(
 	}
 	// input token 估算：文本 prompt + 每张参考图按 size 低质档估算（~272 tokens/1024²），
 	// 与 image_generation tool 输入图像的 token 级别一致。
-	inputTokens := estimatePromptTokens(req.Prompt) + estimateImageInputTokens(len(req.Images), req.Size)
+	imageInputCount := len(req.Images)
+	if isEdit && req.Mask != "" {
+		imageInputCount++
+	}
+	inputTokens := estimatePromptTokens(req.Prompt) + estimateImageInputTokens(imageInputCount, req.Size)
 	return msg, req.N, inputTokens, nil
 }
 

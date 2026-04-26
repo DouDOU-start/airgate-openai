@@ -1,7 +1,7 @@
 package gateway
 
 import (
-	"encoding/json"
+	"net/http/httptest"
 	"strings"
 	"testing"
 
@@ -94,8 +94,8 @@ func TestBuildChatCompatImagePayload(t *testing.T) {
 	t.Run("defaults", func(t *testing.T) {
 		chatBody := []byte(`{"messages":[{"role":"user","content":"hi"}]}`)
 		p := buildChatCompatImagePayload(chatBody, "gpt-image-2", "hi", nil)
-		if p["size"] != "1024x1024" {
-			t.Errorf("default size = %v, want 1024x1024", p["size"])
+		if _, ok := p["size"]; ok {
+			t.Errorf("default size should be absent, got %v", p["size"])
 		}
 		if p["n"] != 1 {
 			t.Errorf("default n = %v, want 1", p["n"])
@@ -122,6 +122,14 @@ func TestBuildChatCompatImagePayload(t *testing.T) {
 		}
 		if p["output_format"] != "webp" {
 			t.Errorf("output_format = %v", p["output_format"])
+		}
+	})
+
+	t.Run("clamps oversized size", func(t *testing.T) {
+		chatBody := []byte(`{"messages":[],"size":"4096x2304"}`)
+		p := buildChatCompatImagePayload(chatBody, "gpt-image-1", "draw", nil)
+		if p["size"] != "3840x2160" {
+			t.Errorf("size = %v, want 3840x2160", p["size"])
 		}
 	})
 
@@ -301,17 +309,20 @@ func TestIsChatCompatImageModel(t *testing.T) {
 // ── writeSSEError ──
 
 func TestWriteSSEError(t *testing.T) {
-	// Verify the error event is valid JSON with expected structure
-	errEvent, _ := json.Marshal(map[string]any{
-		"error": map[string]any{
-			"message": "test error",
-			"type":    "server_error",
-		},
-	})
-	if !gjson.ValidBytes(errEvent) {
-		t.Error("error event is not valid JSON")
+	w := httptest.NewRecorder()
+	writeSSEError(w, "upstream request id 349f8894")
+	body := w.Body.String()
+	if strings.Contains(body, "upstream request id") || strings.Contains(body, "349f8894") {
+		t.Fatalf("response leaked upstream error: %q", body)
 	}
-	if gjson.GetBytes(errEvent, "error.message").String() != "test error" {
+	payload := strings.TrimPrefix(strings.Split(body, "\n")[0], "data: ")
+	if !gjson.Valid(payload) {
+		t.Fatalf("error event is not valid JSON: %q", payload)
+	}
+	if gjson.Get(payload, "error.message").String() != sanitizedImageSSEErrorMessage {
 		t.Error("error message mismatch")
+	}
+	if gjson.Get(payload, "error.type").String() != "server_error" {
+		t.Error("error type mismatch")
 	}
 }

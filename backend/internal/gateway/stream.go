@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"regexp"
 	"strconv"
@@ -34,25 +35,39 @@ func handleStreamResponse(resp *http.Response, w http.ResponseWriter, start time
 	w.Header().Set("Connection", "keep-alive")
 	w.Header().Set("X-Accel-Buffering", "no")
 	passCodexRateLimitHeaders(resp.Header, w.Header())
-	w.WriteHeader(resp.StatusCode)
 
 	usage := &sdk.Usage{ServiceTier: reqServiceTier}
 	scanner := bufio.NewScanner(resp.Body)
 	scanner.Buffer(make([]byte, 64*1024), upstreamSSEMaxLineBytes)
 	var streamErr error
 	firstTokenRecorded := false
+	streamStarted := false
 	var toolImageIn, toolImageOut int // kept for SSE parsing compatibility
 
 	for scanner.Scan() {
 		line := scanner.Text()
+		data, ok := extractSSEData(line)
+		if ok && len(data) > 0 && data != "[DONE]" {
+			if streamErr = parseSSEFailureEvent([]byte(data)); streamErr != nil {
+				logStreamFailure(streamErr, resp.StatusCode, streamStarted)
+				if streamStarted {
+					writeSanitizedSSEError(w)
+				}
+				break
+			}
+		}
+
+		if !streamStarted {
+			w.WriteHeader(resp.StatusCode)
+		}
 		if _, err := fmt.Fprintf(w, "%s\n", line); err != nil {
 			break
 		}
+		streamStarted = true
 		if flusher, ok := w.(http.Flusher); ok {
 			flusher.Flush()
 		}
 
-		data, ok := extractSSEData(line)
 		if !ok || len(data) == 0 || data == "[DONE]" {
 			continue
 		}
@@ -61,9 +76,6 @@ func handleStreamResponse(resp *http.Response, w http.ResponseWriter, start time
 			firstTokenRecorded = true
 		}
 		parseSSEUsage([]byte(data), usage, &toolImageIn, &toolImageOut)
-		if streamErr == nil {
-			streamErr = parseSSEFailureEvent([]byte(data))
-		}
 	}
 	if err := scanner.Err(); err != nil && streamErr == nil {
 		streamErr = fmt.Errorf("读取上游 SSE 失败: %w", err)
@@ -73,12 +85,8 @@ func handleStreamResponse(resp *http.Response, w http.ResponseWriter, start time
 	if streamErr != nil {
 		var failure *responsesFailureError
 		if errors.As(streamErr, &failure) {
-			// 流式中断的 failure：字节已经开始写，Core 看到 StreamAborted 走错误分支
-			// 但不会罚账号；ClientError / RateLimited 在分类器里也映射到对应 Kind。
 			kind := failure.outcomeKind()
-			// 流已开写后的失败其实都是 Aborted 语义；特殊保留 ClientError / RateLimited
-			// 的原因文本，但 Kind 统一改 StreamAborted 以防 Core 试图 failover。
-			if kind != sdk.OutcomeClientError {
+			if streamStarted && kind != sdk.OutcomeClientError {
 				kind = sdk.OutcomeStreamAborted
 			}
 			return sdk.ForwardOutcome{
@@ -105,6 +113,38 @@ func handleStreamResponse(resp *http.Response, w http.ResponseWriter, start time
 		Usage:    usage,
 		Duration: elapsed,
 	}, nil
+}
+
+func logStreamFailure(err error, statusCode int, streamStarted bool) {
+	var failure *responsesFailureError
+	if errors.As(err, &failure) {
+		slog.Warn("上游 SSE 返回错误，已脱敏处理",
+			"kind", failure.Kind,
+			"status_code", firstNonZero(failure.StatusCode, statusCode),
+			"stream_started", streamStarted,
+			"message", failure.Message)
+		return
+	}
+	slog.Warn("上游 SSE 返回错误，已脱敏处理",
+		"status_code", statusCode,
+		"stream_started", streamStarted,
+		"error", err)
+}
+
+func writeSanitizedSSEError(w http.ResponseWriter) {
+	_, _ = w.Write([]byte("data: {\"error\":{\"message\":\"请求暂时无法完成，请稍后重试\",\"type\":\"server_error\",\"code\":\"upstream_error\"}}\n\n"))
+	if flusher, ok := w.(http.Flusher); ok {
+		flusher.Flush()
+	}
+}
+
+func firstNonZero(values ...int) int {
+	for _, value := range values {
+		if value != 0 {
+			return value
+		}
+	}
+	return 0
 }
 
 // handleNonStreamResponse 处理非流式响应。resp.StatusCode 预设 2xx。
@@ -328,6 +368,9 @@ func parseSSEUsage(data []byte, out *sdk.Usage, toolImageIn, toolImageOut *int) 
 // parseSSEFailureEvent 解析 Responses API 的失败事件并映射为错误
 func parseSSEFailureEvent(data []byte) error {
 	if failure := classifyResponsesFailure(data); failure != nil {
+		return failure
+	}
+	if failure := classifyWSErrorEvent(data); failure != nil {
 		return failure
 	}
 	eventType := gjson.GetBytes(data, "type").String()

@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/textproto"
+	"strings"
 	"testing"
 	"time"
 
@@ -98,6 +99,64 @@ func TestShouldUseImagesWebReverse(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			if got := shouldUseImagesWebReverse(tc.account, tc.model); got != tc.want {
 				t.Fatalf("shouldUseImagesWebReverse() = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestApplyWebReverseSizeHint(t *testing.T) {
+	const prompt = "draw a cat"
+	cases := []struct {
+		name string
+		size string
+		want string
+	}{
+		{
+			name: "frontend landscape size",
+			size: "2048x1360",
+			want: "Generate a landscape image at 2048x1360 resolution. draw a cat",
+		},
+		{
+			name: "portrait size",
+			size: "1024x1536",
+			want: "Generate a portrait image at 1024x1536 resolution. draw a cat",
+		},
+		{
+			name: "square size",
+			size: "1024x1024",
+			want: "Generate a square image at 1024x1024 resolution. draw a cat",
+		},
+		{
+			name: "spaced uppercase separator",
+			size: " 2048 X 1360 ",
+			want: "Generate a landscape image at 2048x1360 resolution. draw a cat",
+		},
+		{
+			name: "oversized landscape is clamped",
+			size: "4096x2304",
+			want: "Generate a landscape image at 3840x2160 resolution. draw a cat",
+		},
+		{
+			name: "oversized portrait is clamped",
+			size: "2304x4096",
+			want: "Generate a portrait image at 2160x3840 resolution. draw a cat",
+		},
+		{
+			name: "ratio is ignored",
+			size: "16:9",
+			want: prompt,
+		},
+		{
+			name: "invalid size is ignored",
+			size: "0x1024",
+			want: prompt,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := applyWebReverseSizeHint(prompt, tc.size); got != tc.want {
+				t.Fatalf("applyWebReverseSizeHint() = %q, want %q", got, tc.want)
 			}
 		})
 	}
@@ -339,7 +398,7 @@ func TestCollectImageGenCall(t *testing.T) {
 }
 
 // TestBuildImagesToolCreateMsg 翻译 Images REST 请求体为 Responses API
-// response.create 消息，tool 配置应正确透传 size/quality/background 等字段。
+// response.create 消息，tool 配置保持 Codex 对齐的极简 schema。
 func TestBuildImagesToolCreateMsg(t *testing.T) {
 	body := []byte(`{"model":"gpt-image-1.5","prompt":"a shiba","n":1,"size":"1024x1024","quality":"low","background":"transparent","output_format":"png"}`)
 	msg, n, promptTokens, err := buildImagesToolCreateMsg(body, "application/json", false, openAISessionResolution{})
@@ -354,37 +413,62 @@ func TestBuildImagesToolCreateMsg(t *testing.T) {
 		t.Errorf("promptTokens = %d, want 3", promptTokens)
 	}
 
-	// 结构检查
 	if gjson.GetBytes(msg, "type").String() != "response.create" {
 		t.Errorf("type = %q, want response.create", gjson.GetBytes(msg, "type").String())
 	}
 	if gjson.GetBytes(msg, "model").String() != imagesOAuthChatModel {
 		t.Errorf("model = %q, want %q", gjson.GetBytes(msg, "model").String(), imagesOAuthChatModel)
 	}
-	// input 必须是 list 形式
+	if gjson.GetBytes(msg, "tool_choice").String() != "auto" {
+		t.Errorf("tool_choice = %q, want auto", gjson.GetBytes(msg, "tool_choice").String())
+	}
 	inputItem := gjson.GetBytes(msg, "input.0")
 	if inputItem.Get("type").String() != "message" || inputItem.Get("role").String() != "user" {
 		t.Errorf("input[0] type/role wrong: %s", inputItem.Raw)
 	}
-	if inputItem.Get("content.0.text").String() != "a shiba" {
-		t.Errorf("input[0].content[0].text = %q, want a shiba", inputItem.Get("content.0.text").String())
+	prompt := inputItem.Get("content.0.text").String()
+	if !strings.HasPrefix(prompt, "a shiba\n\nImage API constraints:\n") {
+		t.Errorf("prompt prefix wrong: %q", prompt)
+	}
+	for _, want := range []string{
+		"Generate the image at 1024x1024 pixels.",
+		"Use image quality setting low.",
+		"Use background setting transparent.",
+		"Use requested image model gpt-image-1.5.",
+	} {
+		if !strings.Contains(prompt, want) {
+			t.Errorf("prompt missing constraint %q: %q", want, prompt)
+		}
+		if !strings.Contains(gjson.GetBytes(msg, "instructions").String(), want) {
+			t.Errorf("instructions missing constraint %q", want)
+		}
 	}
 	tool := gjson.GetBytes(msg, "tools.0")
 	if tool.Get("type").String() != "image_generation" {
 		t.Errorf("tools[0].type = %q, want image_generation", tool.Get("type").String())
 	}
-	if tool.Get("size").String() != "1024x1024" {
-		t.Errorf("tools[0].size = %q, want 1024x1024", tool.Get("size").String())
+	if tool.Get("output_format").String() != "png" {
+		t.Errorf("tools[0].output_format = %q, want png", tool.Get("output_format").String())
 	}
-	if tool.Get("quality").String() != "low" {
-		t.Errorf("tools[0].quality = %q, want low", tool.Get("quality").String())
+	for _, forbidden := range []string{"size", "quality", "background", "model", "n"} {
+		if tool.Get(forbidden).Exists() {
+			t.Errorf("tools[0].%s should not be present", forbidden)
+		}
 	}
-	if tool.Get("background").String() != "transparent" {
-		t.Errorf("tools[0].background = %q, want transparent", tool.Get("background").String())
+}
+
+func TestBuildImagesToolCreateMsg_ClampsOversizedSize(t *testing.T) {
+	body := []byte(`{"model":"gpt-image-1.5","prompt":"a shiba","n":1,"size":"4096x2304"}`)
+	msg, _, _, err := buildImagesToolCreateMsg(body, "application/json", false, openAISessionResolution{})
+	if err != nil {
+		t.Fatalf("buildImagesToolCreateMsg returned err: %v", err)
 	}
-	// Responses API image_generation tool schema 不包含 n 字段，此处不应出现
-	if tool.Get("n").Exists() {
-		t.Errorf("tools[0].n should not be present (image_generation tool schema forbids it)")
+	prompt := gjson.GetBytes(msg, "input.0.content.0.text").String()
+	if !strings.Contains(prompt, "Generate the image at 3840x2160 pixels.") {
+		t.Errorf("prompt missing clamped size constraint: %q", prompt)
+	}
+	if gjson.GetBytes(msg, "tools.0.size").Exists() {
+		t.Errorf("tools[0].size should not be present")
 	}
 }
 
@@ -406,8 +490,7 @@ func TestBuildImagesToolCreateMsg_EmptyPrompt(t *testing.T) {
 }
 
 // TestBuildImagesToolCreateMsg_Edit_JSON 验证 /images/edits 走 JSON 路径时：
-// 参考图会以 input_image 注入到 user message 的 content 里，
-// mask 走 tool 的 input_image_mask 字段，input_fidelity 也透传到 tool。
+// 参考图与 mask 会以 input_image 注入，edit 参数作为 prompt/instructions 约束传递。
 func TestBuildImagesToolCreateMsg_Edit_JSON(t *testing.T) {
 	body := []byte(`{
 		"model":"gpt-image-1.5",
@@ -424,26 +507,40 @@ func TestBuildImagesToolCreateMsg_Edit_JSON(t *testing.T) {
 	if n != 1 {
 		t.Errorf("n = %d, want 1", n)
 	}
-	// text prompt "make it cyberpunk" = 17 runes → 6；image input = 1 * 272 → 278
-	if inputTokens != 6+272 {
-		t.Errorf("inputTokens = %d, want %d", inputTokens, 6+272)
+	// text prompt "make it cyberpunk" = 17 runes → 6；reference image + mask = 2 * 272 → 550
+	if inputTokens != 6+272*2 {
+		t.Errorf("inputTokens = %d, want %d", inputTokens, 6+272*2)
 	}
 	content := gjson.GetBytes(msg, "input.0.content")
-	if !content.IsArray() || len(content.Array()) != 2 {
-		t.Fatalf("content len = %d, want 2 (text + image)", len(content.Array()))
+	if !content.IsArray() || len(content.Array()) != 3 {
+		t.Fatalf("content len = %d, want 3 (text + image + mask)", len(content.Array()))
 	}
-	if content.Get("0.type").String() != "input_text" || content.Get("1.type").String() != "input_image" {
+	if content.Get("0.type").String() != "input_text" || content.Get("1.type").String() != "input_image" || content.Get("2.type").String() != "input_image" {
 		t.Errorf("content types wrong: %s", content.Raw)
 	}
 	if content.Get("1.image_url").String() != "data:image/png;base64,AAA" {
 		t.Errorf("image_url not propagated: %s", content.Raw)
 	}
-	tool := gjson.GetBytes(msg, "tools.0")
-	if tool.Get("input_fidelity").String() != "high" {
-		t.Errorf("input_fidelity not propagated: %s", tool.Raw)
+	if content.Get("2.image_url").String() != "data:image/png;base64,BBB" {
+		t.Errorf("mask image_url not propagated: %s", content.Raw)
 	}
-	if tool.Get("input_image_mask.image_url").String() != "data:image/png;base64,BBB" {
-		t.Errorf("input_image_mask not propagated: %s", tool.Raw)
+	prompt := content.Get("0.text").String()
+	for _, want := range []string{
+		"Use input_fidelity setting high for the reference images.",
+		"Use the attached mask image as the edit mask; change only masked areas and preserve unmasked areas.",
+	} {
+		if !strings.Contains(prompt, want) {
+			t.Errorf("prompt missing edit constraint %q: %q", want, prompt)
+		}
+		if !strings.Contains(gjson.GetBytes(msg, "instructions").String(), want) {
+			t.Errorf("instructions missing edit constraint %q", want)
+		}
+	}
+	tool := gjson.GetBytes(msg, "tools.0")
+	for _, forbidden := range []string{"input_fidelity", "input_image_mask", "size", "model"} {
+		if tool.Get(forbidden).Exists() {
+			t.Errorf("tools[0].%s should not be present", forbidden)
+		}
 	}
 }
 

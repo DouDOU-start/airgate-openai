@@ -1,7 +1,10 @@
 package gateway
 
 import (
+	"io"
 	"net/http"
+	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -76,6 +79,41 @@ func TestClassifyWSErrorEventUsageLimitReached(t *testing.T) {
 	}
 	if failure.RetryAfter < 59*time.Minute || failure.RetryAfter > 61*time.Minute {
 		t.Fatalf("expected RetryAfter~=1h from resets_in_seconds, got %s", failure.RetryAfter)
+	}
+}
+
+func TestClassifyWSErrorEventOpenAICompatSSEError(t *testing.T) {
+	raw := []byte(`{"error":{"message":"An error occurred while processing your request. Please include the request ID 349f8894 in your message.","type":"server_error","code":"upstream_error"}}`)
+	failure := classifyWSErrorEvent(raw)
+	if failure == nil {
+		t.Fatalf("expected failure")
+	}
+	if failure.Kind != responsesFailureKindServer {
+		t.Fatalf("expected server kind, got %q", failure.Kind)
+	}
+	if failure.Message != "An error occurred while processing your request. Please include the request ID 349f8894 in your message." {
+		t.Fatalf("unexpected message %q", failure.Message)
+	}
+}
+
+func TestHandleStreamResponseSanitizesFirstSSEError(t *testing.T) {
+	resp := &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{},
+		Body:       io.NopCloser(strings.NewReader("data: {\"error\":{\"message\":\"upstream secret request ID 349f8894\",\"type\":\"server_error\",\"code\":\"upstream_error\"}}\n\n")),
+	}
+	w := httptest.NewRecorder()
+
+	outcome, err := handleStreamResponse(resp, w, time.Now(), "")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if outcome.Kind != sdk.OutcomeUpstreamTransient {
+		t.Fatalf("expected OutcomeUpstreamTransient, got %v", outcome.Kind)
+	}
+	body := w.Body.String()
+	if strings.Contains(body, "upstream secret") || strings.Contains(body, "349f8894") {
+		t.Fatalf("response leaked upstream error: %q", body)
 	}
 }
 

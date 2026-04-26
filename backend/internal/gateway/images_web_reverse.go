@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
@@ -241,21 +242,62 @@ func webReverseImagesError(start time.Time, status int, w http.ResponseWriter, m
 	return outcome, fmt.Errorf("%s", msg)
 }
 
-// webReverseSizeHints 把 OpenAI API 的 size 参数映射为 prompt 前缀提示。
-var webReverseSizeHints = map[string]string{
-	"1024x1024": "Generate a square image (1024x1024). ",
-	"1024x1536": "Generate a portrait image (1024x1536). ",
-	"1536x1024": "Generate a landscape image (1536x1024). ",
-	"512x512":   "Generate a square image (512x512). ",
-	"256x256":   "Generate a small square image (256x256). ",
+const webReverseMaxImageEdge = 3840
+
+func normalizeImageSizeForUpstream(size string) string {
+	width, height, ok := parseImageSize(size)
+	if !ok {
+		return strings.TrimSpace(size)
+	}
+	width, height = clampImageSize(width, height, webReverseMaxImageEdge)
+	return fmt.Sprintf("%dx%d", width, height)
 }
 
 func applyWebReverseSizeHint(prompt, size string) string {
-	size = strings.ToLower(strings.TrimSpace(size))
-	if hint, ok := webReverseSizeHints[size]; ok {
-		return hint + prompt
+	width, height, ok := parseImageSize(size)
+	if !ok {
+		return prompt
 	}
-	return prompt
+
+	width, height = clampImageSize(width, height, webReverseMaxImageEdge)
+	orientation := "square"
+	if width > height {
+		orientation = "landscape"
+	} else if width < height {
+		orientation = "portrait"
+	}
+	return fmt.Sprintf("Generate a %s image at %dx%d resolution. %s", orientation, width, height, prompt)
+}
+
+func parseImageSize(size string) (int, int, bool) {
+	parts := strings.Split(strings.ToLower(strings.TrimSpace(size)), "x")
+	if len(parts) != 2 {
+		return 0, 0, false
+	}
+
+	width, err := strconv.Atoi(strings.TrimSpace(parts[0]))
+	if err != nil || width <= 0 {
+		return 0, 0, false
+	}
+	height, err := strconv.Atoi(strings.TrimSpace(parts[1]))
+	if err != nil || height <= 0 {
+		return 0, 0, false
+	}
+	return width, height, true
+}
+
+func clampImageSize(width, height, maxEdge int) (int, int) {
+	if width <= maxEdge && height <= maxEdge {
+		return width, height
+	}
+	if width >= height {
+		return maxEdge, scaleImageDimension(height, width, maxEdge)
+	}
+	return scaleImageDimension(width, height, maxEdge), maxEdge
+}
+
+func scaleImageDimension(value, oldEdge, newEdge int) int {
+	return int((int64(value)*int64(newEdge) + int64(oldEdge)/2) / int64(oldEdge))
 }
 
 // classifyWebReverseError 根据 err.Error() 文本判定 HTTP 状态码。
