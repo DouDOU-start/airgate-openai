@@ -4,6 +4,10 @@ import (
 	"bytes"
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
+	"image"
+	"image/color"
+	"image/png"
 	"io"
 	"math"
 	"mime/multipart"
@@ -18,6 +22,23 @@ import (
 
 	sdk "github.com/DouDOU-start/airgate-sdk"
 )
+
+func testPNGDataURL(width, height int, pixel func(int, int) color.RGBA) string {
+	img := image.NewRGBA(image.Rect(0, 0, width, height))
+	for y := 0; y < height; y++ {
+		for x := 0; x < width; x++ {
+			img.SetRGBA(x, y, pixel(x, y))
+		}
+	}
+	var buf bytes.Buffer
+	_ = png.Encode(&buf, img)
+	return "data:image/png;base64," + base64.StdEncoding.EncodeToString(buf.Bytes())
+}
+
+func testPNGBase64(width, height int, pixel func(int, int) color.RGBA) string {
+	dataURL := testPNGDataURL(width, height, pixel)
+	return strings.TrimPrefix(dataURL, "data:image/png;base64,")
+}
 
 func TestIsImagesRequest(t *testing.T) {
 	cases := []struct {
@@ -364,6 +385,52 @@ func TestFillUsageCostWithImageTool_NoToolUsage(t *testing.T) {
 	}
 }
 
+func TestCompositeMaskedImageGenCalls(t *testing.T) {
+	base := testPNGDataURL(2, 1, func(x, y int) color.RGBA {
+		if x == 0 {
+			return color.RGBA{R: 10, G: 20, B: 30, A: 255}
+		}
+		return color.RGBA{R: 40, G: 50, B: 60, A: 255}
+	})
+	mask := testPNGDataURL(2, 1, func(x, y int) color.RGBA {
+		if x == 0 {
+			return color.RGBA{A: 0}
+		}
+		return color.RGBA{A: 255}
+	})
+	generated := testPNGBase64(2, 1, func(x, y int) color.RGBA {
+		if x == 0 {
+			return color.RGBA{R: 200, G: 210, B: 220, A: 255}
+		}
+		return color.RGBA{R: 230, G: 240, B: 250, A: 255}
+	})
+
+	calls, err := compositeMaskedImageGenCalls(&imagesRequest{
+		Images: []string{base},
+		Mask:   mask,
+	}, []ImageGenCall{{Result: generated, RevisedPrompt: "internal prompt"}})
+	if err != nil {
+		t.Fatalf("compositeMaskedImageGenCalls returned err: %v", err)
+	}
+	if len(calls) != 1 {
+		t.Fatalf("calls len = %d, want 1", len(calls))
+	}
+	img, err := decodeBase64Image(calls[0].Result)
+	if err != nil {
+		t.Fatalf("decode composited result: %v", err)
+	}
+	if got := sampleImageRGBA(img, 0, 0, 2, 1); got != (color.RGBA{R: 200, G: 210, B: 220, A: 255}) {
+		t.Errorf("masked pixel = %+v, want generated pixel", got)
+	}
+	if got := sampleImageRGBA(img, 1, 0, 2, 1); got != (color.RGBA{R: 40, G: 50, B: 60, A: 255}) {
+		t.Errorf("unmasked pixel = %+v, want original base pixel", got)
+	}
+	stripImageRevisedPrompts(calls)
+	if calls[0].RevisedPrompt != "" {
+		t.Errorf("RevisedPrompt = %q, want empty", calls[0].RevisedPrompt)
+	}
+}
+
 // TestCollectImageGenCall 抽取 output_item.done 里的 image_generation_call 条目。
 func TestCollectImageGenCall(t *testing.T) {
 	item := map[string]any{
@@ -490,16 +557,26 @@ func TestBuildImagesToolCreateMsg_EmptyPrompt(t *testing.T) {
 }
 
 // TestBuildImagesToolCreateMsg_Edit_JSON 验证 /images/edits 走 JSON 路径时：
-// 参考图与 mask 会以 input_image 注入，edit 参数作为 prompt/instructions 约束传递。
+// 参考图以 input_image 注入，mask 转成 Codex built-in image_gen 可理解的区域标注图。
 func TestBuildImagesToolCreateMsg_Edit_JSON(t *testing.T) {
-	body := []byte(`{
+	imageRef := testPNGDataURL(2, 2, func(x, y int) color.RGBA {
+		return color.RGBA{R: 80, G: 90, B: 100, A: 255}
+	})
+	maskRef := testPNGDataURL(2, 2, func(x, y int) color.RGBA {
+		if x == 1 && y == 1 {
+			return color.RGBA{A: 0}
+		}
+		return color.RGBA{R: 255, G: 255, B: 255, A: 255}
+	})
+	body := []byte(fmt.Sprintf(`{
 		"model":"gpt-image-1.5",
 		"prompt":"make it cyberpunk",
 		"size":"1024x1024",
 		"input_fidelity":"high",
-		"image":"data:image/png;base64,AAA",
-		"mask":"data:image/png;base64,BBB"
-	}`)
+		"output_format":"jpeg",
+		"image":%q,
+		"mask":%q
+	}`, imageRef, maskRef))
 	msg, n, inputTokens, err := buildImagesToolCreateMsg(body, "application/json", true, openAISessionResolution{})
 	if err != nil {
 		t.Fatalf("err: %v", err)
@@ -507,27 +584,29 @@ func TestBuildImagesToolCreateMsg_Edit_JSON(t *testing.T) {
 	if n != 1 {
 		t.Errorf("n = %d, want 1", n)
 	}
-	// text prompt "make it cyberpunk" = 17 runes → 6；reference image + mask = 2 * 272 → 550
+	// text prompt "make it cyberpunk" = 17 runes → 6；reference image + region annotation = 2 * 272 → 550
 	if inputTokens != 6+272*2 {
 		t.Errorf("inputTokens = %d, want %d", inputTokens, 6+272*2)
 	}
 	content := gjson.GetBytes(msg, "input.0.content")
 	if !content.IsArray() || len(content.Array()) != 3 {
-		t.Fatalf("content len = %d, want 3 (text + image + mask)", len(content.Array()))
+		t.Fatalf("content len = %d, want 3 (text + image + region annotation)", len(content.Array()))
 	}
 	if content.Get("0.type").String() != "input_text" || content.Get("1.type").String() != "input_image" || content.Get("2.type").String() != "input_image" {
 		t.Errorf("content types wrong: %s", content.Raw)
 	}
-	if content.Get("1.image_url").String() != "data:image/png;base64,AAA" {
+	if content.Get("1.image_url").String() != imageRef {
 		t.Errorf("image_url not propagated: %s", content.Raw)
 	}
-	if content.Get("2.image_url").String() != "data:image/png;base64,BBB" {
-		t.Errorf("mask image_url not propagated: %s", content.Raw)
+	annotationRef := content.Get("2.image_url").String()
+	if annotationRef == "" || annotationRef == maskRef || !strings.HasPrefix(annotationRef, "data:image/png;base64,") {
+		t.Errorf("region annotation not generated: %s", content.Raw)
 	}
 	prompt := content.Get("0.text").String()
 	for _, want := range []string{
-		"Use input_fidelity setting high for the reference images.",
-		"Use the attached mask image as the edit mask; change only masked areas and preserve unmasked areas.",
+		"Image 1 is the edit target; preserve its framing, identity, geometry, lighting, and all unrequested details.",
+		"Preserve the input image with high fidelity.",
+		"Image 2 is a region annotation derived from the edit mask; change only the red marked area in Image 1 and keep everything outside that region unchanged.",
 	} {
 		if !strings.Contains(prompt, want) {
 			t.Errorf("prompt missing edit constraint %q: %q", want, prompt)
@@ -537,7 +616,10 @@ func TestBuildImagesToolCreateMsg_Edit_JSON(t *testing.T) {
 		}
 	}
 	tool := gjson.GetBytes(msg, "tools.0")
-	for _, forbidden := range []string{"input_fidelity", "input_image_mask", "size", "model"} {
+	if tool.Get("output_format").String() != "png" {
+		t.Errorf("tools[0].output_format = %q, want png", tool.Get("output_format").String())
+	}
+	for _, forbidden := range []string{"action", "input_fidelity", "input_image_mask", "size", "model"} {
 		if tool.Get(forbidden).Exists() {
 			t.Errorf("tools[0].%s should not be present", forbidden)
 		}

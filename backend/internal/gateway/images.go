@@ -7,6 +7,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"image"
+	"image/color"
+	"image/draw"
+	_ "image/jpeg"
+	"image/png"
 	"io"
 	"log"
 	"mime"
@@ -326,8 +331,8 @@ func normalizedImageOutputFormat(format string) string {
 	return f
 }
 
-func buildImagesToolPrompt(req *imagesRequest, isEdit bool) string {
-	lines := imageAPIConstraintLines(req, isEdit)
+func buildImagesToolPrompt(req *imagesRequest, isEdit, hasRegionAnnotation bool) string {
+	lines := imageAPIConstraintLines(req, isEdit, hasRegionAnnotation)
 	if len(lines) == 0 {
 		return req.Prompt
 	}
@@ -342,15 +347,15 @@ func buildImagesToolPrompt(req *imagesRequest, isEdit bool) string {
 	return strings.TrimRight(b.String(), "\n")
 }
 
-func buildImagesToolInstructions(req *imagesRequest, isEdit bool) string {
-	lines := imageAPIConstraintLines(req, isEdit)
+func buildImagesToolInstructions(req *imagesRequest, isEdit, hasRegionAnnotation bool) string {
+	lines := imageAPIConstraintLines(req, isEdit, hasRegionAnnotation)
 	if len(lines) == 0 {
 		return imagesPassthroughInstructions
 	}
 	return imagesPassthroughInstructions + "\nHonor these Image API constraints when invoking image_generation: " + strings.Join(lines, " ")
 }
 
-func imageAPIConstraintLines(req *imagesRequest, isEdit bool) []string {
+func imageAPIConstraintLines(req *imagesRequest, isEdit, hasRegionAnnotation bool) []string {
 	if req == nil {
 		return nil
 	}
@@ -368,11 +373,12 @@ func imageAPIConstraintLines(req *imagesRequest, isEdit bool) []string {
 		lines = append(lines, "Use requested image model "+model+".")
 	}
 	if isEdit {
+		lines = append(lines, "Image 1 is the edit target; preserve its framing, identity, geometry, lighting, and all unrequested details.")
 		if fidelity := cleanImageConstraintValue(req.InputFidelity); fidelity != "" {
-			lines = append(lines, "Use input_fidelity setting "+fidelity+" for the reference images.")
+			lines = append(lines, "Preserve the input image with "+fidelity+" fidelity.")
 		}
-		if req.Mask != "" {
-			lines = append(lines, "Use the attached mask image as the edit mask; change only masked areas and preserve unmasked areas.")
+		if hasRegionAnnotation {
+			lines = append(lines, "Image 2 is a region annotation derived from the edit mask; change only the red marked area in Image 1 and keep everything outside that region unchanged.")
 		}
 	}
 	return lines
@@ -380,6 +386,187 @@ func imageAPIConstraintLines(req *imagesRequest, isEdit bool) []string {
 
 func cleanImageConstraintValue(value string) string {
 	return strings.Join(strings.Fields(strings.TrimSpace(value)), " ")
+}
+
+func buildEditRegionAnnotation(req *imagesRequest) (string, error) {
+	if req == nil || req.Mask == "" || len(req.Images) == 0 {
+		return "", nil
+	}
+	base, _ := decodeDataURLImage(req.Images[0])
+	mask, err := decodeDataURLImage(req.Mask)
+	if err != nil {
+		return "", fmt.Errorf("解码编辑 mask 失败: %w", err)
+	}
+	if base == nil {
+		base = whiteCanvas(mask.Bounds().Dx(), mask.Bounds().Dy())
+	}
+	annotation, ok := renderMaskRegionAnnotation(base, mask)
+	if !ok {
+		return "", nil
+	}
+	var buf bytes.Buffer
+	if err := png.Encode(&buf, annotation); err != nil {
+		return "", fmt.Errorf("编码编辑区域标注图失败: %w", err)
+	}
+	return "data:image/png;base64," + base64.StdEncoding.EncodeToString(buf.Bytes()), nil
+}
+
+func decodeDataURLImage(ref string) (image.Image, error) {
+	if !strings.HasPrefix(ref, "data:") {
+		return nil, fmt.Errorf("仅支持 data URL 图片")
+	}
+	commaIdx := strings.Index(ref, ",")
+	if commaIdx < 0 {
+		return nil, fmt.Errorf("data URL 缺少 base64 数据")
+	}
+	data, err := base64.StdEncoding.DecodeString(ref[commaIdx+1:])
+	if err != nil {
+		data, err = base64.RawStdEncoding.DecodeString(ref[commaIdx+1:])
+		if err != nil {
+			return nil, err
+		}
+	}
+	img, _, err := image.Decode(bytes.NewReader(data))
+	if err != nil {
+		return nil, err
+	}
+	return img, nil
+}
+
+func whiteCanvas(width, height int) image.Image {
+	if width <= 0 || height <= 0 {
+		width, height = 1024, 1024
+	}
+	img := image.NewRGBA(image.Rect(0, 0, width, height))
+	draw.Draw(img, img.Bounds(), image.NewUniform(color.White), image.Point{}, draw.Src)
+	return img
+}
+
+func renderMaskRegionAnnotation(base image.Image, mask image.Image) (*image.RGBA, bool) {
+	baseBounds := base.Bounds()
+	width, height := baseBounds.Dx(), baseBounds.Dy()
+	if width <= 0 || height <= 0 {
+		return nil, false
+	}
+	out := image.NewRGBA(image.Rect(0, 0, width, height))
+	draw.Draw(out, out.Bounds(), base, baseBounds.Min, draw.Src)
+
+	maskBounds := mask.Bounds()
+	overlay := color.RGBA{R: 255, A: 95}
+	marked := false
+	for y := 0; y < height; y++ {
+		my := maskBounds.Min.Y + y*maskBounds.Dy()/height
+		for x := 0; x < width; x++ {
+			mx := maskBounds.Min.X + x*maskBounds.Dx()/width
+			_, _, _, alpha := mask.At(mx, my).RGBA()
+			if alpha > 0x7fff {
+				continue
+			}
+			out.Set(x, y, blendRGBA(out.RGBAAt(x, y), overlay))
+			marked = true
+		}
+	}
+	return out, marked
+}
+
+func blendRGBA(dst, src color.RGBA) color.RGBA {
+	a := uint32(src.A)
+	inv := 255 - a
+	return color.RGBA{
+		R: uint8((uint32(src.R)*a + uint32(dst.R)*inv) / 255),
+		G: uint8((uint32(src.G)*a + uint32(dst.G)*inv) / 255),
+		B: uint8((uint32(src.B)*a + uint32(dst.B)*inv) / 255),
+		A: 255,
+	}
+}
+
+func compositeMaskedImageGenCalls(req *imagesRequest, calls []ImageGenCall) ([]ImageGenCall, error) {
+	if req == nil || req.Mask == "" || len(req.Images) == 0 || len(calls) == 0 {
+		return calls, nil
+	}
+	base, err := decodeDataURLImage(req.Images[0])
+	if err != nil {
+		return nil, fmt.Errorf("解码编辑目标图片失败: %w", err)
+	}
+	mask, err := decodeDataURLImage(req.Mask)
+	if err != nil {
+		return nil, fmt.Errorf("解码编辑 mask 失败: %w", err)
+	}
+
+	out := append([]ImageGenCall(nil), calls...)
+	for i := range out {
+		if out[i].Result == "" {
+			continue
+		}
+		generated, err := decodeBase64Image(out[i].Result)
+		if err != nil {
+			return nil, fmt.Errorf("解码编辑结果图片失败: %w", err)
+		}
+		composited := compositeMaskedImage(base, mask, generated)
+		encoded, err := encodePNGBase64(composited)
+		if err != nil {
+			return nil, fmt.Errorf("编码编辑合成结果失败: %w", err)
+		}
+		out[i].Result = encoded
+	}
+	return out, nil
+}
+
+func decodeBase64Image(b64 string) (image.Image, error) {
+	data, err := base64.StdEncoding.DecodeString(strings.TrimSpace(b64))
+	if err != nil {
+		data, err = base64.RawStdEncoding.DecodeString(strings.TrimSpace(b64))
+		if err != nil {
+			return nil, err
+		}
+	}
+	img, _, err := image.Decode(bytes.NewReader(data))
+	if err != nil {
+		return nil, err
+	}
+	return img, nil
+}
+
+func compositeMaskedImage(base, mask, generated image.Image) *image.RGBA {
+	baseBounds := base.Bounds()
+	width, height := baseBounds.Dx(), baseBounds.Dy()
+	out := image.NewRGBA(image.Rect(0, 0, width, height))
+	maskBounds := mask.Bounds()
+	for y := 0; y < height; y++ {
+		my := maskBounds.Min.Y + y*maskBounds.Dy()/height
+		for x := 0; x < width; x++ {
+			mx := maskBounds.Min.X + x*maskBounds.Dx()/width
+			_, _, _, alpha := mask.At(mx, my).RGBA()
+			if alpha <= 0x7fff {
+				out.SetRGBA(x, y, sampleImageRGBA(generated, x, y, width, height))
+				continue
+			}
+			out.SetRGBA(x, y, sampleImageRGBA(base, x, y, width, height))
+		}
+	}
+	return out
+}
+
+func sampleImageRGBA(img image.Image, x, y, width, height int) color.RGBA {
+	bounds := img.Bounds()
+	sx := bounds.Min.X + x*bounds.Dx()/width
+	sy := bounds.Min.Y + y*bounds.Dy()/height
+	r, g, b, a := img.At(sx, sy).RGBA()
+	return color.RGBA{R: uint8(r >> 8), G: uint8(g >> 8), B: uint8(b >> 8), A: uint8(a >> 8)}
+}
+
+func encodePNGBase64(img image.Image) (string, error) {
+	var buf bytes.Buffer
+	if err := png.Encode(&buf, img); err != nil {
+		return "", err
+	}
+	return base64.StdEncoding.EncodeToString(buf.Bytes()), nil
+}
+
+func stripImageRevisedPrompts(calls []ImageGenCall) {
+	for i := range calls {
+		calls[i].RevisedPrompt = ""
+	}
 }
 
 // buildImagesToolCreateMsg 把 Images REST 请求体翻译成 Responses API 的
@@ -402,12 +589,20 @@ func buildImagesToolCreateMsg(
 	if req.N > 1 {
 		return nil, 0, 0, fmt.Errorf("OAuth 模式下 n 只能为 1（REST→tools 翻译路径暂不支持多图）")
 	}
+	regionAnnotation, err := buildEditRegionAnnotation(req)
+	if err != nil {
+		return nil, 0, 0, err
+	}
+	outputFormat := normalizedImageOutputFormat(req.OutputFormat)
+	if isEdit && req.Mask != "" {
+		outputFormat = "png"
+	}
 	tool := map[string]any{
 		"type":          "image_generation",
-		"output_format": normalizedImageOutputFormat(req.OutputFormat),
+		"output_format": outputFormat,
 	}
-	prompt := buildImagesToolPrompt(req, isEdit)
-	instructions := buildImagesToolInstructions(req, isEdit)
+	prompt := buildImagesToolPrompt(req, isEdit, regionAnnotation != "")
+	instructions := buildImagesToolInstructions(req, isEdit, regionAnnotation != "")
 
 	// input 必须是 list 形式（与 normalizeResponsesInput 的 string→list 包装一致），
 	// 否则上游返回 "Input must be a list"。/edits 在同一条 user message 的 content
@@ -421,10 +616,10 @@ func buildImagesToolCreateMsg(
 			"image_url": url,
 		})
 	}
-	if isEdit && req.Mask != "" {
+	if regionAnnotation != "" {
 		content = append(content, map[string]any{
 			"type":      "input_image",
-			"image_url": req.Mask,
+			"image_url": regionAnnotation,
 		})
 	}
 	inputList := []map[string]any{
@@ -450,7 +645,7 @@ func buildImagesToolCreateMsg(
 	// input token 估算：文本 prompt + 每张参考图按 size 低质档估算（~272 tokens/1024²），
 	// 与 image_generation tool 输入图像的 token 级别一致。
 	imageInputCount := len(req.Images)
-	if isEdit && req.Mask != "" {
+	if regionAnnotation != "" {
 		imageInputCount++
 	}
 	inputTokens := estimatePromptTokens(req.Prompt) + estimateImageInputTokens(imageInputCount, req.Size)
@@ -614,6 +809,27 @@ func (g *OpenAIGateway) forwardImagesViaResponsesTool(ctx context.Context, req *
 			Reason:   fmt.Sprintf("image_generation_call 为空 (n=%d)", n),
 			Duration: elapsed,
 		}, fmt.Errorf("image_generation_call 为空 (n=%d)", n)
+	}
+	if isEdit {
+		var err error
+		wsResult.ImageGenCalls, err = compositeMaskedImageGenCalls(imgReq, wsResult.ImageGenCalls)
+		if err != nil {
+			body := buildImagesErrorBody(http.StatusBadGateway, err.Error())
+			if ka != nil {
+				ka.Finish(http.StatusBadGateway, body)
+			}
+			return sdk.ForwardOutcome{
+				Kind: sdk.OutcomeUpstreamTransient,
+				Upstream: sdk.UpstreamResponse{
+					StatusCode: http.StatusBadGateway,
+					Headers:    http.Header{"Content-Type": []string{"application/json"}},
+					Body:       body,
+				},
+				Reason:   err.Error(),
+				Duration: elapsed,
+			}, err
+		}
+		stripImageRevisedPrompts(wsResult.ImageGenCalls)
 	}
 
 	numImages := len(wsResult.ImageGenCalls)
