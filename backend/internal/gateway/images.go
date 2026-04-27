@@ -13,7 +13,7 @@ import (
 	_ "image/jpeg"
 	"image/png"
 	"io"
-	"log"
+	"log/slog"
 	"mime"
 	"mime/multipart"
 	"net/http"
@@ -569,6 +569,29 @@ func stripImageRevisedPrompts(calls []ImageGenCall) {
 	}
 }
 
+func imageGenCallDiagnosticsDetail(wsResult WSResult) string {
+	if len(wsResult.ImageGenCallDiagnostics) > 0 {
+		return strings.Join(wsResult.ImageGenCallDiagnostics, "; ")
+	}
+	if len(wsResult.CompletedEventRaw) > 0 {
+		return "completed_event=" + truncate(string(wsResult.CompletedEventRaw), 500)
+	}
+	if wsResult.ResponseID != "" || wsResult.Model != "" || wsResult.StopReason != "" {
+		parts := make([]string, 0, 3)
+		if wsResult.ResponseID != "" {
+			parts = append(parts, "response_id="+wsResult.ResponseID)
+		}
+		if wsResult.Model != "" {
+			parts = append(parts, "model="+wsResult.Model)
+		}
+		if wsResult.StopReason != "" {
+			parts = append(parts, "stop_reason="+wsResult.StopReason)
+		}
+		return strings.Join(parts, ", ")
+	}
+	return ""
+}
+
 // buildImagesToolCreateMsg 把 Images REST 请求体翻译成 Responses API 的
 // response.create 消息（tools 数组带一个 image_generation 项）。
 // 返回：上游消息 bytes；n（当前固定 1）；prompt 估算的 token 数（用于计费）。
@@ -698,7 +721,7 @@ func (g *OpenAIGateway) forwardImagesViaResponsesTool(ctx context.Context, req *
 			Duration: time.Since(start),
 		}, nil
 	}
-	g.logger.Info("Images OAuth request",
+	g.logger.Debug("Images OAuth request",
 		"path", reqPath,
 		"request_model", imgReq.Model,
 		"is_edit", isEdit,
@@ -755,7 +778,10 @@ func (g *OpenAIGateway) forwardImagesViaResponsesTool(ctx context.Context, req *
 		return transientOutcome(reason), fmt.Errorf("%s", reason)
 	}
 
-	ka := startImageKeepAlive(req.Writer)
+	var sseKA *ssePingKeepAlive
+	if req.Stream {
+		sseKA = startSSEPingKeepAlive(req.Writer)
+	}
 
 	handler := &imagesSilentHandler{accountID: account.ID, start: start}
 	wsResult := ReceiveWSResponse(ctx, conn, handler)
@@ -767,24 +793,50 @@ func (g *OpenAIGateway) forwardImagesViaResponsesTool(ctx context.Context, req *
 
 	if wsResult.Err != nil {
 		var failure *responsesFailureError
-		if errors.As(wsResult.Err, &failure) && failure.shouldReturnClientError() {
-			body := buildImagesErrorBody(failure.StatusCode, failure.Message)
-			if ka != nil {
-				ka.Finish(failure.StatusCode, body)
+		if errors.As(wsResult.Err, &failure) {
+			if failure.shouldReturnClientError() {
+				body := buildImagesErrorBody(failure.StatusCode, failure.Message)
+				if sseKA != nil {
+					sseKA.Stop()
+					g.logger.Warn("Images OAuth 上游返回客户端错误，已脱敏响应",
+						"path", reqPath, "model", imgReq.Model, "status_code", failure.StatusCode, "reason", failure.Message)
+					writeSSEError(req.Writer, sanitizedImageSSEErrorMessage)
+				}
+				return sdk.ForwardOutcome{
+					Kind: sdk.OutcomeClientError,
+					Upstream: sdk.UpstreamResponse{
+						StatusCode: failure.StatusCode,
+						Headers:    http.Header{"Content-Type": []string{"application/json"}},
+						Body:       body,
+					},
+					Reason:   failure.Message,
+					Duration: elapsed,
+				}, wsResult.Err
+			}
+			// 用 *responsesFailureError 自带的分类驱动 Outcome：
+			// rate_limited 走 AccountRateLimited（带 RetryAfter），server 等仍归 UpstreamTransient。
+			// 之前这里直接拍成 UpstreamTransient/502，导致 Core 把账号丢进 softExclude 被反复重试。
+			if sseKA != nil {
+				sseKA.Stop()
+				g.logger.Warn("Images OAuth 流式请求失败，已脱敏响应",
+					"path", reqPath, "model", imgReq.Model, "status_code", failure.StatusCode,
+					"kind", failure.Kind, "retry_after", failure.RetryAfter, "error", wsResult.Err)
+				writeSSEError(req.Writer, sanitizedImageSSEErrorMessage)
 			}
 			return sdk.ForwardOutcome{
-				Kind: sdk.OutcomeClientError,
-				Upstream: sdk.UpstreamResponse{
-					StatusCode: failure.StatusCode,
-					Headers:    http.Header{"Content-Type": []string{"application/json"}},
-					Body:       body,
-				},
-				Reason:   failure.Message,
-				Duration: elapsed,
+				Kind:       failure.outcomeKind(),
+				Upstream:   sdk.UpstreamResponse{StatusCode: failure.StatusCode},
+				Reason:     failure.Error(),
+				RetryAfter: failure.RetryAfter,
+				Duration:   elapsed,
 			}, wsResult.Err
 		}
-		if ka != nil {
-			ka.Stop()
+		// 兜底：网络层 / 解析失败 等无 *responsesFailureError 的情况，保留 UpstreamTransient/502。
+		if sseKA != nil {
+			sseKA.Stop()
+			g.logger.Warn("Images OAuth 流式请求失败，已脱敏响应",
+				"path", reqPath, "model", imgReq.Model, "error", wsResult.Err)
+			writeSSEError(req.Writer, sanitizedImageSSEErrorMessage)
 		}
 		return sdk.ForwardOutcome{
 			Kind:     sdk.OutcomeUpstreamTransient,
@@ -795,9 +847,16 @@ func (g *OpenAIGateway) forwardImagesViaResponsesTool(ctx context.Context, req *
 	}
 
 	if len(wsResult.ImageGenCalls) == 0 {
+		reason := fmt.Sprintf("image_generation_call 为空 (n=%d)", n)
+		if detail := imageGenCallDiagnosticsDetail(wsResult); detail != "" {
+			reason += ": " + detail
+		}
 		body := buildImagesErrorBody(http.StatusBadGateway, "上游未返回图像结果")
-		if ka != nil {
-			ka.Finish(http.StatusBadGateway, body)
+		if sseKA != nil {
+			sseKA.Stop()
+			g.logger.Warn("Images OAuth 未返回图像结果，已脱敏响应",
+				"path", reqPath, "model", imgReq.Model, "reason", reason)
+			writeSSEError(req.Writer, sanitizedImageSSEErrorMessage)
 		}
 		return sdk.ForwardOutcome{
 			Kind: sdk.OutcomeUpstreamTransient,
@@ -806,17 +865,20 @@ func (g *OpenAIGateway) forwardImagesViaResponsesTool(ctx context.Context, req *
 				Headers:    http.Header{"Content-Type": []string{"application/json"}},
 				Body:       body,
 			},
-			Reason:   fmt.Sprintf("image_generation_call 为空 (n=%d)", n),
+			Reason:   reason,
 			Duration: elapsed,
-		}, fmt.Errorf("image_generation_call 为空 (n=%d)", n)
+		}, fmt.Errorf("%s", reason)
 	}
 	if isEdit {
 		var err error
 		wsResult.ImageGenCalls, err = compositeMaskedImageGenCalls(imgReq, wsResult.ImageGenCalls)
 		if err != nil {
 			body := buildImagesErrorBody(http.StatusBadGateway, err.Error())
-			if ka != nil {
-				ka.Finish(http.StatusBadGateway, body)
+			if sseKA != nil {
+				sseKA.Stop()
+				g.logger.Warn("Images OAuth 编辑结果合成失败，已脱敏响应",
+					"path", reqPath, "model", imgReq.Model, "error", err)
+				writeSSEError(req.Writer, sanitizedImageSSEErrorMessage)
 			}
 			return sdk.ForwardOutcome{
 				Kind: sdk.OutcomeUpstreamTransient,
@@ -841,7 +903,7 @@ func (g *OpenAIGateway) forwardImagesViaResponsesTool(ctx context.Context, req *
 		Model:        billingModel,
 		FirstTokenMs: handler.firstTokenMs,
 	}
-	g.logger.Info("Images OAuth result",
+	g.logger.Debug("Images OAuth result",
 		"path", reqPath,
 		"request_model", imgReq.Model,
 		"tool_model", wsResult.ToolImageModel,
@@ -857,8 +919,10 @@ func (g *OpenAIGateway) forwardImagesViaResponsesTool(ctx context.Context, req *
 		Usage:    usage,
 		Duration: elapsed,
 	}
-	if ka != nil {
-		ka.Finish(http.StatusOK, respBody)
+	if sseKA != nil {
+		sseKA.Stop()
+		writeImagesRESTSSE(req.Writer, respBody)
+		outcome.Upstream.Headers = http.Header{"Content-Type": []string{"text/event-stream"}}
 	} else {
 		outcome.Upstream.Body = respBody
 		outcome.Upstream.Headers = http.Header{"Content-Type": []string{"application/json"}}
@@ -940,12 +1004,24 @@ func buildImagesErrorBody(status int, message string) []byte {
 // 计费字段复用 parseUsage：gpt-image-1 / gpt-image-1.5 返回的
 // usage.input_tokens / usage.output_tokens / usage.input_tokens_details.cached_tokens
 // 与 Responses API 字段同构，parseUsage 已经处理了 cached token 扣减。
-func handleImagesResponse(resp *http.Response, w http.ResponseWriter, ka *imageKeepAlive, start time.Time, fallbackModel string) (sdk.ForwardOutcome, error) {
+func handleImagesResponse(resp *http.Response, w http.ResponseWriter, sseKA *ssePingKeepAlive, start time.Time, fallbackModel string) (sdk.ForwardOutcome, error) {
+	return handleImagesResponseWithLogger(nil, resp, w, sseKA, start, fallbackModel)
+}
+
+func (g *OpenAIGateway) handleImagesResponse(resp *http.Response, w http.ResponseWriter, sseKA *ssePingKeepAlive, start time.Time, fallbackModel string) (sdk.ForwardOutcome, error) {
+	return handleImagesResponseWithLogger(g.logger, resp, w, sseKA, start, fallbackModel)
+}
+
+func handleImagesResponseWithLogger(logger *slog.Logger, resp *http.Response, w http.ResponseWriter, sseKA *ssePingKeepAlive, start time.Time, fallbackModel string) (sdk.ForwardOutcome, error) {
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		reason := fmt.Sprintf("读取 Images 响应失败: %v", err)
-		if ka != nil {
-			ka.Finish(http.StatusBadGateway, buildImagesErrorBody(http.StatusBadGateway, reason))
+		if sseKA != nil {
+			sseKA.Stop()
+			if logger != nil {
+				logger.Warn("Images APIKey 响应读取失败，已脱敏响应", "model", fallbackModel, "error", err)
+			}
+			writeSSEError(w, sanitizedImageSSEErrorMessage)
 		}
 		return transientOutcome(reason), fmt.Errorf("%s", reason)
 	}
@@ -953,8 +1029,9 @@ func handleImagesResponse(resp *http.Response, w http.ResponseWriter, ka *imageK
 	parsed := parseUsage(body)
 	headers := resp.Header.Clone()
 
-	if ka != nil {
-		ka.Finish(resp.StatusCode, body)
+	if sseKA != nil {
+		sseKA.Stop()
+		writeImagesRESTSSE(w, body)
 	} else if w != nil {
 		if ct := resp.Header.Get("Content-Type"); ct != "" {
 			w.Header().Set("Content-Type", ct)
@@ -972,7 +1049,14 @@ func handleImagesResponse(resp *http.Response, w http.ResponseWriter, ka *imageK
 	if numImages <= 0 {
 		numImages = 1
 	}
-	log.Printf("[images] native result request_model=%q response_model=%q num_images=%d", fallbackModel, modelName, numImages)
+	if logger == nil {
+		logger = slog.Default()
+	}
+	logger.Debug("images_native_result_returned",
+		"request_model", fallbackModel,
+		sdk.LogFieldModel, modelName,
+		"num_images", numImages,
+	)
 
 	elapsed := time.Since(start)
 	usage := &sdk.Usage{
@@ -990,7 +1074,9 @@ func handleImagesResponse(resp *http.Response, w http.ResponseWriter, ka *imageK
 		Usage:    usage,
 		Duration: elapsed,
 	}
-	if w == nil {
+	if sseKA != nil {
+		outcome.Upstream.Headers = http.Header{"Content-Type": []string{"text/event-stream"}}
+	} else {
 		outcome.Upstream.Body = body
 	}
 	return outcome, nil

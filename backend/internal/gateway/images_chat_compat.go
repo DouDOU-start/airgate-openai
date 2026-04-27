@@ -64,25 +64,14 @@ func (g *OpenAIGateway) forwardChatCompletionsAsImages(ctx context.Context, req 
 
 	streaming := req.Stream && req.Writer != nil
 
-	// keepalive 策略：streaming 用 SSE comment，非 streaming 用 whitespace
-	var ka *imageKeepAlive
-	var sseKA *sseCommentKeepAlive
+	var sseKA *ssePingKeepAlive
 	if streaming {
-		sseKA = startSSECommentKeepAlive(req.Writer)
-	} else {
-		ka = startImageKeepAlive(req.Writer)
+		sseKA = startSSEPingKeepAlive(req.Writer)
 	}
 
 	outcome, err := g.dispatchImageRequest(ctx, req, &imageReq)
 
 	if err != nil || outcome.Kind != sdk.OutcomeSuccess {
-		if ka != nil {
-			errBody := outcome.Upstream.Body
-			if errBody == nil {
-				errBody = buildImagesErrorBody(outcome.Upstream.StatusCode, "image generation failed")
-			}
-			ka.Finish(outcome.Upstream.StatusCode, errBody)
-		}
 		if sseKA != nil {
 			sseKA.Stop()
 			errMsg := outcome.Reason
@@ -109,9 +98,6 @@ func (g *OpenAIGateway) forwardChatCompletionsAsImages(ctx context.Context, req 
 		outcome.Upstream.Headers = http.Header{"Content-Type": []string{"text/event-stream"}}
 	} else {
 		chatBody := imagesToChatCompletion(outcome.Upstream.Body, req.Model)
-		if ka != nil {
-			ka.Finish(http.StatusOK, chatBody)
-		}
 		outcome.Upstream.Body = chatBody
 		outcome.Upstream.Headers = http.Header{"Content-Type": []string{"application/json"}}
 	}
@@ -328,79 +314,4 @@ func extractImageUsageTokens(imagesBody []byte) (inputTokens, outputTokens int) 
 		inputTokens = 1
 	}
 	return
-}
-
-// ──────────────────────────────────────────────────────
-// SSE 写入辅助
-// ──────────────────────────────────────────────────────
-
-// sseCommentKeepAlive 在 SSE 流中周期发送 comment 行防止 Cloudflare 524 超时。
-type sseCommentKeepAlive struct {
-	w      http.ResponseWriter
-	cancel context.CancelFunc
-	done   chan struct{}
-}
-
-func startSSECommentKeepAlive(w http.ResponseWriter) *sseCommentKeepAlive {
-	if w == nil {
-		return nil
-	}
-	w.Header().Set("Content-Type", "text/event-stream")
-	w.Header().Set("Cache-Control", "no-cache")
-	w.WriteHeader(http.StatusOK)
-
-	ctx, cancel := context.WithCancel(context.Background())
-	ka := &sseCommentKeepAlive{w: w, cancel: cancel, done: make(chan struct{})}
-	go func() {
-		defer close(ka.done)
-		t := time.NewTicker(imageKeepAliveInterval)
-		defer t.Stop()
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-t.C:
-				_, _ = w.Write([]byte(": keepalive\n\n"))
-				if f, ok := w.(http.Flusher); ok {
-					f.Flush()
-				}
-			}
-		}
-	}()
-	return ka
-}
-
-func (ka *sseCommentKeepAlive) Stop() {
-	if ka == nil {
-		return
-	}
-	ka.cancel()
-	<-ka.done
-}
-
-func writeSSEData(w http.ResponseWriter, data []byte) {
-	_, _ = w.Write([]byte("data: "))
-	_, _ = w.Write(data)
-	_, _ = w.Write([]byte("\n\n"))
-	if f, ok := w.(http.Flusher); ok {
-		f.Flush()
-	}
-}
-
-func writeSSEDone(w http.ResponseWriter) {
-	_, _ = w.Write([]byte("data: [DONE]\n\n"))
-	if f, ok := w.(http.Flusher); ok {
-		f.Flush()
-	}
-}
-
-func writeSSEError(w http.ResponseWriter, _ string) {
-	errEvent, _ := json.Marshal(map[string]any{
-		"error": map[string]any{
-			"message": sanitizedImageSSEErrorMessage,
-			"type":    "server_error",
-		},
-	})
-	writeSSEData(w, errEvent)
-	writeSSEDone(w)
 }

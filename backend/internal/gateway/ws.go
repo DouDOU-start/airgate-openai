@@ -59,7 +59,8 @@ type WSResult struct {
 	ToolImageOutputTokens int
 	// ImageGenCalls 捕获 Responses API 返回的 image_generation_call output items，
 	// 供 REST→tools 翻译路径将 base64 结果打包回 OpenAI Images REST 响应。
-	ImageGenCalls []ImageGenCall
+	ImageGenCalls           []ImageGenCall
+	ImageGenCallDiagnostics []string
 	// ToolImageModel 是 response.tools[0].model —— 上游实际为 image_generation
 	// 工具选用的内部模型（客户端请求 gpt-image-2 时可能被静默降级为 gpt-image-1.5）。
 	ToolImageModel    string
@@ -516,7 +517,39 @@ func collectImageGenCall(result *WSResult, item map[string]any) {
 		Model:         jsonString(item["model"]),
 	}
 	if call.Result == "" {
+		result.ImageGenCallDiagnostics = append(result.ImageGenCallDiagnostics, summarizeImageGenCallItem(item))
 		return
 	}
 	result.ImageGenCalls = append(result.ImageGenCalls, call)
+}
+
+func summarizeImageGenCallItem(item map[string]any) string {
+	parts := make([]string, 0, 5)
+	if id := jsonString(item["id"]); id != "" {
+		parts = append(parts, "id="+id)
+	}
+	if status := jsonString(item["status"]); status != "" {
+		parts = append(parts, "status="+status)
+	}
+	if msg := nestedJSONString(item["error"], "message"); msg != "" {
+		parts = append(parts, "error="+truncate(msg, 200))
+	}
+	if reason := nestedJSONString(item["incomplete_details"], "reason"); reason != "" {
+		parts = append(parts, "incomplete_reason="+reason)
+	}
+	if raw, err := json.Marshal(item); err == nil && len(raw) > 0 {
+		parts = append(parts, "item="+truncate(string(raw), 500))
+	}
+	if len(parts) == 0 {
+		return "image_generation_call result 为空"
+	}
+	return strings.Join(parts, ", ")
+}
+
+func nestedJSONString(value any, key string) string {
+	obj, ok := value.(map[string]any)
+	if !ok {
+		return ""
+	}
+	return jsonString(obj[key])
 }

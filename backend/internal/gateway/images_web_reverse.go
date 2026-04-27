@@ -101,7 +101,7 @@ func (g *OpenAIGateway) forwardImagesViaWebReverse(ctx context.Context, req *sdk
 		return webReverseImagesError(start, http.StatusBadRequest, req.Writer,
 			fmt.Sprintf("解析 Images 请求失败: %v", err))
 	}
-	g.logger.Info("Images WebReverse request",
+	g.logger.Debug("Images WebReverse request",
 		"path", reqPath,
 		"request_model", imgReq.Model,
 		"is_edit", isEdit,
@@ -130,17 +130,23 @@ func (g *OpenAIGateway) forwardImagesViaWebReverse(ctx context.Context, req *sdk
 	}
 	client := imgen.NewClient(accessToken, proxyURL)
 
-	ka := startImageKeepAlive(req.Writer)
+	var sseKA *ssePingKeepAlive
+	if req.Stream {
+		sseKA = startSSEPingKeepAlive(req.Writer)
+	}
 
 	prompt := applyWebReverseSizeHint(imgReq.Prompt, imgReq.Size)
 	imgRes, err := client.GenerateImage(ctx, prompt, imageInputs)
 	if err != nil {
 		if imgRes == nil || len(imgRes.Images) == 0 {
 			status := classifyWebReverseError(err)
-			if ka != nil {
-				ka.Finish(status, buildImagesErrorBody(status, err.Error()))
+			if sseKA != nil {
+				sseKA.Stop()
+				g.logger.Warn("Images WebReverse 流式请求失败，已脱敏响应",
+					"model", imgReq.Model, "status_code", status, "error", err)
+				writeSSEError(req.Writer, sanitizedImageSSEErrorMessage)
 			}
-			outcome := failureOutcome(status, nil, nil, err.Error(), 0)
+			outcome := failureOutcome(status, nil, nil, err.Error(), parseRetryDelay(err.Error()))
 			outcome.Duration = time.Since(start)
 			if outcome.Usage == nil {
 				outcome.Usage = &sdk.Usage{Model: imagesWebReverseModel}
@@ -152,7 +158,7 @@ func (g *OpenAIGateway) forwardImagesViaWebReverse(ctx context.Context, req *sdk
 	}
 
 	numImages := len(imgRes.Images)
-	g.logger.Info("Images WebReverse result",
+	g.logger.Debug("Images WebReverse result",
 		"path", reqPath,
 		"request_model", imgReq.Model,
 		"model_slug", imgRes.ModelSlug,
@@ -161,8 +167,9 @@ func (g *OpenAIGateway) forwardImagesViaWebReverse(ctx context.Context, req *sdk
 	)
 
 	respBody := buildWebReverseImagesResponse(imgRes, 0, 0)
-	if ka != nil {
-		ka.Finish(http.StatusOK, respBody)
+	if sseKA != nil {
+		sseKA.Stop()
+		writeImagesRESTSSE(req.Writer, respBody)
 	}
 
 	elapsed := time.Since(start)
@@ -178,7 +185,9 @@ func (g *OpenAIGateway) forwardImagesViaWebReverse(ctx context.Context, req *sdk
 		Usage:    usage,
 		Duration: elapsed,
 	}
-	if req.Writer == nil {
+	if sseKA != nil {
+		outcome.Upstream.Headers = http.Header{"Content-Type": []string{"text/event-stream"}}
+	} else {
 		outcome.Upstream.Body = respBody
 		outcome.Upstream.Headers = http.Header{"Content-Type": []string{"application/json"}}
 	}
@@ -303,7 +312,8 @@ func scaleImageDimension(value, oldEdge, newEdge int) int {
 // classifyWebReverseError 根据 err.Error() 文本判定 HTTP 状态码。
 //
 // imgen 底层的错误都是 fmt.Errorf("...HTTP %d: ...")，通过文本嗅探定位上游状态码。
-// 匹配不到时统一归 502，让 Core 决定是否 failover。
+// 上游有时把 429 包成 502 + "rate limit reached" 文案下发，单看 "HTTP 502" 会误判，
+// 所以默认分支再用 isTemporaryRateLimitText 兜一遍，命中限流关键词就归 429。
 func classifyWebReverseError(err error) int {
 	if err == nil {
 		return http.StatusBadGateway
@@ -318,6 +328,8 @@ func classifyWebReverseError(err error) int {
 		return http.StatusTooManyRequests
 	case strings.Contains(msg, "PoW"), strings.Contains(msg, "触发风控"):
 		return http.StatusForbidden
+	case isTemporaryRateLimitText(msg):
+		return http.StatusTooManyRequests
 	default:
 		return http.StatusBadGateway
 	}

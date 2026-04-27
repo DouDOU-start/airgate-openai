@@ -246,6 +246,71 @@ func TestHandleImagesResponse_TokenAttribution(t *testing.T) {
 	}
 }
 
+func TestWriteSSEPingUsesOpenAIStyleEvent(t *testing.T) {
+	w := httptest.NewRecorder()
+	writeSSEPing(w)
+
+	if got, want := w.Body.String(), "event: ping\ndata: {}\n\n"; got != want {
+		t.Fatalf("body = %q, want %q", got, want)
+	}
+}
+
+func TestHandleImagesResponse_StreamWrapsRESTJSONAsSSE(t *testing.T) {
+	body := `{"created":1713833628,"data":[{"b64_json":"iVBORw0"}],"usage":{"input_tokens":1,"output_tokens":2}}`
+	resp := &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": []string{"application/json"}},
+		Body:       ioNopCloserFromString(body),
+	}
+	w := httptest.NewRecorder()
+	sseKA := startSSEPingKeepAlive(w)
+
+	outcome, err := handleImagesResponse(resp, w, sseKA, time.Now(), "gpt-image-1")
+	if err != nil {
+		t.Fatalf("handleImagesResponse returned err: %v", err)
+	}
+	if outcome.Kind != sdk.OutcomeSuccess {
+		t.Fatalf("Kind = %v, want Success", outcome.Kind)
+	}
+	if outcome.Upstream.Body != nil {
+		t.Fatalf("Upstream.Body = %q, want nil for streamed response", outcome.Upstream.Body)
+	}
+	if got := outcome.Upstream.Headers.Get("Content-Type"); got != "text/event-stream" {
+		t.Fatalf("Content-Type = %q, want text/event-stream", got)
+	}
+	if w.Code != http.StatusOK {
+		t.Fatalf("writer status = %d, want 200", w.Code)
+	}
+	if got := w.Header().Get("Content-Type"); got != "text/event-stream" {
+		t.Fatalf("writer Content-Type = %q, want text/event-stream", got)
+	}
+	gotBody := w.Body.String()
+	wantBody := "data: " + body + "\n\ndata: [DONE]\n\n"
+	if gotBody != wantBody {
+		t.Fatalf("writer body = %q, want %q", gotBody, wantBody)
+	}
+}
+
+func TestHandleImagesResponse_NonStreamReturnsBodyWithoutWriter(t *testing.T) {
+	body := `{"data":[{"url":"https://example/a.png"}],"usage":{"input_tokens":10,"output_tokens":100}}`
+	resp := &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": []string{"application/json"}},
+		Body:       ioNopCloserFromString(body),
+	}
+
+	outcome, err := handleImagesResponse(resp, nil, nil, time.Now(), "gpt-image-1")
+	if err != nil {
+		t.Fatalf("handleImagesResponse returned err: %v", err)
+	}
+	if len(outcome.Upstream.Body) != len(body) {
+		t.Fatalf("Upstream.Body len = %d, want %d", len(outcome.Upstream.Body), len(body))
+	}
+	if got := outcome.Upstream.Headers.Get("Content-Type"); got != "application/json" {
+		t.Fatalf("Content-Type = %q, want application/json", got)
+	}
+}
+
 // TestHandleImagesResponse_FallbackModelWhenBodyLacksModel 验证 Images 响应里
 // 没有 model 字段时，会回退到请求侧传入的 fallbackModel，避免 fillUsageCost 查不到定价。
 func TestHandleImagesResponse_FallbackModelWhenBodyLacksModel(t *testing.T) {
@@ -457,10 +522,21 @@ func TestCollectImageGenCall(t *testing.T) {
 	if len(ws.ImageGenCalls) != 1 {
 		t.Errorf("non-image item should be ignored")
 	}
-	// 缺 result 的也应被忽略
-	collectImageGenCall(&ws, map[string]any{"type": "image_generation_call"})
+	// 缺 result 的也应被忽略，但要保留上游诊断，便于 failover 日志定位真实原因。
+	collectImageGenCall(&ws, map[string]any{
+		"type":   "image_generation_call",
+		"id":     "ig_123",
+		"status": "failed",
+		"error":  map[string]any{"message": "safety system rejected the prompt"},
+	})
 	if len(ws.ImageGenCalls) != 1 {
 		t.Errorf("item without result should be ignored")
+	}
+	if len(ws.ImageGenCallDiagnostics) != 1 {
+		t.Fatalf("ImageGenCallDiagnostics len = %d, want 1", len(ws.ImageGenCallDiagnostics))
+	}
+	if !strings.Contains(ws.ImageGenCallDiagnostics[0], "status=failed") || !strings.Contains(ws.ImageGenCallDiagnostics[0], "safety system rejected the prompt") {
+		t.Errorf("diagnostic missing upstream cause: %s", ws.ImageGenCallDiagnostics[0])
 	}
 }
 
