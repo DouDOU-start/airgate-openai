@@ -694,7 +694,7 @@ func translateResponsesSSEToAnthropicSSE(
 					serviceTier = normalizeOpenAIServiceTier(gjson.Get(data, "response.service_tier").String())
 				}
 				usageNode := gjson.Get(data, "response.usage")
-				slog.Info("[Anthropic←Responses] 上游 usage",
+				slog.Debug("[Anthropic←Responses] 上游 usage",
 					"session", session.SessionKey,
 					"response_id", gjson.Get(data, "response.id").String(),
 					"usage_raw", usageNode.Raw,

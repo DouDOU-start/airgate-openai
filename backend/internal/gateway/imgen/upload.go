@@ -9,10 +9,12 @@ import (
 	_ "image/jpeg"
 	_ "image/png"
 	"io"
-	"log"
+	"log/slog"
 	"mime/multipart"
 	"net/http"
 	"strings"
+
+	sdk "github.com/DouDOU-start/airgate-sdk"
 )
 
 // ImageInput 调用方传入的待上传图片（内存中的原始二进制）。
@@ -93,21 +95,30 @@ func (c *Client) uploadFile(input ImageInput) (*UploadedFile, error) {
 	fileSize := int64(len(input.Data))
 	width, height := getImageDimensions(input.Data)
 
-	log.Printf("[imgen] 上传文件: %s (%d bytes, %dx%d, %s)", fileName, fileSize, width, height, mimeType)
+	logger := slog.Default()
+	logger.Debug("imgen_upload_start",
+		"file_name", fileName,
+		"file_size", fileSize,
+		"width", width,
+		"height", height,
+		"mime_type", mimeType,
+	)
 
 	fileID, uploadURL, err := c.fileCreate(fileName, fileSize, mimeType)
 	if err != nil {
+		logger.Warn("imgen_upload_failed", "stage", "file_create", sdk.LogFieldError, err)
 		return nil, fmt.Errorf("创建文件记录失败: %w", err)
 	}
-	log.Printf("[imgen] file_id: %s", fileID)
+	logger.Debug("imgen_upload_file_created", "file_id", fileID)
 
 	if err := c.fileUploadData(fileID, uploadURL, input.Data, mimeType); err != nil {
+		logger.Warn("imgen_upload_failed", "stage", "binary_upload", "file_id", fileID, sdk.LogFieldError, err)
 		return nil, fmt.Errorf("上传文件失败: %w", err)
 	}
-	log.Println("[imgen] 二进制上传完成")
+	logger.Debug("imgen_upload_completed", "file_id", fileID, "file_size", fileSize)
 
 	if err := c.fileConfirm(fileID); err != nil {
-		log.Printf("[imgen] 文件确认警告（非致命）: %v", err)
+		logger.Warn("imgen_upload_confirm_failed", "file_id", fileID, sdk.LogFieldError, err)
 	}
 
 	return &UploadedFile{

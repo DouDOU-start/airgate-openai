@@ -4,11 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"log"
 	"net/http"
 	"strconv"
 	"strings"
 
+	sdk "github.com/DouDOU-start/airgate-sdk"
 	"github.com/DouDOU-start/airgate-sdk/devserver"
 )
 
@@ -33,9 +33,10 @@ func (h *OAuthDevHandler) handleStart(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	logger := sdk.LoggerFromContext(r.Context())
 	resp, err := h.Gateway.StartOAuth(context.Background(), &OAuthStartRequest{})
 	if err != nil {
-		log.Printf("StartOAuth 失败: %v", err)
+		logger.Error("oauth_start_failed", sdk.LogFieldError, err)
 		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusInternalServerError)
 		return
 	}
@@ -45,7 +46,7 @@ func (h *OAuthDevHandler) handleStart(w http.ResponseWriter, r *http.Request) {
 		"authorize_url": resp.AuthorizeURL,
 		"state":         resp.State,
 	}); err != nil {
-		log.Printf("编码 OAuth start 响应失败: %v", err)
+		logger.Error("oauth_response_encode_failed", "stage", "start", sdk.LogFieldError, err)
 	}
 }
 
@@ -65,12 +66,13 @@ func (h *OAuthDevHandler) handleCallback(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
+	logger := sdk.LoggerFromContext(r.Context())
 	result, err := h.Gateway.HandleOAuthCallback(context.Background(), &OAuthCallbackRequest{
 		Code:  body.Code,
 		State: body.State,
 	})
 	if err != nil {
-		log.Printf("HandleOAuthCallback 失败: %v", err)
+		logger.Error("oauth_callback_failed", sdk.LogFieldError, err)
 		http.Error(w, fmt.Sprintf(`{"error":"%s"}`, err.Error()), http.StatusInternalServerError)
 		return
 	}
@@ -85,14 +87,17 @@ func (h *OAuthDevHandler) handleCallback(w http.ResponseWriter, r *http.Request)
 		Credentials: result.Credentials,
 	})
 
-	log.Printf("OAuth 授权成功，账号已创建: id=%d name=%s", account.ID, account.Name)
+	logger.Info("oauth_account_created",
+		sdk.LogFieldAccountID, account.ID,
+		"account_name", account.Name,
+	)
 
 	w.Header().Set("Content-Type", "application/json")
 	if err := json.NewEncoder(w).Encode(map[string]interface{}{
 		"success": true,
 		"account": account,
 	}); err != nil {
-		log.Printf("编码 OAuth callback 响应失败: %v", err)
+		logger.Error("oauth_response_encode_failed", "stage", "callback", sdk.LogFieldError, err)
 	}
 }
 
@@ -156,7 +161,10 @@ func (h *OAuthDevHandler) handleQuota(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 实时查询失败，回退到 credentials 中的缓存值
-	log.Printf("实时查询额度失败 (id=%d): %v，使用缓存值", id, queryErr)
+	sdk.LoggerFromContext(r.Context()).Warn("oauth_quota_realtime_query_failed",
+		sdk.LogFieldAccountID, id,
+		sdk.LogFieldError, queryErr,
+	)
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]interface{}{
 		"plan_type":                 account.Credentials["plan_type"],

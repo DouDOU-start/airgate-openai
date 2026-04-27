@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
@@ -18,6 +19,19 @@ import (
 	"github.com/DouDOU-start/airgate-openai/backend/internal/model"
 	sdk "github.com/DouDOU-start/airgate-sdk"
 )
+
+// redactURL 去掉 query string，仅保留 host+path（避免敏感参数泄漏到日志）
+func redactURL(rawURL string) string {
+	if u, err := url.Parse(rawURL); err == nil && u != nil {
+		u.RawQuery = ""
+		u.User = nil
+		return u.String()
+	}
+	if idx := strings.Index(rawURL, "?"); idx >= 0 {
+		return rawURL[:idx]
+	}
+	return rawURL
+}
 
 // ──────────────────────────────────────────────────────
 // 转发入口（三模式分发）
@@ -93,6 +107,11 @@ func (g *OpenAIGateway) forwardHTTP(ctx context.Context, req *sdk.ForwardRequest
 		return g.forwardOAuth(ctx, req)
 	}
 	reason := "账号缺少 api_key 或 access_token"
+	sdk.LoggerFromContext(ctx).Error("forward_dispatch_failed",
+		sdk.LogFieldAccountID, account.ID,
+		sdk.LogFieldReason, reason,
+		sdk.LogFieldError, reason,
+	)
 	return accountDeadOutcome(reason), fmt.Errorf("%s", reason)
 }
 
@@ -165,9 +184,15 @@ func buildLocalModelsResponse(imageOnly bool) sdk.ForwardOutcome {
 func (g *OpenAIGateway) forwardAPIKey(ctx context.Context, req *sdk.ForwardRequest, reqServiceTier string) (sdk.ForwardOutcome, error) {
 	start := time.Now()
 	account := req.Account
+	logger := sdk.LoggerFromContext(ctx)
 
 	reqMethod, reqPath := resolveAPIKeyRoute(req)
 	targetURL := buildAPIKeyURL(account, reqPath)
+	if isImagesRequest(reqPath) && len(req.Body) > 0 && !strings.HasPrefix(req.Headers.Get("Content-Type"), "multipart/") {
+		if patched, err := sjson.DeleteBytes(req.Body, "stream"); err == nil {
+			req.Body = patched
+		}
+	}
 
 	var bodyReader io.Reader
 	if methodAllowsBody(reqMethod) && len(req.Body) > 0 {
@@ -177,6 +202,12 @@ func (g *OpenAIGateway) forwardAPIKey(ctx context.Context, req *sdk.ForwardReque
 	upstreamReq, err := http.NewRequestWithContext(ctx, reqMethod, targetURL, bodyReader)
 	if err != nil {
 		reason := fmt.Sprintf("构建上游请求失败: %v", err)
+		logger.Warn("upstream_request_build_failed",
+			sdk.LogFieldAccountID, account.ID,
+			sdk.LogFieldModel, req.Model,
+			"url", redactURL(targetURL),
+			sdk.LogFieldError, err,
+		)
 		return transientOutcome(reason), fmt.Errorf("%s", reason)
 	}
 
@@ -193,17 +224,39 @@ func (g *OpenAIGateway) forwardAPIKey(ctx context.Context, req *sdk.ForwardReque
 	}
 	passHeadersForAccount(req.Headers, upstreamReq.Header, account)
 
-	var ka *imageKeepAlive
-	if isImagesRequest(reqPath) {
-		ka = startImageKeepAlive(req.Writer)
+	var sseKA *ssePingKeepAlive
+	if isImagesRequest(reqPath) && req.Stream {
+		sseKA = startSSEPingKeepAlive(req.Writer)
 	}
+
+	logger.Debug("upstream_request_start",
+		sdk.LogFieldAccountID, account.ID,
+		sdk.LogFieldModel, req.Model,
+		"url", redactURL(targetURL),
+		sdk.LogFieldMethod, reqMethod,
+		"stream", req.Stream,
+		"account_type", "apikey",
+	)
 
 	client := g.buildHTTPClient(account)
 	resp, err := client.Do(upstreamReq)
 	if err != nil {
-		if ka != nil {
-			ka.Finish(http.StatusBadGateway, buildImagesErrorBody(http.StatusBadGateway, err.Error()))
+		dur := time.Since(start)
+		if sseKA != nil {
+			sseKA.Stop()
+			logger.Warn("images_apikey_stream_failed_redacted",
+				sdk.LogFieldPath, reqPath,
+				sdk.LogFieldModel, req.Model,
+				sdk.LogFieldError, err,
+			)
+			writeSSEError(req.Writer, sanitizedImageSSEErrorMessage)
 		}
+		logger.Warn("upstream_request_failed",
+			sdk.LogFieldAccountID, account.ID,
+			sdk.LogFieldModel, req.Model,
+			sdk.LogFieldDurationMs, dur.Milliseconds(),
+			sdk.LogFieldError, err,
+		)
 		// 网络层错误，无上游 HTTP 响应
 		return transientOutcome(err.Error()), fmt.Errorf("请求上游失败: %w", err)
 	}
@@ -212,17 +265,41 @@ func (g *OpenAIGateway) forwardAPIKey(ctx context.Context, req *sdk.ForwardReque
 	// 非 2xx 统一走 failureOutcome 归类。包含 4xx（客户端错）/ 429 / 401 / 403 / 5xx。
 	if resp.StatusCode >= 400 {
 		respBody, _ := io.ReadAll(resp.Body)
-		if ka != nil {
-			ka.Finish(resp.StatusCode, respBody)
-		}
 		errDetail := gjson.GetBytes(respBody, "error.message").String()
 		if errDetail == "" {
 			errDetail = truncate(string(respBody), 200)
 		}
+		dur := time.Since(start)
+		if sseKA != nil {
+			sseKA.Stop()
+			logger.Warn("images_apikey_upstream_error_redacted",
+				sdk.LogFieldPath, reqPath,
+				sdk.LogFieldModel, req.Model,
+				sdk.LogFieldStatus, resp.StatusCode,
+				sdk.LogFieldReason, errDetail,
+			)
+			writeSSEError(req.Writer, sanitizedImageSSEErrorMessage)
+		}
+		logger.Warn("upstream_request_non_2xx",
+			sdk.LogFieldAccountID, account.ID,
+			sdk.LogFieldModel, req.Model,
+			sdk.LogFieldStatus, resp.StatusCode,
+			sdk.LogFieldDurationMs, dur.Milliseconds(),
+			sdk.LogFieldReason, errDetail,
+		)
 		outcome := failureOutcome(resp.StatusCode, respBody, resp.Header.Clone(), errDetail, extractRetryAfterHeader(resp.Header))
 		outcome.Duration = time.Since(start)
 		return outcome, nil
 	}
+
+	logger.Debug("upstream_request_completed",
+		sdk.LogFieldAccountID, account.ID,
+		sdk.LogFieldModel, req.Model,
+		sdk.LogFieldStatus, resp.StatusCode,
+		sdk.LogFieldDurationMs, time.Since(start).Milliseconds(),
+		"content_length", resp.ContentLength,
+		"stream", req.Stream,
+	)
 
 	// /v1/models 路径补齐上下文元信息
 	if reqMethod == http.MethodGet && strings.HasPrefix(reqPath, "/v1/models") {
@@ -236,7 +313,7 @@ func (g *OpenAIGateway) forwardAPIKey(ctx context.Context, req *sdk.ForwardReque
 
 	// Images API 响应体无 model 字段，另走专用处理器回填后再 fillCost
 	if isImagesRequest(reqPath) {
-		return handleImagesResponse(resp, req.Writer, ka, start, req.Model)
+		return g.handleImagesResponse(resp, req.Writer, sseKA, start, req.Model)
 	}
 
 	if req.Stream && req.Writer != nil {
@@ -314,6 +391,7 @@ func enrichModelsResponse(resp *http.Response) *http.Response {
 func (g *OpenAIGateway) forwardOAuth(ctx context.Context, req *sdk.ForwardRequest) (sdk.ForwardOutcome, error) {
 	start := time.Now()
 	account := req.Account
+	logger := sdk.LoggerFromContext(ctx)
 	session := resolveOpenAISession(req.Headers, req.Body)
 	updateSessionStateFromRequest(session)
 
@@ -326,14 +404,38 @@ func (g *OpenAIGateway) forwardOAuth(ctx context.Context, req *sdk.ForwardReques
 		TurnState:      session.LastTurnState,
 		Originator:     req.Headers.Get("originator"),
 	}
+
+	logger.Debug("upstream_request_start",
+		sdk.LogFieldAccountID, account.ID,
+		sdk.LogFieldModel, req.Model,
+		"url", "wss://chatgpt.com/backend-api/codex",
+		sdk.LogFieldMethod, "WS",
+		"stream", req.Stream,
+		"account_type", "oauth",
+	)
+
 	conn, wsResp, err := DialWebSocket(cfg)
 	if err != nil {
+		dur := time.Since(start)
 		// WS 握手失败：按 HTTP 响应码归类。无响应则视为网络层 transient。
 		if wsResp != nil {
+			logger.Warn("upstream_request_non_2xx",
+				sdk.LogFieldAccountID, account.ID,
+				sdk.LogFieldStatus, wsResp.StatusCode,
+				sdk.LogFieldDurationMs, dur.Milliseconds(),
+				sdk.LogFieldReason, err.Error(),
+				"phase", "ws_handshake",
+			)
 			outcome := failureOutcome(wsResp.StatusCode, nil, wsResp.Header.Clone(), err.Error(), 0)
 			outcome.Duration = time.Since(start)
 			return outcome, err
 		}
+		logger.Warn("upstream_request_failed",
+			sdk.LogFieldAccountID, account.ID,
+			sdk.LogFieldDurationMs, dur.Milliseconds(),
+			sdk.LogFieldError, err,
+			"phase", "ws_handshake",
+		)
 		return transientOutcome(err.Error()), err
 	}
 	defer func() { _ = conn.Close() }()
@@ -347,6 +449,11 @@ func (g *OpenAIGateway) forwardOAuth(ctx context.Context, req *sdk.ForwardReques
 	createMsg, err := g.buildWSRequest(req, session)
 	if err != nil {
 		reason := fmt.Sprintf("构建 WebSocket 请求失败: %v", err)
+		logger.Warn("ws_build_request_failed",
+			sdk.LogFieldAccountID, account.ID,
+			sdk.LogFieldModel, req.Model,
+			sdk.LogFieldError, err,
+		)
 		return transientOutcome(reason), fmt.Errorf("%s", reason)
 	}
 
@@ -428,6 +535,13 @@ func (g *OpenAIGateway) forwardOAuth(ctx context.Context, req *sdk.ForwardReques
 
 	result, err := runAttempt(createMsg, w)
 	if err != nil {
+		logger.Warn("upstream_request_failed",
+			sdk.LogFieldAccountID, account.ID,
+			sdk.LogFieldModel, req.Model,
+			sdk.LogFieldDurationMs, time.Since(start).Milliseconds(),
+			sdk.LogFieldError, err,
+			"phase", "ws_send",
+		)
 		return transientOutcome(err.Error()), err
 	}
 	if session.SessionKey != "" {
@@ -508,6 +622,14 @@ func (g *OpenAIGateway) forwardOAuth(ctx context.Context, req *sdk.ForwardReques
 		if req.Stream && kind != sdk.OutcomeClientError {
 			kind = sdk.OutcomeStreamAborted
 		}
+		logger.Warn("upstream_request_non_2xx",
+			sdk.LogFieldAccountID, account.ID,
+			sdk.LogFieldModel, req.Model,
+			sdk.LogFieldStatus, statusCode,
+			sdk.LogFieldDurationMs, elapsed.Milliseconds(),
+			sdk.LogFieldReason, message,
+			"phase", "ws_response",
+		)
 		return sdk.ForwardOutcome{
 			Kind:       kind,
 			Upstream:   sdk.UpstreamResponse{StatusCode: statusCode},
@@ -517,6 +639,16 @@ func (g *OpenAIGateway) forwardOAuth(ctx context.Context, req *sdk.ForwardReques
 		}, result.Err
 	}
 
+	logger.Debug("upstream_request_completed",
+		sdk.LogFieldAccountID, account.ID,
+		sdk.LogFieldModel, req.Model,
+		sdk.LogFieldStatus, http.StatusOK,
+		sdk.LogFieldDurationMs, elapsed.Milliseconds(),
+		"first_token_ms", firstTokenMs,
+		"input_tokens", result.InputTokens,
+		"output_tokens", result.OutputTokens,
+		"stream", req.Stream,
+	)
 	fillUsageCostWithImageTool(usage, numImages)
 	return sdk.ForwardOutcome{
 		Kind:     sdk.OutcomeSuccess,

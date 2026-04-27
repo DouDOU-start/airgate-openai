@@ -6,7 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
 	"regexp"
 	"sort"
 	"strings"
@@ -291,7 +291,7 @@ func (c *Client) streamConversation(prompt, chatToken, conduitToken, proofToken,
 
 		if cid, ok := event["conversation_id"].(string); ok && result.ConversationID == "" {
 			result.ConversationID = cid
-			log.Printf("[imgen] 会话 ID: %s", cid)
+			slog.Default().Debug("imgen_conversation_id_received", "conversation_id", cid)
 		}
 
 		c.extractImageRefs(event, seen, &result.ImageRefs)

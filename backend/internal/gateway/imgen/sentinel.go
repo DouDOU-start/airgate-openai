@@ -5,8 +5,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
 	"time"
+
+	sdk "github.com/DouDOU-start/airgate-sdk"
 )
 
 // ChatRequirementsResult /backend-api/sentinel/chat-requirements 的产物。
@@ -61,8 +63,10 @@ func (c *Client) getChatRequirements() (*ChatRequirementsResult, error) {
 	if result.POW.Required {
 		start := time.Now()
 		cr.ProofToken = SolveProofToken(result.POW.Seed, result.POW.Difficulty, DefaultUA)
-		log.Printf("[imgen] PoW 已解算 (难度 %s, 耗时 %v)",
-			result.POW.Difficulty, time.Since(start).Round(time.Millisecond))
+		slog.Default().Debug("imgen_pow_solved",
+			"difficulty", result.POW.Difficulty,
+			sdk.LogFieldDurationMs, time.Since(start).Milliseconds(),
+		)
 	}
 
 	return cr, nil
@@ -100,7 +104,7 @@ func (c *Client) startHeartbeat(interval time.Duration) (stop func()) {
 				return
 			case <-t.C:
 				if err := c.sentinelPing(); err != nil {
-					log.Printf("[imgen] sentinel/ping 失败: %v", err)
+					slog.Default().Warn("imgen_sentinel_ping_failed", sdk.LogFieldError, err)
 				}
 			}
 		}

@@ -110,7 +110,7 @@ func (g *OpenAIGateway) StartOAuth(ctx context.Context, req *OAuthStartRequest) 
 	q.Set("codex_cli_simplified_flow", "true")
 	authorizeURL := oauthAuthEndpoint + "?" + q.Encode()
 
-	g.logger.Info("OAuth 授权发起", "authorize_url", authorizeURL)
+	g.logger.Info("oauth_authorize_initiated", "authorize_url", authorizeURL)
 
 	return &OAuthStartResponse{
 		AuthorizeURL: authorizeURL,
@@ -156,9 +156,9 @@ func (g *OpenAIGateway) HandleOAuthCallback(ctx context.Context, req *OAuthCallb
 		credentials["subscription_active_until"] = info.SubscriptionActiveUntil
 	}
 
-	g.logger.Info("OAuth 授权成功",
+	g.logger.Info("oauth_authorize_completed",
 		"account_name", info.AccountName,
-		"account_id", info.AccountID,
+		sdk.LogFieldAccountID, info.AccountID,
 		"plan_type", info.PlanType,
 	)
 
@@ -213,9 +213,9 @@ func (g *OpenAIGateway) ImportFromRefreshToken(ctx context.Context, refreshToken
 		credentials["subscription_active_until"] = info.SubscriptionActiveUntil
 	}
 
-	g.logger.Info("OAuth Refresh Token 导入成功",
+	g.logger.Info("oauth_refresh_token_imported",
 		"account_name", info.AccountName,
-		"account_id", info.AccountID,
+		sdk.LogFieldAccountID, info.AccountID,
 		"plan_type", info.PlanType,
 	)
 

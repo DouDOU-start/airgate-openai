@@ -3,9 +3,10 @@ package imgen
 import (
 	"context"
 	"fmt"
-	"log"
 	"strings"
 	"time"
+
+	sdk "github.com/DouDOU-start/airgate-sdk"
 )
 
 // Image 单张图像产物。
@@ -41,10 +42,13 @@ func (c *Client) GenerateImage(ctx context.Context, prompt string, images []Imag
 		return nil, fmt.Errorf("prompt 为空")
 	}
 
+	logger := sdk.LoggerFromContext(ctx)
+	logger.Debug("imgen_generate_start", "image_count", len(images))
+
 	// Step 0: Bootstrap（仅首次）
 	if !c.bootstrapped {
 		if err := c.Bootstrap(); err != nil {
-			log.Printf("[imgen] bootstrap 失败（继续尝试）: %v", err)
+			logger.Warn("imgen_bootstrap_failed", sdk.LogFieldError, err)
 		} else {
 			c.bootstrapped = true
 		}
@@ -53,7 +57,7 @@ func (c *Client) GenerateImage(ctx context.Context, prompt string, images []Imag
 
 	// Step 0.5: conversation/init 槽位
 	if err := c.conversationInit(); err != nil {
-		log.Printf("[imgen] conversation/init 失败（继续尝试）: %v", err)
+		logger.Warn("imgen_conversation_init_failed", sdk.LogFieldError, err)
 	}
 
 	// 心跳覆盖整个生成期
@@ -94,7 +98,7 @@ func (c *Client) GenerateImage(ctx context.Context, prompt string, images []Imag
 	// Step 2: prepare（失败不致命，缺 conduit_token 也能跑）
 	conduitToken, err := c.prepareConversation(prompt, cr.ChatToken, cr.ProofToken, "", "", uploaded)
 	if err != nil {
-		log.Printf("[imgen] prepare 失败（继续尝试）: %v", err)
+		logger.Warn("imgen_generate_prepare_failed", sdk.LogFieldError, err)
 	}
 
 	if err := ctx.Err(); err != nil {
@@ -135,7 +139,7 @@ func (c *Client) GenerateImage(ctx context.Context, prompt string, images []Imag
 	if sr.ConversationID != "" {
 		_, modelSlug = c.readMappingRefsAndModel(sr.ConversationID)
 		if modelSlug != "" {
-			log.Printf("[imgen] 最终 model_slug=%s", modelSlug)
+			logger.Debug("imgen_model_slug_resolved", sdk.LogFieldModel, modelSlug)
 		}
 	}
 
@@ -147,7 +151,7 @@ func (c *Client) GenerateImage(ctx context.Context, prompt string, images []Imag
 		}
 		data, err := c.downloadImage(sr.ConversationID, ref)
 		if err != nil {
-			log.Printf("[imgen] 下载 %s 失败: %v", ref, err)
+			logger.Warn("imgen_download_failed", "ref", ref, sdk.LogFieldError, err)
 			continue
 		}
 		kind := "sediment"
@@ -164,5 +168,9 @@ func (c *Client) GenerateImage(ctx context.Context, prompt string, images []Imag
 	if len(result.Images) == 0 {
 		return result, fmt.Errorf("所有图片下载均失败")
 	}
+	logger.Debug("imgen_generate_completed",
+		"image_count", len(result.Images),
+		sdk.LogFieldModel, modelSlug,
+	)
 	return result, nil
 }

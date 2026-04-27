@@ -43,8 +43,9 @@ func (g *OpenAIGateway) forwardAnthropicMessage(ctx context.Context, req *sdk.Fo
 	}
 	updateSessionStateFromRequest(session)
 
-	g.logger.Info("[客户端→Anthropic] 收到请求",
-		"model", gjson.GetBytes(body, "model").String(),
+	logger := sdk.LoggerFromContext(ctx)
+	logger.Debug("anthropic_request_received",
+		sdk.LogFieldModel, gjson.GetBytes(body, "model").String(),
 		"messages", gjson.GetBytes(body, "messages.#").Int(),
 		"tools", gjson.GetBytes(body, "tools.#").Int(),
 		"stream", gjson.GetBytes(body, "stream").Bool(),
@@ -75,7 +76,7 @@ func (g *OpenAIGateway) forwardAnthropicMessage(ctx context.Context, req *sdk.Fo
 	var mapping *anthropicModelMapping
 	var mappingEffort string
 	if mapping = resolveAnthropicModelMapping(originalModel); mapping != nil {
-		g.logger.Info("Anthropic 模型映射",
+		logger.Debug("anthropic_model_mapped",
 			"from", originalModel,
 			"to", mapping.OpenAIModel,
 			"fallback", mapping.FallbackModel,
@@ -94,7 +95,7 @@ func (g *OpenAIGateway) forwardAnthropicMessage(ctx context.Context, req *sdk.Fo
 	const sparkContextGuard = 100 * 1024 // 100KB body 上限（对应 ~32K tokens，Spark 128K 留余量）
 	if sparkTargetModel != "" && sparkTargetModel != modelName &&
 		isSparkEligibleToolTurn(body) && len(body) < sparkContextGuard {
-		g.logger.Info("简单操作路由到 Spark",
+		logger.Debug("spark_route_applied",
 			"original", modelName,
 			"spark", sparkTargetModel,
 			"body_size", len(body))
@@ -135,7 +136,7 @@ func (g *OpenAIGateway) forwardAnthropicMessage(ctx context.Context, req *sdk.Fo
 	responsesBody = injectAnthropicPromptCacheKey(responsesBody, strategy, session)
 	fullResponsesBody = injectAnthropicPromptCacheKey(fullResponsesBody, strategy, session)
 
-	g.logger.Info("[Anthropic→Responses] 转换完成",
+	logger.Debug("anthropic_request_converted",
 		"model", gjson.GetBytes(responsesBody, "model").String(),
 		"tools", gjson.GetBytes(responsesBody, "tools.#").Int(),
 		"input_items", gjson.GetBytes(responsesBody, "input.#").Int(),
@@ -225,7 +226,7 @@ func (g *OpenAIGateway) doAnthropicForward(
 		if len(replayBody) > 0 {
 			var failure *responsesFailureError
 			if errors.As(err, &failure) && failure.isContinuationAnchorError() {
-				g.logger.Warn("Anthropic continuation 锚点失效，降级为 full replay 重试一次",
+				sdk.LoggerFromContext(ctx).Warn("anthropic_continuation_anchor_invalid",
 					"session", session.SessionKey,
 					"digest_chain", session.DigestChain)
 				clearSessionStateResponseID(session.SessionKey)
@@ -241,10 +242,10 @@ func (g *OpenAIGateway) doAnthropicForward(
 fallbackCheck:
 	if hasFallback && errBody != nil {
 		if isModelNotFoundError(outcome.Upstream.StatusCode, errBody) {
-			g.logger.Info("模型降级重试",
+			sdk.LoggerFromContext(ctx).Warn("model_fallback_retry",
 				"primary", gjson.GetBytes(responsesBody, "model").String(),
 				"fallback", fallbackModel,
-				"status", outcome.Upstream.StatusCode)
+				sdk.LogFieldStatus, outcome.Upstream.StatusCode)
 
 			responsesBody, _ = sjson.SetBytes(responsesBody, "model", fallbackModel)
 			fallbackStart := time.Now()
@@ -308,24 +309,63 @@ func (g *OpenAIGateway) forwardAnthropicResponses(
 	session openAISessionResolution,
 ) (sdk.ForwardOutcome, []byte, error) {
 	account := req.Account
+	logger := sdk.LoggerFromContext(ctx)
 	responsesBody = applyForceInstructions(responsesBody, req.Headers)
 
 	upstreamReq, err := g.buildAnthropicUpstreamRequest(ctx, req, account, responsesBody, session)
 	if err != nil {
 		reason := fmt.Sprintf("构建上游请求失败: %v", err)
+		logger.Warn("upstream_request_build_failed",
+			sdk.LogFieldAccountID, account.ID,
+			sdk.LogFieldModel, mappedModel,
+			"protocol", "anthropic",
+			sdk.LogFieldError, err,
+		)
 		return transientOutcome(reason), nil, fmt.Errorf("%s", reason)
 	}
+
+	isOAuth := account.Credentials["access_token"] != ""
+	accountType := "apikey"
+	if isOAuth {
+		accountType = "oauth"
+	}
+	logger.Debug("upstream_request_start",
+		sdk.LogFieldAccountID, account.ID,
+		sdk.LogFieldModel, mappedModel,
+		"original_model", originalModel,
+		"url", redactURL(upstreamReq.URL.String()),
+		sdk.LogFieldMethod, http.MethodPost,
+		"stream", gjson.GetBytes(req.Body, "stream").Bool(),
+		"account_type", accountType,
+		"protocol", "anthropic",
+	)
 
 	client := g.buildHTTPClient(account)
 	resp, err := client.Do(upstreamReq)
 	if err != nil {
+		dur := time.Since(start)
+		logger.Warn("upstream_request_failed",
+			sdk.LogFieldAccountID, account.ID,
+			sdk.LogFieldModel, mappedModel,
+			sdk.LogFieldDurationMs, dur.Milliseconds(),
+			sdk.LogFieldError, err,
+			"protocol", "anthropic",
+		)
 		return transientOutcome(err.Error()), nil, fmt.Errorf("请求上游失败: %w", err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode >= 400 {
 		body, _ := io.ReadAll(resp.Body)
-		g.logger.Error("上游返回错误", "status", resp.StatusCode, "body", truncate(string(body), 300))
+		dur := time.Since(start)
+		logger.Warn("upstream_request_non_2xx",
+			sdk.LogFieldAccountID, account.ID,
+			sdk.LogFieldModel, mappedModel,
+			sdk.LogFieldStatus, resp.StatusCode,
+			sdk.LogFieldDurationMs, dur.Milliseconds(),
+			"body_preview", truncate(string(body), 300),
+			"protocol", "anthropic",
+		)
 
 		if suppressErrorWrite {
 			// fallback 模式：不写客户端，把 body 返给调用方判断是否降级
@@ -344,6 +384,16 @@ func (g *OpenAIGateway) forwardAnthropicResponses(
 	if snapshot := parseCodexUsageFromHeaders(resp.Header); snapshot != nil {
 		StoreCodexUsage(account.ID, snapshot)
 	}
+
+	logger.Debug("upstream_request_completed",
+		sdk.LogFieldAccountID, account.ID,
+		sdk.LogFieldModel, mappedModel,
+		sdk.LogFieldStatus, resp.StatusCode,
+		sdk.LogFieldDurationMs, time.Since(start).Milliseconds(),
+		"content_length", resp.ContentLength,
+		"stream", gjson.GetBytes(req.Body, "stream").Bool(),
+		"protocol", "anthropic",
+	)
 
 	serviceTier := firstNonEmptyTier(req.Headers.Get("X-Airgate-Service-Tier"), gjson.GetBytes(req.Body, "service_tier").String())
 	isStream := gjson.GetBytes(req.Body, "stream").Bool()

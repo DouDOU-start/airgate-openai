@@ -5,10 +5,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
 	"sort"
 	"strings"
 	"time"
+
+	sdk "github.com/DouDOU-start/airgate-sdk"
 )
 
 // ---------- stream_status ----------
@@ -152,19 +154,27 @@ func (c *Client) pollForImages(conversationID string, maxAttempts int) ([]string
 		asyncFailCount  int
 	)
 
+	logger := slog.Default()
 	for i := 0; i < maxAttempts; i++ {
 		time.Sleep(interval)
-		log.Printf("[imgen] 轮询 %d/%d", i+1, maxAttempts)
+		logger.Debug("imgen_poll_attempt", "attempt", i+1, "max_attempts", maxAttempts)
 
 		// 主路径：async-status
 		if asyncFailCount < 3 {
 			if as, err := c.asyncStatus(conversationID); err != nil {
 				asyncFailCount++
-				log.Printf("[imgen]   async-status 失败(%d/3): %v", asyncFailCount, err)
+				logger.Warn("imgen_async_status_failed",
+					"fail_count", asyncFailCount,
+					"max_fail", 3,
+					sdk.LogFieldError, err,
+				)
 			} else {
 				asyncFailCount = 0
 				if as.Completed && len(as.AssetPointers) > 0 {
-					log.Printf("[imgen] async-status 命中，返回 %d 个 asset_pointer", len(as.AssetPointers))
+					logger.Debug("imgen_poll_completed",
+						"source", "async_status",
+						"asset_count", len(as.AssetPointers),
+					)
 					return as.AssetPointers, nil
 				}
 			}
@@ -181,11 +191,14 @@ func (c *Client) pollForImages(conversationID string, maxAttempts int) ([]string
 
 		for _, r := range refs {
 			if strings.HasPrefix(r, "file-service://") {
-				if modelSlug != "" {
-					log.Printf("[imgen] mapping 命中（file-service 直出，共 %d ref，model_slug=%s）", len(refs), modelSlug)
-				} else {
-					log.Printf("[imgen] mapping 命中（file-service 直出，共 %d ref）", len(refs))
+				attrs := []any{
+					"source", "mapping_file_service",
+					"ref_count", len(refs),
 				}
+				if modelSlug != "" {
+					attrs = append(attrs, sdk.LogFieldModel, modelSlug)
+				}
+				logger.Debug("imgen_poll_completed", attrs...)
 				return refs, nil
 			}
 		}
@@ -196,11 +209,15 @@ func (c *Client) pollForImages(conversationID string, maxAttempts int) ([]string
 		if sig == lastFallbackSig && sig != "" {
 			stableCount++
 			if stableCount >= stableRounds {
-				if modelSlug != "" {
-					log.Printf("[imgen] mapping 命中（sediment 稳定 %d 轮，%d ref，model_slug=%s）", stableRounds, len(refs), modelSlug)
-				} else {
-					log.Printf("[imgen] mapping 命中（sediment 稳定 %d 轮，%d ref）", stableRounds, len(refs))
+				attrs := []any{
+					"source", "mapping_sediment",
+					"stable_rounds", stableRounds,
+					"ref_count", len(refs),
 				}
+				if modelSlug != "" {
+					attrs = append(attrs, sdk.LogFieldModel, modelSlug)
+				}
+				logger.Debug("imgen_poll_completed", attrs...)
 				return refs, nil
 			}
 		} else {
@@ -209,6 +226,7 @@ func (c *Client) pollForImages(conversationID string, maxAttempts int) ([]string
 		}
 	}
 
+	logger.Warn("imgen_poll_timeout", "max_attempts", maxAttempts)
 	return nil, fmt.Errorf("轮询 %d 次未拿到图片 asset_pointer", maxAttempts)
 }
 

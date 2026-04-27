@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"log"
 	"log/slog"
 	"net/http"
 	"net/url"
@@ -92,6 +91,22 @@ func (g *OpenAIGateway) Routes() []sdk.RouteDefinition {
 }
 
 func (g *OpenAIGateway) Forward(ctx context.Context, req *sdk.ForwardRequest) (sdk.ForwardOutcome, error) {
+	// 抽取/生成 request_id 并派生请求级 logger，注入 ctx 供下游使用
+	rid := sdk.ExtractOrGenerateRequestID(req.Headers)
+	logger := sdk.LoggerFromContext(ctx).With(sdk.LogFieldRequestID, rid)
+	if logger == nil {
+		logger = g.logger.With(sdk.LogFieldRequestID, rid)
+	}
+	ctx = sdk.WithLogger(ctx, logger)
+	ctx = sdk.WithRequestID(ctx, rid)
+
+	method, path := resolveAPIKeyRoute(req)
+	logger.Debug("plugin_request_received",
+		sdk.LogFieldMethod, method,
+		sdk.LogFieldPath, path,
+		sdk.LogFieldModel, req.Model,
+		"stream", req.Stream,
+	)
 	return g.forwardHTTP(ctx, req)
 }
 
@@ -224,8 +239,8 @@ func (g *OpenAIGateway) QueryQuota(ctx context.Context, credentials map[string]s
 				extra["email"] = info.Email
 			}
 			if g.logger != nil {
-				g.logger.Warn("QueryQuota refresh 失败，降级为 access_token JWT 解析",
-					"error", err,
+				g.logger.Warn("query_quota_refresh_failed_fallback_jwt",
+					sdk.LogFieldError, err,
 					"plan_type", info.PlanType,
 					"has_email", info.Email != "",
 				)
@@ -304,7 +319,11 @@ func (g *OpenAIGateway) probeAPIKeyUsage(ctx context.Context, accountID int64, c
 	// 401/403 标记为凭证错误
 	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
 		body, _ := io.ReadAll(resp.Body)
-		log.Printf("[ProbeUsage] API Key 账号 %d: HTTP %d, body=%s", accountID, resp.StatusCode, truncate(string(body), 200))
+		g.logger.Warn("probe_apikey_credential_error",
+			sdk.LogFieldAccountID, accountID,
+			sdk.LogFieldStatus, resp.StatusCode,
+			sdk.LogFieldReason, truncate(string(body), 200),
+		)
 		StoreProbeError(accountID, fmt.Sprintf("HTTP %d: %s", resp.StatusCode, string(body)))
 	}
 	return snapshot
@@ -321,7 +340,10 @@ func (g *OpenAIGateway) probeOAuthUsage(ctx context.Context, accountID int64, cr
 	// 构建 HTTP POST 请求到 SSE 端点（与 buildAnthropicUpstreamRequest OAuth 模式一致）
 	req, err := http.NewRequestWithContext(probeCtx, http.MethodPost, ChatGPTSSEURL, bytes.NewReader(probeBody))
 	if err != nil {
-		log.Printf("[ProbeUsage] OAuth 账号 %d: 构建请求失败: %v", accountID, err)
+		g.logger.Warn("probe_oauth_build_request_failed",
+			sdk.LogFieldAccountID, accountID,
+			sdk.LogFieldError, err,
+		)
 		return nil
 	}
 	req.Header.Set("Content-Type", "application/json")
@@ -335,7 +357,10 @@ func (g *OpenAIGateway) probeOAuthUsage(ctx context.Context, accountID int64, cr
 	client := g.buildHTTPClient(account)
 	resp, err := client.Do(req)
 	if err != nil {
-		log.Printf("[ProbeUsage] OAuth 账号 %d: 请求失败: %v", accountID, err)
+		g.logger.Warn("probe_oauth_request_failed",
+			sdk.LogFieldAccountID, accountID,
+			sdk.LogFieldError, err,
+		)
 		return nil
 	}
 	defer func() { _ = resp.Body.Close() }()
@@ -346,7 +371,11 @@ func (g *OpenAIGateway) probeOAuthUsage(ctx context.Context, accountID int64, cr
 
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
-		log.Printf("[ProbeUsage] OAuth 账号 %d: HTTP %d, body=%s", accountID, resp.StatusCode, truncate(string(body), 200))
+		g.logger.Warn("probe_oauth_non_2xx",
+			sdk.LogFieldAccountID, accountID,
+			sdk.LogFieldStatus, resp.StatusCode,
+			sdk.LogFieldReason, truncate(string(body), 200),
+		)
 		// 401/403 标记为凭证错误，存入 probe error 缓存供 HandleRequest 查询
 		if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
 			StoreProbeError(accountID, fmt.Sprintf("HTTP %d: %s", resp.StatusCode, string(body)))

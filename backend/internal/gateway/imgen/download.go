@@ -4,7 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"strings"
@@ -80,7 +80,10 @@ func (c *Client) downloadFileService(conversationID, fileID string) ([]byte, err
 
 	// 3) 其它情况 → fallback 到旧版 JSON 链接
 	_ = resp.Body.Close()
-	log.Printf("[imgen] files/download 新路径返回 HTTP %d，fallback 到旧版", resp.StatusCode)
+	slog.Default().Debug("imgen_download_fallback",
+		"http_status", resp.StatusCode,
+		"file_id", fileID,
+	)
 	return c.downloadByJSONLink("/backend-api/files/" + fileID + "/download")
 }
 

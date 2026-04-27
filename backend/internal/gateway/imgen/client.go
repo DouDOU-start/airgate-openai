@@ -3,7 +3,7 @@ package imgen
 import (
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
 	"net/http"
 	"net/http/cookiejar"
 	"net/url"
@@ -91,7 +91,7 @@ func (c *Client) Bootstrap() error {
 	for _, ck := range cookies {
 		names = append(names, ck.Name)
 	}
-	log.Printf("[imgen] bootstrap 获取 %d 个 cookie", len(cookies))
+	slog.Default().Debug("imgen_bootstrap_cookies_acquired", "cookie_count", len(cookies))
 	_ = names
 	return nil
 }
