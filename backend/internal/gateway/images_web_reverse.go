@@ -1,10 +1,14 @@
 package gateway
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"image"
+	_ "image/jpeg"
+	_ "image/png"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -101,6 +105,11 @@ func (g *OpenAIGateway) forwardImagesViaWebReverse(ctx context.Context, req *sdk
 		return webReverseImagesError(start, http.StatusBadRequest, req.Writer,
 			fmt.Sprintf("解析 Images 请求失败: %v", err))
 	}
+	// Web 逆向必然走 gpt-image-2（imagesWebReverseModel），统一启用严格 size 校验，
+	// 提前挡住上游 chatgpt.com 必拒的请求，避免浪费一次 PoW + 30s 轮询。
+	if err := validateImageSize(imgReq.Size, imagesWebReverseModel); err != nil {
+		return webReverseImagesError(start, http.StatusBadRequest, req.Writer, err.Error())
+	}
 	g.logger.Debug("Images WebReverse request",
 		"path", reqPath,
 		"request_model", imgReq.Model,
@@ -177,7 +186,17 @@ func (g *OpenAIGateway) forwardImagesViaWebReverse(ctx context.Context, req *sdk
 		Model:        imagesWebReverseModel,
 		FirstTokenMs: elapsed.Milliseconds(),
 	}
-	fillUsageCostPerImage(usage, numImages)
+	// Web 逆向上游不返 size 字段，直接解码生成的 PNG header 拿真实宽高（O(1)）。
+	// 解码失败 fallback 到请求 size（auto/空时 imagePriceForSize 兜底 1K）。
+	billingSize := imgReq.Size
+	if numImages > 0 {
+		if cfg, _, err := image.DecodeConfig(bytes.NewReader(imgRes.Images[0].Data)); err == nil && cfg.Width > 0 && cfg.Height > 0 {
+			billingSize = fmt.Sprintf("%dx%d", cfg.Width, cfg.Height)
+		}
+	}
+	// 透传到 usage_log.image_size 给 admin 后台展示（详见 forwardImagesViaResponsesTool 的注释）。
+	usage.ImageSize = billingSize
+	fillUsageCostPerImageBySize(usage, numImages, billingSize)
 
 	outcome := sdk.ForwardOutcome{
 		Kind:     sdk.OutcomeSuccess,

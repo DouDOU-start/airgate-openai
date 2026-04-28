@@ -355,6 +355,88 @@ func TestFillUsageCostPerImage(t *testing.T) {
 	}
 }
 
+// TestImageActualSizeFromBase64 验证从 base64 PNG header 解码出真实宽高。
+// auto 计费场景关键 fallback：上游若不返 size 字段，靠这个保证按真图计费。
+func TestImageActualSizeFromBase64(t *testing.T) {
+	// 生成 1536×1024 的真 PNG，编 base64
+	b64 := testPNGBase64(1536, 1024, func(x, y int) color.RGBA {
+		return color.RGBA{R: 100, G: 100, B: 100, A: 255}
+	})
+	got, ok := imageActualSizeFromBase64(b64)
+	if !ok {
+		t.Fatal("imageActualSizeFromBase64 = ok=false, want true")
+	}
+	if got != "1536x1024" {
+		t.Errorf("size = %q, want 1536x1024", got)
+	}
+	// 异常 base64 应返回 false
+	if _, ok := imageActualSizeFromBase64("not-valid-base64!!!"); ok {
+		t.Error("invalid base64 should return ok=false")
+	}
+	// 空字符串
+	if _, ok := imageActualSizeFromBase64(""); ok {
+		t.Error("empty string should return ok=false")
+	}
+}
+
+// TestImagePriceForSize 覆盖 1K/2K/4K 三档 + auto/空/异常 fallback。
+func TestImagePriceForSize(t *testing.T) {
+	cases := []struct {
+		size string
+		want float64
+	}{
+		// 1K (≤1536)
+		{"1024x1024", 0.10},
+		{"1536x1024", 0.10},
+		{"1024x1536", 0.10},
+		// 2K (1537-2048)
+		{"2048x2048", 0.20},
+		{"2048x1152", 0.20},
+		{"1152x2048", 0.20},
+		// 4K (>2048)
+		{"3840x2160", 0.40},
+		{"2160x3840", 0.40},
+		// fallback 1K
+		{"", 0.10},
+		{"auto", 0.10},
+		{"garbage", 0.10},
+	}
+	for _, tc := range cases {
+		if got := imagePriceForSize(tc.size); !almostEqual(got, tc.want, 1e-9) {
+			t.Errorf("imagePriceForSize(%q) = %v, want %v", tc.size, got, tc.want)
+		}
+	}
+}
+
+// TestFillUsageCostPerImageBySize 验证按张 × 档位单价填到 OutputCost。
+func TestFillUsageCostPerImageBySize(t *testing.T) {
+	cases := []struct {
+		name      string
+		size      string
+		numImages int
+		want      float64
+	}{
+		{"1K single", "1024x1024", 1, 0.10},
+		{"1K triple", "1536x1024", 3, 0.30},
+		{"2K single", "2048x2048", 1, 0.20},
+		{"4K double", "3840x2160", 2, 0.80},
+		{"auto fallback to 1K", "auto", 4, 0.40},
+		{"zero images skipped", "1024x1024", 0, 0},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			usage := &sdk.Usage{Model: "gpt-image-2"}
+			fillUsageCostPerImageBySize(usage, tc.numImages, tc.size)
+			if !almostEqual(usage.OutputCost, tc.want, 1e-9) {
+				t.Errorf("OutputCost = %v, want %v", usage.OutputCost, tc.want)
+			}
+			if !almostEqual(usage.InputCost, 0, 1e-9) {
+				t.Errorf("InputCost = %v, want 0", usage.InputCost)
+			}
+		})
+	}
+}
+
 func almostEqual(a, b, eps float64) bool {
 	return math.Abs(a-b) <= eps
 }
@@ -593,7 +675,22 @@ func TestBuildImagesToolCreateMsg(t *testing.T) {
 	if tool.Get("output_format").String() != "png" {
 		t.Errorf("tools[0].output_format = %q, want png", tool.Get("output_format").String())
 	}
-	for _, forbidden := range []string{"size", "quality", "background", "model", "n"} {
+	// size / quality / background 必须直接落到 tool 字段，
+	// 否则上游 image_generation 收不到这些参数会按默认（1024×1024）出图。
+	if got := tool.Get("size").String(); got != "1024x1024" {
+		t.Errorf("tools[0].size = %q, want 1024x1024", got)
+	}
+	if got := tool.Get("quality").String(); got != "low" {
+		t.Errorf("tools[0].quality = %q, want low", got)
+	}
+	if got := tool.Get("background").String(); got != "transparent" {
+		t.Errorf("tools[0].background = %q, want transparent", got)
+	}
+	// 这些字段不应出现：
+	//   - n：image_generation 一次只产 1 张，n>1 需要多轮工具调用编排，不通过 tool 字段
+	//   - model：image_generation tool 不接受 model 字段，image 模型由工具自己定（默认 gpt-image-2），
+	//     写了上游会 502；顶层 payload.model 给 chat 模型用是另一回事
+	for _, forbidden := range []string{"n", "model"} {
 		if tool.Get(forbidden).Exists() {
 			t.Errorf("tools[0].%s should not be present", forbidden)
 		}
@@ -610,8 +707,10 @@ func TestBuildImagesToolCreateMsg_ClampsOversizedSize(t *testing.T) {
 	if !strings.Contains(prompt, "Generate the image at 3840x2160 pixels.") {
 		t.Errorf("prompt missing clamped size constraint: %q", prompt)
 	}
-	if gjson.GetBytes(msg, "tools.0.size").Exists() {
-		t.Errorf("tools[0].size should not be present")
+	// clamp 后的 size 也要落到 tool 字段（之前期望"不存在"是按 prompt-only 策略写的，
+	// 现在改双轨：tool 字段是权威来源）。
+	if got := gjson.GetBytes(msg, "tools.0.size").String(); got != "3840x2160" {
+		t.Errorf("tools[0].size = %q, want clamped 3840x2160", got)
 	}
 }
 
@@ -695,7 +794,15 @@ func TestBuildImagesToolCreateMsg_Edit_JSON(t *testing.T) {
 	if tool.Get("output_format").String() != "png" {
 		t.Errorf("tools[0].output_format = %q, want png", tool.Get("output_format").String())
 	}
-	for _, forbidden := range []string{"action", "input_fidelity", "input_image_mask", "size", "model"} {
+	// /edits 模式下 size 同样要落到 tool 字段（双轨：tool 字段权威 + prompt 兜底）。
+	if got := tool.Get("size").String(); got != "1024x1024" {
+		t.Errorf("tools[0].size = %q, want 1024x1024", got)
+	}
+	// 这些字段仍不应出现：
+	//   - action / input_image_mask：codex CLI 字段，不是 Responses API image_generation tool 的合法字段
+	//   - input_fidelity：当前未作为 tool 字段透传（在 prompt constraints 里走兜底，gpt-image-2 上跳过）
+	//   - model：image_generation tool 不接受 model 字段，写了会 502
+	for _, forbidden := range []string{"action", "input_image_mask", "input_fidelity", "model"} {
 		if tool.Get(forbidden).Exists() {
 			t.Errorf("tools[0].%s should not be present", forbidden)
 		}
@@ -948,5 +1055,127 @@ func TestForwardImagesViaResponsesTool_EmptyPrompt(t *testing.T) {
 	}
 	if w.Code != http.StatusBadRequest {
 		t.Errorf("writer status = %d, want 400", w.Code)
+	}
+}
+
+// TestValidateImageSize 覆盖 gpt-image-2 size 硬约束的全部分支。
+// 包括：空/auto 透传、显式 1.5 跳过、16 倍数对齐、3:1 比例、
+// 总像素 [655360, 8294400] 范围、3840 边长上限。
+func TestValidateImageSize(t *testing.T) {
+	cases := []struct {
+		name    string
+		size    string
+		model   string
+		wantErr bool
+	}{
+		// 透传：空 / auto 不校验
+		{"empty size", "", "gpt-image-2", false},
+		{"auto size", "auto", "gpt-image-2", false},
+		{"AUTO uppercase", "AUTO", "", false},
+
+		// 跳过：显式 gpt-image-1 / 1.5 不应用 SKILL 严格约束
+		{"gpt-image-1.5 skips strict check", "1000x1000", "gpt-image-1.5", false},
+		{"gpt-image-1 skips strict check", "999x999", "gpt-image-1", false},
+
+		// gpt-image-2 / 空 model：合规
+		{"square 1024 ok", "1024x1024", "gpt-image-2", false},
+		{"landscape 1536x1024 ok", "1536x1024", "gpt-image-2", false},
+		{"4K landscape ok", "3840x2160", "gpt-image-2", false},
+		{"empty model treats as gpt-image-2 ok", "1024x1024", "", false},
+
+		// 格式错
+		{"malformed size", "1024", "gpt-image-2", true},
+		{"non-numeric", "abcxdef", "gpt-image-2", true},
+
+		// 边长超过 3840
+		{"oversize edge", "4096x2304", "gpt-image-2", true},
+
+		// 不是 16 的倍数
+		{"width not multiple of 16", "1000x1024", "gpt-image-2", true},
+		{"height not multiple of 16", "1024x1000", "gpt-image-2", true},
+
+		// 比例 > 3:1
+		{"ratio over 3 to 1", "3840x1024", "gpt-image-2", true}, // 3.75:1
+
+		// 总像素低于 655360
+		{"too few pixels", "512x512", "gpt-image-2", true}, // 262144
+
+		// 总像素高于 8294400 —— 但同时也会触发"边长超 3840"或"比例超"
+		// 单独构造一个仅超总像素而不超其它约束的 case 不可能（3840×3840=14745600，
+		// 但比例 1:1 ✓、边长 3840 ✓、16 倍数 ✓，仅超总像素），用这个验证总像素分支
+		{"too many pixels", "3840x3840", "gpt-image-2", true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := validateImageSize(tc.size, tc.model)
+			if tc.wantErr && err == nil {
+				t.Errorf("validateImageSize(%q, %q) = nil, want err", tc.size, tc.model)
+			}
+			if !tc.wantErr && err != nil {
+				t.Errorf("validateImageSize(%q, %q) = %v, want nil", tc.size, tc.model, err)
+			}
+		})
+	}
+}
+
+// TestForwardImagesViaResponsesTool_InvalidSize 客户端在 gpt-image-2 上传非法 size，
+// 应在 OAuth/PoW 链路启动前 400 返回，省一次配额。
+func TestForwardImagesViaResponsesTool_InvalidSize(t *testing.T) {
+	g := &OpenAIGateway{}
+	w := httptest.NewRecorder()
+	req := &sdk.ForwardRequest{
+		Account: &sdk.Account{ID: 1, Credentials: map[string]string{"access_token": "tok"}},
+		// size 1000 不是 16 倍数
+		Body:    []byte(`{"prompt":"hi","n":1,"model":"gpt-image-2","size":"1000x1000"}`),
+		Headers: http.Header{},
+		Writer:  w,
+	}
+	outcome, err := g.forwardImagesViaResponsesTool(t.Context(), req)
+	if err != nil {
+		t.Fatalf("expected nil err for client-side issue, got %v", err)
+	}
+	if outcome.Kind != sdk.OutcomeClientError {
+		t.Errorf("Kind = %v, want OutcomeClientError", outcome.Kind)
+	}
+	if outcome.Upstream.StatusCode != http.StatusBadRequest {
+		t.Errorf("Upstream.StatusCode = %d, want 400", outcome.Upstream.StatusCode)
+	}
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("writer status = %d, want 400", w.Code)
+	}
+	if !strings.Contains(string(outcome.Upstream.Body), "16") {
+		t.Errorf("error body should mention the 16-multiple constraint: %s", outcome.Upstream.Body)
+	}
+}
+
+// TestBuildImagesToolCreateMsg_Edit_GPTImage2_SkipsInputFidelity gpt-image-2 始终
+// 用 high fidelity 处理输入图，input_fidelity 是 no-op，constraints 不应再追加。
+// SKILL.md: "do not set input_fidelity with this model".
+func TestBuildImagesToolCreateMsg_Edit_GPTImage2_SkipsInputFidelity(t *testing.T) {
+	imageRef := testPNGDataURL(2, 2, func(x, y int) color.RGBA {
+		return color.RGBA{R: 80, G: 90, B: 100, A: 255}
+	})
+	body := []byte(fmt.Sprintf(`{
+		"model":"gpt-image-2",
+		"prompt":"make it cyberpunk",
+		"size":"1024x1024",
+		"input_fidelity":"high",
+		"image":%q
+	}`, imageRef))
+	msg, _, _, err := buildImagesToolCreateMsg(body, "application/json", true, openAISessionResolution{})
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	prompt := gjson.GetBytes(msg, "input.0.content.0.text").String()
+	if strings.Contains(prompt, "fidelity") {
+		t.Errorf("gpt-image-2 prompt should not mention fidelity, got: %q", prompt)
+	}
+	instructions := gjson.GetBytes(msg, "instructions").String()
+	if strings.Contains(instructions, "fidelity") {
+		t.Errorf("gpt-image-2 instructions should not mention fidelity, got: %q", instructions)
+	}
+	// 其它编辑约束不受影响，校验它们仍然存在
+	if !strings.Contains(prompt, "Image 1 is the edit target") {
+		t.Errorf("edit-target constraint missing: %q", prompt)
 	}
 }

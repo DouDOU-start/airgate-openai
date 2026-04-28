@@ -119,6 +119,19 @@ func fillUsageCostPerImage(usage *sdk.Usage, numImages int) {
 	usage.OutputPrice = spec.ImagePrice
 }
 
+// fillUsageCostPerImageBySize 按 1K/2K/4K size 分档填充 Usage（USD/张）。
+// 用于 OAuth → image_generation tool 路径，价格由 imagePriceForSize 硬编码（详见其注释）。
+// 跟 spec.ImagePrice 解耦：plugin.yaml 不需要登记 ImagePrice，分档定价完全由网关侧决定。
+func fillUsageCostPerImageBySize(usage *sdk.Usage, numImages int, size string) {
+	if usage == nil || numImages <= 0 {
+		return
+	}
+	price := imagePriceForSize(size)
+	usage.OutputCost = float64(numImages) * price
+	usage.InputCost = 0
+	usage.OutputPrice = price
+}
+
 // fillUsageCostWithImageTool 先按主 model 定价算 token 成本，再叠加图像按张费用。
 // numImages 是本次请求实际生成的图片张数（0 表示无图像工具调用）。
 func fillUsageCostWithImageTool(usage *sdk.Usage, numImages int) {

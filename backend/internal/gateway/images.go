@@ -374,14 +374,136 @@ func imageAPIConstraintLines(req *imagesRequest, isEdit, hasRegionAnnotation boo
 	}
 	if isEdit {
 		lines = append(lines, "Image 1 is the edit target; preserve its framing, identity, geometry, lighting, and all unrequested details.")
-		if fidelity := cleanImageConstraintValue(req.InputFidelity); fidelity != "" {
-			lines = append(lines, "Preserve the input image with "+fidelity+" fidelity.")
+		// gpt-image-2 始终用 high fidelity 处理输入图，input_fidelity 是 no-op；
+		// 写进 constraints 反而是噪声，可能让 chat 模型输出无效约束词。
+		// SKILL.md: "gpt-image-2 always uses high fidelity for image inputs;
+		// do not set input_fidelity with this model."
+		if !isGPTImage2Model(req.Model) {
+			if fidelity := cleanImageConstraintValue(req.InputFidelity); fidelity != "" {
+				lines = append(lines, "Preserve the input image with "+fidelity+" fidelity.")
+			}
 		}
 		if hasRegionAnnotation {
 			lines = append(lines, "Image 2 is a region annotation derived from the edit mask; change only the red marked area in Image 1 and keep everything outside that region unchanged.")
 		}
 	}
 	return lines
+}
+
+// isGPTImage2Model 判断 model 是否走 gpt-image-2 链路。
+// 空 model 视为 gpt-image-2，因为客户端不指定时上游默认升到 gpt-image-2。
+func isGPTImage2Model(model string) bool {
+	m := strings.ToLower(strings.TrimSpace(model))
+	if m == "" {
+		return true
+	}
+	return strings.HasPrefix(m, "gpt-image-2")
+}
+
+// imageActualSizeFromBase64 从图像 base64 数据里解码 header 拿实际宽高。
+// 用于 auto 计费场景兜底——客户端选 auto 时上游 image_generation_call event
+// 经常不返 size 字段，falling back 到 imgReq.Size="auto" 会按 1K 兜底，
+// 但上游可能实际出 1024² 也可能 1536×1024 也可能更大，估算不准。
+//
+// image.DecodeConfig 只读 PNG/JPEG 头部，O(1) 时间，不耗 CPU 解整张图。
+// 失败（base64 异常 / 非 PNG/JPEG / WebP 没注册解码器）返回 ok=false，
+// 调用方继续用 fallback 链。
+func imageActualSizeFromBase64(b64 string) (string, bool) {
+	if b64 == "" {
+		return "", false
+	}
+	data, err := base64.StdEncoding.DecodeString(strings.TrimSpace(b64))
+	if err != nil {
+		data, err = base64.RawStdEncoding.DecodeString(strings.TrimSpace(b64))
+		if err != nil {
+			return "", false
+		}
+	}
+	cfg, _, err := image.DecodeConfig(bytes.NewReader(data))
+	if err != nil {
+		return "", false
+	}
+	if cfg.Width <= 0 || cfg.Height <= 0 {
+		return "", false
+	}
+	return fmt.Sprintf("%dx%d", cfg.Width, cfg.Height), true
+}
+
+// imagePriceForSize 把生成的 size 映射成 USD 单价（1K/2K/4K 三档）。
+// 阈值按最长边：≤1536=1K, ≤2048=2K, 否则 4K。当前固定档位价格：
+//
+//	1K  → $0.10/张  (1024×1024 / 1536×1024 / 1024×1536)
+//	2K  → $0.20/张  (2048×2048 / 2048×1152 / 1152×2048)
+//	4K  → $0.40/张  (3840×2160 / 2160×3840)
+//
+// size = "auto" 或为空（上游用默认 1024²）按 1K 计费。
+// 跟 plugin.yaml 里 ImagePrice 字段解耦——OAuth → image_generation tool 路径
+// 走这一档分档表，不读 spec.ImagePrice。
+func imagePriceForSize(size string) float64 {
+	width, height, ok := parseImageSize(size)
+	if !ok {
+		return 0.10
+	}
+	longest := width
+	if height > longest {
+		longest = height
+	}
+	switch {
+	case longest <= 1536:
+		return 0.10
+	case longest <= 2048:
+		return 0.20
+	default:
+		return 0.40
+	}
+}
+
+// validateImageSize 在 OAuth → image_generation tool 路径上预校验 size，
+// 把上游会拒的请求挡在 OAuth/PoW/SSE 整套链路之前，省一次配额 + 30s 延迟。
+//
+// 校验范围限定 gpt-image-2（含空 model，默认走 2）；显式 gpt-image-1 / 1.5
+// 跳过：DALL-E 系列约束完全不同（只接受固定 size 列表），现有 normalize+clamp
+// 已经够用。
+//
+// 硬约束（gpt-image-2 SKILL.md）：
+//   - size = "" 或 "auto" → 允许（由上游决定）
+//   - 边长 ≤ 3840px（已有 clamp 兜底，此处仍校验是为了配 16 倍数检查）
+//   - 两边都是 16 的倍数
+//   - 长短边比例 ≤ 3:1
+//   - 总像素 ∈ [655360, 8294400]
+func validateImageSize(size, model string) error {
+	s := strings.ToLower(strings.TrimSpace(size))
+	if s == "" || s == "auto" {
+		return nil
+	}
+	if !isGPTImage2Model(model) {
+		return nil
+	}
+	width, height, ok := parseImageSize(s)
+	if !ok {
+		return fmt.Errorf("size 格式无效，应为 WIDTHxHEIGHT 或 auto")
+	}
+	if width > 3840 || height > 3840 {
+		return fmt.Errorf("size 边长超过 3840px (%dx%d)", width, height)
+	}
+	if width%16 != 0 || height%16 != 0 {
+		return fmt.Errorf("size 两边必须是 16 的倍数 (%dx%d)", width, height)
+	}
+	long, short := width, height
+	if short > long {
+		long, short = height, width
+	}
+	if long > short*3 {
+		return fmt.Errorf("size 长短边比例不能超过 3:1 (%dx%d)", width, height)
+	}
+	total := width * height
+	if total < 655360 {
+		return fmt.Errorf("size 总像素数不能少于 655360 (%dx%d=%d)", width, height, total)
+	}
+	if total > 8294400 {
+		return fmt.Errorf("size 总像素数不能超过 8294400 (%dx%d=%d)", width, height, total)
+	}
+	return nil
 }
 
 func cleanImageConstraintValue(value string) string {
@@ -620,9 +742,27 @@ func buildImagesToolCreateMsg(
 	if isEdit && req.Mask != "" {
 		outputFormat = "png"
 	}
+	// image_generation tool 把 size/quality/background 当作"工具默认参数"——
+	// 上游每次调用该 tool 都按这些值执行。早先版本只把这些塞到 prompt constraints
+	// 文本里，但中间那个 chat 模型（gpt-5.4）在触发 image_generation tool 时不会把
+	// prompt 文本翻译成 tool args，结果上游 image_generation 收不到 size，永远按
+	// 默认 1024×1024 出图——客户端选 4K 完全失效。
+	// constraints 文本仍保留作为兜底（双轨制），但 tool 字段是权威来源。
+	//
+	// 不写 model 字段：image_generation tool 不接受 model（image 模型由工具自己定，
+	// 默认 gpt-image-2），写了会 502。顶层 payload.model 是给 chat 模型用的另一回事。
 	tool := map[string]any{
 		"type":          "image_generation",
 		"output_format": outputFormat,
+	}
+	if size := normalizeImageSizeForUpstream(req.Size); size != "" && !strings.EqualFold(size, "auto") {
+		tool["size"] = size
+	}
+	if quality := strings.TrimSpace(req.Quality); quality != "" {
+		tool["quality"] = quality
+	}
+	if background := strings.TrimSpace(req.Background); background != "" {
+		tool["background"] = background
 	}
 	prompt := buildImagesToolPrompt(req, isEdit, regionAnnotation != "")
 	instructions := buildImagesToolInstructions(req, isEdit, regionAnnotation != "")
@@ -703,6 +843,9 @@ func (g *OpenAIGateway) forwardImagesViaResponsesTool(ctx context.Context, req *
 	isEdit := isImagesEditRequest(reqPath)
 	contentType := req.Headers.Get("Content-Type")
 	imgReq, err := parseImagesRequest(req.Body, contentType, isEdit)
+	if err == nil {
+		err = validateImageSize(imgReq.Size, imgReq.Model)
+	}
 	if err != nil {
 		body := jsonError(err.Error())
 		if req.Writer != nil {
@@ -928,7 +1071,25 @@ func (g *OpenAIGateway) forwardImagesViaResponsesTool(ctx context.Context, req *
 		outcome.Upstream.Headers = http.Header{"Content-Type": []string{"application/json"}}
 	}
 
-	fillUsageCostPerImage(usage, numImages)
+	// 计费 size 优先级（高 → 低）：
+	//   1. 上游 image_generation_call event 的 size 字段（telemetry 反馈）
+	//   2. 直接解码生成的 base64 图 header 拿真实宽高（auto 时最准的来源——
+	//      上游有时不返 size 字段，但图本身永远是诚实的）
+	//   3. 客户端请求里的 size（最可能是 "auto" 兜底）
+	billingSize := imgReq.Size
+	if len(wsResult.ImageGenCalls) > 0 {
+		first := wsResult.ImageGenCalls[0]
+		if first.Size != "" {
+			billingSize = first.Size
+		} else if sz, ok := imageActualSizeFromBase64(first.Result); ok {
+			billingSize = sz
+		}
+	}
+	// usage.ImageSize 透传到 Core 落到 usage_log.image_size 列，admin 后台用它解释计费
+	// 档位（1K/2K/4K）。auto 计费场景特别有用：用户看到 0.40 美元能立即对照 size 知道
+	// "上游真出了张 4K 图"，不用怀疑是不是算错了。
+	usage.ImageSize = billingSize
+	fillUsageCostPerImageBySize(usage, numImages, billingSize)
 	return outcome, nil
 }
 
