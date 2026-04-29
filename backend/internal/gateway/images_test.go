@@ -870,9 +870,10 @@ func TestParseImagesEditMultipart(t *testing.T) {
 // TestNormalizeImageRef 三种输入形式都应命中预期：data URL / http URL / 裸 base64。
 func TestNormalizeImageRef(t *testing.T) {
 	cases := map[string]string{
-		"data:image/png;base64,AAA": "data:image/png;base64,AAA",
-		"https://example.com/a.png": "https://example.com/a.png",
-		"AAA":                       "data:image/png;base64,AAA",
+		"data:image/png;base64,AAA=":     "data:image/png;base64,AAA=",
+		"data:image/png;base64,QUJD\nRA": "data:image/png;base64,QUJDRA==",
+		"https://example.com/a.png":      "https://example.com/a.png",
+		"QUJD\nRA":                       "data:image/png;base64,QUJDRA==",
 	}
 	for in, want := range cases {
 		if got := normalizeImageRef(in); got != want {

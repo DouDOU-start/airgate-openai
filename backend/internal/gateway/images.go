@@ -21,6 +21,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 
 	"github.com/tidwall/gjson"
 
@@ -315,12 +316,35 @@ func multipartImageRef(contentType string, data []byte, text string) string {
 // normalizeImageRef 把用户传来的 image 字符串归一化为上游能识别的形式。
 // 已经是 data URL / http(s) URL → 原样返回；否则按裸 base64（PNG）处理。
 func normalizeImageRef(s string) string {
-	if strings.HasPrefix(s, "data:") ||
-		strings.HasPrefix(s, "http://") ||
-		strings.HasPrefix(s, "https://") {
+	s = strings.TrimSpace(s)
+	if strings.HasPrefix(s, "http://") || strings.HasPrefix(s, "https://") {
 		return s
 	}
-	return "data:image/png;base64," + s
+	if strings.HasPrefix(s, "data:") {
+		return normalizeImageDataURL(s)
+	}
+	return "data:image/png;base64," + normalizeBase64ImageData(s)
+}
+
+func normalizeImageDataURL(s string) string {
+	comma := strings.IndexByte(s, ',')
+	if comma < 0 || !strings.Contains(strings.ToLower(s[:comma]), ";base64") {
+		return s
+	}
+	return s[:comma+1] + normalizeBase64ImageData(s[comma+1:])
+}
+
+func normalizeBase64ImageData(s string) string {
+	s = strings.Map(func(r rune) rune {
+		if unicode.IsSpace(r) {
+			return -1
+		}
+		return r
+	}, s)
+	if rem := len(s) % 4; rem != 0 {
+		s += strings.Repeat("=", 4-rem)
+	}
+	return s
 }
 
 func normalizedImageOutputFormat(format string) string {

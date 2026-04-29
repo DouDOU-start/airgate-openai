@@ -88,6 +88,17 @@ func TestExtractChatImageInputs(t *testing.T) {
 	}
 }
 
+func TestExtractChatImageInputs_NormalizesImageURL(t *testing.T) {
+	body := []byte(`{"messages":[{"role":"user","content":[
+		{"type":"text","text":"edit this"},
+		{"type":"image_url","image_url":{"url":"QUJD\nRA"}}
+	]}]}`)
+	_, images := extractChatImageInputs(body)
+	if len(images) != 1 || images[0] != "data:image/png;base64,QUJDRA==" {
+		t.Fatalf("images = %#v", images)
+	}
+}
+
 // ── buildChatCompatImagePayload ──
 
 func TestBuildChatCompatImagePayload(t *testing.T) {

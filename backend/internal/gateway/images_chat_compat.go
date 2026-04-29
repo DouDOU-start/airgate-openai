@@ -151,8 +151,8 @@ func extractChatImageInputs(body []byte) (string, []string) {
 				case "text":
 					lastPrompt = part.Get("text").String()
 				case "image_url":
-					if u := part.Get("image_url.url").String(); u != "" {
-						imageRefs = append(imageRefs, u)
+					if u := part.Get("image_url.url").String(); strings.TrimSpace(u) != "" {
+						imageRefs = append(imageRefs, normalizeImageRef(u))
 					}
 				}
 			}
