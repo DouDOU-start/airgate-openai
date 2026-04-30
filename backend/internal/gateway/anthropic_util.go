@@ -214,6 +214,85 @@ func hasWebSearchTool(body []byte) bool {
 	return false
 }
 
+func estimateAnthropicInputTokens(body []byte) int {
+	if len(body) == 0 {
+		return 0
+	}
+	if !gjson.ValidBytes(body) {
+		return estimateTextTokens(string(body))
+	}
+
+	tokens := 8
+	if system := gjson.GetBytes(body, "system"); system.Exists() {
+		tokens += estimateAnthropicContentTokens(system) + 4
+	}
+	for _, msg := range gjson.GetBytes(body, "messages").Array() {
+		tokens += 8 + estimateTextTokens(msg.Get("role").String())
+		tokens += estimateAnthropicContentTokens(msg.Get("content"))
+	}
+	for _, tool := range gjson.GetBytes(body, "tools").Array() {
+		tokens += 24 + estimateTextTokens(tool.Get("name").String())
+		tokens += estimateTextTokens(tool.Get("description").String())
+		if raw := tool.Get("input_schema").Raw; raw != "" {
+			tokens += estimateTextTokens(raw)
+		} else if raw := tool.Get("parameters").Raw; raw != "" {
+			tokens += estimateTextTokens(raw)
+		}
+	}
+	if raw := gjson.GetBytes(body, "tool_choice").Raw; raw != "" {
+		tokens += estimateTextTokens(raw)
+	}
+	return tokens
+}
+
+func estimateAnthropicContentTokens(content gjson.Result) int {
+	switch {
+	case !content.Exists() || content.Type == gjson.Null:
+		return 0
+	case content.IsArray():
+		tokens := 0
+		for _, block := range content.Array() {
+			tokens += 6
+			switch block.Get("type").String() {
+			case "text", "thinking":
+				tokens += estimateTextTokens(block.Get("text").String())
+				tokens += estimateTextTokens(block.Get("thinking").String())
+			case "tool_use":
+				tokens += 16 + estimateTextTokens(block.Get("name").String()) + estimateTextTokens(block.Get("input").Raw)
+			case "tool_result":
+				tokens += 12 + estimateAnthropicContentTokens(block.Get("content"))
+			case "image", "document":
+				tokens += estimateTextTokens(block.Raw) + 256
+			default:
+				tokens += estimateTextTokens(block.Raw)
+			}
+		}
+		return tokens
+	case content.Type == gjson.String:
+		return estimateTextTokens(content.String())
+	default:
+		return estimateTextTokens(content.Raw)
+	}
+}
+
+func estimateTextTokens(text string) int {
+	if text == "" {
+		return 0
+	}
+	asciiChars := 0
+	nonASCIIChars := 0
+	for _, r := range text {
+		if r < 128 {
+			asciiChars++
+		} else {
+			nonASCIIChars++
+		}
+	}
+	tokens := (asciiChars + 3) / 4
+	tokens += nonASCIIChars
+	return tokens
+}
+
 // normalizeToolParametersJSON 确保 object schema 至少包含空 properties（参考 CLIProxyAPI normalizeToolParameters）
 func normalizeToolParametersJSON(raw string) string {
 	raw = strings.TrimSpace(raw)

@@ -166,19 +166,26 @@ func resolveAnthropicModelMapping(claudeModel string) *anthropicModelMapping {
 	return &m
 }
 
-// isModelNotFoundError 判断上游错误是否为模型不可用（用于 fallback 降级）
-func isModelNotFoundError(statusCode int, body []byte) bool {
+// isModelFallbackError 判断上游错误是否可通过切换 fallback 模型恢复。
+func isModelFallbackError(statusCode int, body []byte) bool {
 	if statusCode == 404 {
 		return true
 	}
 	if statusCode == 400 {
 		msg := strings.ToLower(string(body))
-		return strings.Contains(msg, "model") &&
+		modelUnavailable := strings.Contains(msg, "model") &&
 			(strings.Contains(msg, "not found") ||
 				strings.Contains(msg, "does not exist") ||
 				strings.Contains(msg, "not available") ||
 				strings.Contains(msg, "invalid model") ||
 				strings.Contains(msg, "not supported"))
+		contextExceeded := strings.Contains(msg, "context_length") ||
+			strings.Contains(msg, "context window") ||
+			strings.Contains(msg, "max_input_tokens") ||
+			strings.Contains(msg, "token limit") ||
+			strings.Contains(msg, "too many tokens") ||
+			strings.Contains(msg, "input_too_long")
+		return modelUnavailable || contextExceeded
 	}
 	return false
 }

@@ -178,7 +178,7 @@ type imagesRequest struct {
 }
 
 // parseImagesRequest 把原始请求体按内容类型解析成 imagesRequest。
-// /generations 只支持 application/json；/edits 同时支持 JSON（image 字段是 base64/data URL/数组）
+// /generations 只支持 application/json；/edits 同时支持 JSON（image 字段是 data URL/http(s) URL/数组）
 // 与 multipart/form-data（OpenAI SDK 标准）。
 func parseImagesRequest(body []byte, contentType string, isEdit bool) (*imagesRequest, error) {
 	if isEdit {
@@ -222,14 +222,26 @@ func parseImagesJSON(body []byte, isEdit bool) (*imagesRequest, error) {
 	if imgNode.IsArray() {
 		for _, item := range imgNode.Array() {
 			if s := strings.TrimSpace(item.String()); s != "" {
-				req.Images = append(req.Images, normalizeImageRef(s))
+				imageRef, err := normalizeImageRef(s)
+				if err != nil {
+					return nil, err
+				}
+				req.Images = append(req.Images, imageRef)
 			}
 		}
 	} else if s := strings.TrimSpace(imgNode.String()); s != "" {
-		req.Images = append(req.Images, normalizeImageRef(s))
+		imageRef, err := normalizeImageRef(s)
+		if err != nil {
+			return nil, err
+		}
+		req.Images = append(req.Images, imageRef)
 	}
 	if mask := strings.TrimSpace(gjson.GetBytes(body, "mask").String()); mask != "" {
-		req.Mask = normalizeImageRef(mask)
+		maskRef, err := normalizeImageRef(mask)
+		if err != nil {
+			return nil, err
+		}
+		req.Mask = maskRef
 	}
 	if len(req.Images) == 0 {
 		return nil, fmt.Errorf("/v1/images/edits 需要至少一张 image")
@@ -284,9 +296,17 @@ func parseImagesEditMultipart(body []byte, contentType string) (*imagesRequest, 
 		case "input_fidelity":
 			req.InputFidelity = text
 		case "image", "image[]":
-			req.Images = append(req.Images, multipartImageRef(ctype, data, text))
+			imageRef, refErr := multipartImageRef(ctype, data, text)
+			if refErr != nil {
+				return nil, refErr
+			}
+			req.Images = append(req.Images, imageRef)
 		case "mask":
-			req.Mask = multipartImageRef(ctype, data, text)
+			maskRef, refErr := multipartImageRef(ctype, data, text)
+			if refErr != nil {
+				return nil, refErr
+			}
+			req.Mask = maskRef
 		}
 	}
 	if req.Prompt == "" {
@@ -298,32 +318,26 @@ func parseImagesEditMultipart(body []byte, contentType string) (*imagesRequest, 
 	return req, nil
 }
 
-// multipartImageRef 把 multipart part 转成统一的图片引用：
-//   - 二进制文件（Content-Type=image/*）→ data URL
-//   - 文本字段（Content-Type=text/* 或空 + 看上去像 data URL / http URL）→ 直接使用文本
-func multipartImageRef(contentType string, data []byte, text string) string {
+func multipartImageRef(contentType string, data []byte, text string) (string, error) {
 	mainType := strings.TrimSpace(strings.Split(strings.ToLower(contentType), ";")[0])
 	if strings.HasPrefix(mainType, "image/") {
-		return "data:" + mainType + ";base64," + base64.StdEncoding.EncodeToString(data)
+		return "data:" + mainType + ";base64," + base64.StdEncoding.EncodeToString(data), nil
 	}
-	// 兜底：无 Content-Type 也按二进制处理（OpenAI SDK 有时只带文件名不带类型）
-	if mainType == "" || mainType == "application/octet-stream" {
-		return "data:image/png;base64," + base64.StdEncoding.EncodeToString(data)
+	if mainType == "" || strings.HasPrefix(mainType, "text/") {
+		return normalizeImageRef(text)
 	}
-	return normalizeImageRef(text)
+	return "", fmt.Errorf("不支持的 multipart 图片 Content-Type: %s", contentType)
 }
 
-// normalizeImageRef 把用户传来的 image 字符串归一化为上游能识别的形式。
-// 已经是 data URL / http(s) URL → 原样返回；否则按裸 base64（PNG）处理。
-func normalizeImageRef(s string) string {
+func normalizeImageRef(s string) (string, error) {
 	s = strings.TrimSpace(s)
 	if strings.HasPrefix(s, "http://") || strings.HasPrefix(s, "https://") {
-		return s
+		return s, nil
 	}
 	if strings.HasPrefix(s, "data:") {
-		return normalizeImageDataURL(s)
+		return normalizeImageDataURL(s), nil
 	}
-	return "data:image/png;base64," + normalizeBase64ImageData(s)
+	return "", fmt.Errorf("image 必须是 data URL 或 http(s) URL")
 }
 
 func normalizeImageDataURL(s string) string {

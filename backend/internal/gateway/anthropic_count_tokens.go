@@ -2,21 +2,27 @@ package gateway
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 
 	sdk "github.com/DouDOU-start/airgate-sdk"
 )
 
-// forwardAnthropicCountTokens 当前返回 404，让 Claude Code 等客户端回退到本地估算。
-// 这样可以避免 count_tokens 辅助请求干扰主链路行为判断。
+// forwardAnthropicCountTokens 返回本地估算，避免客户端把 404 当作不可计数并继续发送过长请求。
 func (g *OpenAIGateway) forwardAnthropicCountTokens(_ context.Context, req *sdk.ForwardRequest) (sdk.ForwardOutcome, error) {
-	const message = "count_tokens endpoint is not supported"
+	body, err := json.Marshal(map[string]int{"input_tokens": estimateAnthropicInputTokens(req.Body)})
+	if err != nil {
+		body = []byte(`{"input_tokens":0}`)
+	}
 	if req.Writer != nil {
-		writeAnthropicErrorJSON(req.Writer, http.StatusNotFound, "not_found_error", message)
+		setAnthropicStyleResponseHeaders(req.Writer)
+		req.Writer.Header().Set("Content-Type", "application/json")
+		req.Writer.WriteHeader(http.StatusOK)
+		_, _ = req.Writer.Write(body)
 	}
 	return sdk.ForwardOutcome{
-		Kind:     sdk.OutcomeClientError,
-		Upstream: sdk.UpstreamResponse{StatusCode: http.StatusNotFound},
-		Reason:   message,
+		Kind:     sdk.OutcomeSuccess,
+		Upstream: sdk.UpstreamResponse{StatusCode: http.StatusOK, Body: body},
+		Reason:   "count_tokens estimated locally",
 	}, nil
 }

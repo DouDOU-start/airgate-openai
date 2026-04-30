@@ -1,13 +1,140 @@
 package gateway
 
 import (
+	"context"
 	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/tidwall/gjson"
+
+	sdk "github.com/DouDOU-start/airgate-sdk"
 )
+
+func TestEstimateAnthropicInputTokensCountsSystemMessagesAndTools(t *testing.T) {
+	body := []byte(`{"model":"claude-haiku-4-5","system":"You are concise.","messages":[{"role":"user","content":[{"type":"text","text":"hello world"},{"type":"tool_result","tool_use_id":"toolu_1","content":"搜索结果"}]}],"tools":[{"name":"grep","description":"Search files","input_schema":{"type":"object","properties":{"query":{"type":"string"}}}}],"max_tokens":64}`)
+
+	got := estimateAnthropicInputTokens(body)
+	if got <= 40 {
+		t.Fatalf("estimateAnthropicInputTokens() = %d, want a non-trivial estimate", got)
+	}
+}
+
+func TestIsModelFallbackErrorIncludesContextWindowErrors(t *testing.T) {
+	cases := []struct {
+		name       string
+		statusCode int
+		body       []byte
+	}{
+		{
+			name:       "context length code",
+			statusCode: http.StatusBadRequest,
+			body:       []byte(`{"error":{"code":"context_length_exceeded","message":"Your input exceeds the context window of this model."}}`),
+		},
+		{
+			name:       "input too long",
+			statusCode: http.StatusBadRequest,
+			body:       []byte(`{"error":{"code":"input_too_long","message":"input is too long"}}`),
+		},
+		{
+			name:       "model unavailable",
+			statusCode: http.StatusBadRequest,
+			body:       []byte(`{"error":{"message":"The model gpt-x is not supported."}}`),
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if !isModelFallbackError(tc.statusCode, tc.body) {
+				t.Fatalf("isModelFallbackError(%d, %s) = false, want true", tc.statusCode, tc.body)
+			}
+		})
+	}
+}
+
+func TestIsModelFallbackErrorRejectsOrdinaryClientErrors(t *testing.T) {
+	body := []byte(`{"error":{"message":"Missing required parameter: messages."}}`)
+	if isModelFallbackError(http.StatusBadRequest, body) {
+		t.Fatalf("ordinary invalid request should not trigger model fallback")
+	}
+}
+
+func TestForwardAnthropicMessageFallsBackOnContextWindowError(t *testing.T) {
+	var models []string
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("read request body: %v", err)
+		}
+		model := gjson.GetBytes(body, "model").String()
+		models = append(models, model)
+		if len(models) == 1 {
+			if model != sparkTargetModel {
+				t.Fatalf("first request model = %q, want Spark %q", model, sparkTargetModel)
+			}
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = fmt.Fprint(w, `data: {"type":"response.failed","response":{"error":{"type":"invalid_request_error","code":"context_length_exceeded","message":"Your input exceeds the context window of this model."}}}`+"\n\n")
+			return
+		}
+		if model != sonnetTargetModel {
+			t.Fatalf("fallback request model = %q, want %q", model, sonnetTargetModel)
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = fmt.Fprint(w, `data: {"type":"response.output_text.delta","delta":"ok"}`+"\n")
+		_, _ = fmt.Fprint(w, `data: {"type":"response.completed","response":{"id":"resp_fallback","model":"`+sonnetTargetModel+`","usage":{"input_tokens":3,"output_tokens":1}}}`+"\n\n")
+	}))
+	defer ts.Close()
+
+	body := []byte(`{"model":"claude-sonnet-4-6","max_tokens":128,"messages":[{"role":"assistant","content":[{"type":"tool_use","id":"toolu_1","name":"Grep","input":{"pattern":"foo"}}]},{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","content":"foo.go:1"}]}]}`)
+	w := httptest.NewRecorder()
+	req := &sdk.ForwardRequest{
+		Account: &sdk.Account{ID: time.Now().UnixNano(), Credentials: map[string]string{
+			"api_key":  "test-key",
+			"base_url": ts.URL,
+		}},
+		Writer: w,
+		Body:   body,
+	}
+	gateway := &OpenAIGateway{transportPool: NewTransportPool()}
+	outcome, err := gateway.forwardAnthropicMessage(context.Background(), req)
+	if err != nil {
+		t.Fatalf("forwardAnthropicMessage err: %v", err)
+	}
+	if outcome.Kind != sdk.OutcomeSuccess {
+		t.Fatalf("outcome kind = %v, want success; reason=%s", outcome.Kind, outcome.Reason)
+	}
+	if len(models) != 2 {
+		t.Fatalf("upstream request count = %d, want 2; models=%v", len(models), models)
+	}
+	if got := gjson.Get(w.Body.String(), "content.0.text").String(); got != "ok" {
+		t.Fatalf("response text = %q, want ok; body=%s", got, w.Body.String())
+	}
+}
+
+func TestForwardAnthropicCountTokensReturnsEstimate(t *testing.T) {
+	w := httptest.NewRecorder()
+	req := &sdk.ForwardRequest{
+		Writer:  w,
+		Headers: http.Header{"X-Forwarded-Path": []string{"/v1/messages/count_tokens"}},
+		Body:    []byte(`{"model":"claude-haiku-4-5","messages":[{"role":"user","content":"hello world"}]}`),
+	}
+	outcome, err := (&OpenAIGateway{}).forwardAnthropicCountTokens(context.Background(), req)
+	if err != nil {
+		t.Fatalf("forwardAnthropicCountTokens err: %v", err)
+	}
+	if outcome.Kind != sdk.OutcomeSuccess {
+		t.Fatalf("outcome kind = %v, want success", outcome.Kind)
+	}
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", w.Code)
+	}
+	if got := gjson.Get(w.Body.String(), "input_tokens").Int(); got <= 0 {
+		t.Fatalf("input_tokens = %d, want > 0; body=%s", got, w.Body.String())
+	}
+}
 
 func TestNormalizeAnthropicStopReason(t *testing.T) {
 	tests := []struct {

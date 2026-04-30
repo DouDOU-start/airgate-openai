@@ -25,7 +25,25 @@ import (
 func (g *OpenAIGateway) forwardChatCompletionsAsImages(ctx context.Context, req *sdk.ForwardRequest) (sdk.ForwardOutcome, error) {
 	start := time.Now()
 
-	prompt, imageRefs := extractChatImageInputs(req.Body)
+	prompt, imageRefs, extractErr := extractChatImageInputs(req.Body)
+	if extractErr != nil {
+		body := jsonError(extractErr.Error())
+		if req.Writer != nil {
+			req.Writer.Header().Set("Content-Type", "application/json")
+			req.Writer.WriteHeader(http.StatusBadRequest)
+			_, _ = req.Writer.Write(body)
+		}
+		return sdk.ForwardOutcome{
+			Kind: sdk.OutcomeClientError,
+			Upstream: sdk.UpstreamResponse{
+				StatusCode: http.StatusBadRequest,
+				Headers:    http.Header{"Content-Type": []string{"application/json"}},
+				Body:       body,
+			},
+			Reason:   "image model via chat completions: invalid image url",
+			Duration: time.Since(start),
+		}, nil
+	}
 	if prompt == "" {
 		body := jsonError("messages 中未找到用户消息")
 		if req.Writer != nil {
@@ -133,10 +151,10 @@ func isChatCompatImageModel(reqModel string) bool {
 
 // extractChatImageInputs 从 messages 数组中提取最后一条 user 消息的
 // 文本 prompt 以及所有 image_url 附件引用。
-func extractChatImageInputs(body []byte) (string, []string) {
+func extractChatImageInputs(body []byte) (string, []string, error) {
 	messages := gjson.GetBytes(body, "messages")
 	if !messages.Exists() || !messages.IsArray() {
-		return "", nil
+		return "", nil, nil
 	}
 	var lastPrompt string
 	var imageRefs []string
@@ -152,7 +170,11 @@ func extractChatImageInputs(body []byte) (string, []string) {
 					lastPrompt = part.Get("text").String()
 				case "image_url":
 					if u := part.Get("image_url.url").String(); strings.TrimSpace(u) != "" {
-						imageRefs = append(imageRefs, normalizeImageRef(u))
+						imageRef, err := normalizeImageRef(u)
+						if err != nil {
+							return "", nil, err
+						}
+						imageRefs = append(imageRefs, imageRef)
 					}
 				}
 			}
@@ -160,12 +182,12 @@ func extractChatImageInputs(body []byte) (string, []string) {
 			lastPrompt = content.String()
 		}
 	}
-	return strings.TrimSpace(lastPrompt), imageRefs
+	return strings.TrimSpace(lastPrompt), imageRefs, nil
 }
 
 // extractPromptFromMessages 便捷封装，只取 prompt 文本。
 func extractPromptFromMessages(body []byte) string {
-	prompt, _ := extractChatImageInputs(body)
+	prompt, _, _ := extractChatImageInputs(body)
 	return prompt
 }
 

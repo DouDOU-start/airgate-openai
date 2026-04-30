@@ -77,7 +77,10 @@ func TestExtractChatImageInputs(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			prompt, images := extractChatImageInputs([]byte(tc.body))
+			prompt, images, err := extractChatImageInputs([]byte(tc.body))
+			if err != nil {
+				t.Fatalf("extractChatImageInputs err: %v", err)
+			}
 			if prompt != tc.wantPrompt {
 				t.Errorf("prompt = %q, want %q", prompt, tc.wantPrompt)
 			}
@@ -88,14 +91,28 @@ func TestExtractChatImageInputs(t *testing.T) {
 	}
 }
 
-func TestExtractChatImageInputs_NormalizesImageURL(t *testing.T) {
+func TestExtractChatImageInputs_NormalizesDataImageURL(t *testing.T) {
 	body := []byte(`{"messages":[{"role":"user","content":[
 		{"type":"text","text":"edit this"},
-		{"type":"image_url","image_url":{"url":"QUJD\nRA"}}
+		{"type":"image_url","image_url":{"url":"data:image/png;base64,QUJD\nRA"}}
 	]}]}`)
-	_, images := extractChatImageInputs(body)
+	_, images, err := extractChatImageInputs(body)
+	if err != nil {
+		t.Fatalf("extractChatImageInputs err: %v", err)
+	}
 	if len(images) != 1 || images[0] != "data:image/png;base64,QUJDRA==" {
 		t.Fatalf("images = %#v", images)
+	}
+}
+
+func TestExtractChatImageInputsRejectsUnsupportedImageURL(t *testing.T) {
+	body := []byte(`{"messages":[{"role":"user","content":[
+		{"type":"text","text":"edit this"},
+		{"type":"image_url","image_url":{"url":"QUJDRA=="}}
+	]}]}`)
+	_, _, err := extractChatImageInputs(body)
+	if err == nil {
+		t.Fatal("expected err for unsupported image_url, got nil")
 	}
 }
 
