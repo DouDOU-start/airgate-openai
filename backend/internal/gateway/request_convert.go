@@ -202,11 +202,7 @@ func convertChatMessagesToResponsesInput(messages []gjson.Result) ([]any, string
 			item := map[string]any{
 				"type":    "function_call_output",
 				"call_id": callID,
-			}
-			if outputParts := convertChatContentToResponsesParts(msg, "input_text"); len(outputParts) > 0 {
-				item["output"] = outputParts
-			} else {
-				item["output"] = extractChatMessageText(msg)
+				"output":  extractChatMessageText(msg),
 			}
 			input = append(input, item)
 

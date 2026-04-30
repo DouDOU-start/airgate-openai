@@ -192,6 +192,22 @@ func TestWrapAsResponsesAPIPreservesChatImageURL(t *testing.T) {
 	}
 }
 
+func TestWrapAsResponsesAPIToolResultOutputIsString(t *testing.T) {
+	body := []byte(`{"messages":[{"role":"assistant","tool_calls":[{"id":"call_1","type":"function","function":{"name":"get_weather","arguments":"{\"city\":\"北京\"}"}}]},{"role":"tool","tool_call_id":"call_1","content":[{"type":"text","text":"sunny"}]}]}`)
+	result, err := wrapAsResponsesAPI(body, "gpt-5.4")
+	if err != nil {
+		t.Fatalf("wrapAsResponsesAPI: %v", err)
+	}
+
+	output := gjson.GetBytes(result, "input.1.output")
+	if output.Type != gjson.String {
+		t.Fatalf("function_call_output.output type = %v, want string; body=%s", output.Type, result)
+	}
+	if output.String() != "sunny" {
+		t.Fatalf("function_call_output.output = %q, want sunny", output.String())
+	}
+}
+
 func TestNormalizeResponsesInputPreservesChatImageURL(t *testing.T) {
 	body := []byte(`{"model":"gpt-5.4","messages":[{"role":"user","content":[{"type":"text","text":"describe this"},{"type":"image_url","image_url":{"url":"data:image/png;base64,AAA"}}]}]}`)
 	result := normalizeResponsesInput(body, "/v1/responses")

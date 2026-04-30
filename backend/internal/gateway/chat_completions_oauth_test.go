@@ -167,6 +167,37 @@ func TestChatCompletionsStreamWriter_ToolCall(t *testing.T) {
 	}
 }
 
+func TestChatCompletionsStreamWriter_ToolCallArgumentsDoneOnly(t *testing.T) {
+	w := newFakeWriter()
+	writer := newChatCompletionsStreamWriter(w, "gpt-5.4", 0, "", false, time.Now())
+
+	writer.OnRawEvent("response.created", []byte(`{"type":"response.created","response":{"id":"resp_xyz","model":"gpt-5.4"}}`))
+	writer.OnRawEvent("response.output_item.added", []byte(`{"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","call_id":"call_1","name":"get_weather"}}`))
+	writer.OnRawEvent("response.function_call_arguments.done", []byte(`{"type":"response.function_call_arguments.done","output_index":0,"arguments":"{\"city\":\"北京\"}"}`))
+	writer.OnRawEvent("response.completed", []byte(`{"type":"response.completed","response":{"status":"completed","usage":{"input_tokens":10,"output_tokens":6}}}`))
+	writer.finalize()
+
+	lines := extractSSEDataLines(w.buf.String())
+	var argBuf strings.Builder
+	for _, l := range lines[:len(lines)-1] {
+		var m map[string]any
+		if err := json.Unmarshal([]byte(l), &m); err != nil {
+			t.Fatalf("chunk not valid JSON: %v\n%s", err, l)
+		}
+		choice := m["choices"].([]any)[0].(map[string]any)
+		delta, _ := choice["delta"].(map[string]any)
+		if tcs, ok := delta["tool_calls"].([]any); ok && len(tcs) > 0 {
+			fn, _ := tcs[0].(map[string]any)["function"].(map[string]any)
+			if args, _ := fn["arguments"].(string); args != "" {
+				argBuf.WriteString(args)
+			}
+		}
+	}
+	if argBuf.String() != `{"city":"北京"}` {
+		t.Errorf("tool call arguments = %q, want %q", argBuf.String(), `{"city":"北京"}`)
+	}
+}
+
 func TestBuildNonStreamChatCompletion_Text(t *testing.T) {
 	result := WSResult{
 		ResponseID:        "resp_1",

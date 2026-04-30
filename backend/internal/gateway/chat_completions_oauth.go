@@ -72,6 +72,7 @@ type chatCompletionsStreamWriter struct {
 	nextToolIdx        int
 	includeUsage       bool
 	usage              map[string]any
+	toolArgsDeltas     map[int]bool
 
 	firstTokenOnce sync.Once
 	firstTokenMs   int64
@@ -95,6 +96,7 @@ func newChatCompletionsStreamWriter(
 		id:                 generateChatCmplID(),
 		created:            time.Now().Unix(),
 		outputIdxToToolIdx: make(map[int]int),
+		toolArgsDeltas:     make(map[int]bool),
 		start:              start,
 		accountID:          accountID,
 		sessionKey:         sessionKey,
@@ -215,11 +217,34 @@ func (s *chatCompletionsStreamWriter) translateEvent(eventType string, data []by
 		if !ok {
 			return nil
 		}
+		s.toolArgsDeltas[outputIdx] = true
 		return [][]byte{s.makeDeltaChunk(map[string]any{
 			"tool_calls": []map[string]any{{
 				"index": idx,
 				"function": map[string]any{
 					"arguments": argsDelta,
+				},
+			}},
+		})}
+
+	case "response.function_call_arguments.done":
+		outputIdx := int(gjson.GetBytes(data, "output_index").Int())
+		if s.toolArgsDeltas[outputIdx] {
+			return nil
+		}
+		args := gjson.GetBytes(data, "arguments").String()
+		if args == "" {
+			return nil
+		}
+		idx, ok := s.outputIdxToToolIdx[outputIdx]
+		if !ok {
+			return nil
+		}
+		return [][]byte{s.makeDeltaChunk(map[string]any{
+			"tool_calls": []map[string]any{{
+				"index": idx,
+				"function": map[string]any{
+					"arguments": args,
 				},
 			}},
 		})}
