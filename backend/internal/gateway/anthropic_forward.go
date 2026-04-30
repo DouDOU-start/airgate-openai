@@ -525,6 +525,9 @@ func (g *OpenAIGateway) handleAnthropicNonStreamFromResponses(
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte(anthropicJSON))
 	}
+	anthropicBody := []byte(anthropicJSON)
+	upstreamHeaders := http.Header{}
+	upstreamHeaders.Set("Content-Type", "application/json")
 
 	// 计费 model 用映射后的 GPT 名
 	billingModel := mappedModel
@@ -549,7 +552,7 @@ func (g *OpenAIGateway) handleAnthropicNonStreamFromResponses(
 	fillUsageCost(usage)
 	return sdk.ForwardOutcome{
 		Kind:     sdk.OutcomeSuccess,
-		Upstream: sdk.UpstreamResponse{StatusCode: http.StatusOK},
+		Upstream: sdk.UpstreamResponse{StatusCode: http.StatusOK, Headers: upstreamHeaders, Body: anthropicBody},
 		Usage:    usage,
 		Duration: elapsed,
 	}, nil

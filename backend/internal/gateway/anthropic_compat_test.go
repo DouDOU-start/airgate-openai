@@ -114,6 +114,44 @@ func TestForwardAnthropicMessageFallsBackOnContextWindowError(t *testing.T) {
 	}
 }
 
+func TestForwardAnthropicMessageNonStreamReturnsBodyForGRPC(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = fmt.Fprint(w, `data: {"type":"response.output_text.delta","delta":"pong"}`+"\n")
+		_, _ = fmt.Fprint(w, `data: {"type":"response.completed","response":{"id":"resp_grpc","model":"gpt-5.4","usage":{"input_tokens":3,"output_tokens":1}}}`+"\n\n")
+	}))
+	defer ts.Close()
+
+	req := &sdk.ForwardRequest{
+		Account: &sdk.Account{ID: time.Now().UnixNano(), Credentials: map[string]string{
+			"api_key":  "test-key",
+			"base_url": ts.URL,
+		}},
+		Body: []byte(`{"model":"claude-sonnet-4-6","max_tokens":128,"messages":[{"role":"user","content":[{"type":"text","text":"ping"}]}]}`),
+	}
+
+	gateway := &OpenAIGateway{transportPool: NewTransportPool()}
+	outcome, err := gateway.forwardAnthropicMessage(context.Background(), req)
+	if err != nil {
+		t.Fatalf("forwardAnthropicMessage err: %v", err)
+	}
+	if outcome.Kind != sdk.OutcomeSuccess {
+		t.Fatalf("outcome kind = %v, want success; reason=%s", outcome.Kind, outcome.Reason)
+	}
+	if len(outcome.Upstream.Body) == 0 {
+		t.Fatalf("expected non-empty upstream body for non-stream gRPC path")
+	}
+	if got := outcome.Upstream.Headers.Get("Content-Type"); got != "application/json" {
+		t.Fatalf("content-type = %q, want application/json", got)
+	}
+	if got := gjson.GetBytes(outcome.Upstream.Body, "content.0.text").String(); got != "pong" {
+		t.Fatalf("response text = %q, want pong; body=%s", got, outcome.Upstream.Body)
+	}
+	if got := gjson.GetBytes(outcome.Upstream.Body, "model").String(); got != "claude-sonnet-4-6" {
+		t.Fatalf("model = %q, want claude-sonnet-4-6", got)
+	}
+}
+
 func TestForwardAnthropicCountTokensReturnsEstimate(t *testing.T) {
 	w := httptest.NewRecorder()
 	req := &sdk.ForwardRequest{
