@@ -17,6 +17,8 @@ import (
 	sdk "github.com/DouDOU-start/airgate-sdk"
 )
 
+const chatGPTBrowserUserAgent = `Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36 Edg/131.0.0.0`
+
 // OAuth 请求/响应类型（插件内部定义，不依赖 SDK）
 // OAuth 仅在 devserver 中使用，不走 gRPC
 
@@ -47,8 +49,10 @@ type OAuthResult struct {
 const (
 	oauthClientID     = "app_EMoamEEZ73f0CkXaXp7hrann"
 	oauthScope        = "openid profile email offline_access"
+	oauthRefreshScope = "openid profile email"
 	oauthAuthEndpoint = "https://auth.openai.com/oauth/authorize"
 	oauthTokenURL     = "https://auth.openai.com/oauth/token"
+	accountsCheckURL  = "https://chatgpt.com/backend-api/accounts/check/v4-2023-04-27"
 
 	// OAuthCallbackPort codex 注册的固定回调端口，不可更改
 	OAuthCallbackPort = 1455
@@ -136,8 +140,8 @@ func (g *OpenAIGateway) HandleOAuthCallback(ctx context.Context, req *OAuthCallb
 		return nil, fmt.Errorf("token 交换失败: %w", err)
 	}
 
-	// 解析 id_token JWT payload 提取用户信息和订阅状态
-	info := parseIDToken(tokens.IDToken)
+	// 解析 JWT payload 提取用户信息和订阅状态。
+	info := g.enrichTokenInfo(ctx, parseTokenInfo(tokens.IDToken, tokens.AccessToken), tokens.AccessToken, req.ProxyURL)
 
 	credentials := map[string]string{
 		"access_token":  tokens.AccessToken,
@@ -174,13 +178,14 @@ func (g *OpenAIGateway) HandleOAuthCallback(ctx context.Context, req *OAuthCallb
 // 返回 OAuthResult（结构与 HandleOAuthCallback 对齐）。
 //
 // 用于后台管理员粘贴 refresh_token 批量/单条导入 OAuth 账号的场景。
-func (g *OpenAIGateway) ImportFromRefreshToken(ctx context.Context, refreshToken, proxyURL string) (*OAuthResult, error) {
+func (g *OpenAIGateway) ImportFromRefreshToken(ctx context.Context, refreshToken, proxyURL, clientID string) (*OAuthResult, error) {
 	refreshToken = strings.TrimSpace(refreshToken)
 	if refreshToken == "" {
 		return nil, fmt.Errorf("refresh_token 不能为空")
 	}
+	clientID = strings.TrimSpace(clientID)
 
-	tokens, err := g.refreshTokens(ctx, refreshToken, proxyURL)
+	tokens, err := g.refreshTokens(ctx, refreshToken, proxyURL, clientID)
 	if err != nil {
 		return nil, fmt.Errorf("刷新 token 失败: %w", err)
 	}
@@ -188,7 +193,7 @@ func (g *OpenAIGateway) ImportFromRefreshToken(ctx context.Context, refreshToken
 		return nil, fmt.Errorf("刷新响应缺少 access_token")
 	}
 
-	info := parseIDToken(tokens.IDToken)
+	info := g.enrichTokenInfo(ctx, parseTokenInfo(tokens.IDToken, tokens.AccessToken), tokens.AccessToken, proxyURL)
 
 	// 部分上游在 refresh_token 模式下不轮换 refresh_token（返回空串），此时沿用原值。
 	nextRefresh := tokens.RefreshToken
@@ -199,6 +204,9 @@ func (g *OpenAIGateway) ImportFromRefreshToken(ctx context.Context, refreshToken
 	credentials := map[string]string{
 		"access_token":  tokens.AccessToken,
 		"refresh_token": nextRefresh,
+	}
+	if clientID != "" {
+		credentials["client_id"] = clientID
 	}
 	if info.AccountID != "" {
 		credentials["chatgpt_account_id"] = info.AccountID
@@ -280,6 +288,7 @@ func (g *OpenAIGateway) exchangeCodeForTokens(ctx context.Context, callbackURL, 
 		return nil, err
 	}
 	httpReq.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	httpReq.Header.Set("User-Agent", "codex-cli/0.91.0")
 
 	client := g.buildHTTPClient(&sdk.Account{ProxyURL: proxyURL})
 	resp, err := client.Do(httpReq)
@@ -325,6 +334,7 @@ type idTokenInfo struct {
 	Email                   string
 	PlanType                string // free / plus / pro / team
 	SubscriptionActiveUntil string // ISO 8601 格式
+	OrganizationID          string
 }
 
 // parseIDToken 解码 JWT payload（不验签），提取账号信息和订阅状态
@@ -354,9 +364,15 @@ func parseIDToken(idToken string) *idTokenInfo {
 		return info
 	}
 
-	// 直接取 chatgpt_account_id
+	// 直接取顶层字段
 	if id, ok := claims["chatgpt_account_id"].(string); ok {
 		info.AccountID = id
+	}
+	if pt, ok := claims["chatgpt_plan_type"].(string); ok {
+		info.PlanType = pt
+	}
+	if until := claims["chatgpt_subscription_active_until"]; until != nil {
+		info.SubscriptionActiveUntil = fmt.Sprintf("%v", until)
 	}
 
 	// 尝试从嵌套的 auth claims 中取
@@ -364,11 +380,17 @@ func parseIDToken(idToken string) *idTokenInfo {
 		if id, ok := authClaims["chatgpt_account_id"].(string); ok && info.AccountID == "" {
 			info.AccountID = id
 		}
+		if id, ok := authClaims["poid"].(string); ok && info.OrganizationID == "" {
+			info.OrganizationID = id
+		}
 		if pt, ok := authClaims["chatgpt_plan_type"].(string); ok {
 			info.PlanType = pt
 		}
 		if until := authClaims["chatgpt_subscription_active_until"]; until != nil {
 			info.SubscriptionActiveUntil = fmt.Sprintf("%v", until)
+		}
+		if info.OrganizationID == "" {
+			info.OrganizationID = defaultOrganizationID(authClaims)
 		}
 	}
 
@@ -387,12 +409,264 @@ func parseIDToken(idToken string) *idTokenInfo {
 	return info
 }
 
+func parseTokenInfo(idToken, accessToken string) *idTokenInfo {
+	info := parseIDToken(idToken)
+	if info.PlanType != "" && info.SubscriptionActiveUntil != "" {
+		return info
+	}
+
+	accessInfo := parseIDToken(accessToken)
+	if info.AccountID == "" {
+		info.AccountID = accessInfo.AccountID
+	}
+	if info.AccountName == "" {
+		info.AccountName = accessInfo.AccountName
+	}
+	if info.Email == "" {
+		info.Email = accessInfo.Email
+	}
+	if info.PlanType == "" {
+		info.PlanType = accessInfo.PlanType
+	}
+	if info.SubscriptionActiveUntil == "" {
+		info.SubscriptionActiveUntil = accessInfo.SubscriptionActiveUntil
+	}
+	if info.OrganizationID == "" {
+		info.OrganizationID = accessInfo.OrganizationID
+	}
+	return info
+}
+
+func defaultOrganizationID(authClaims map[string]interface{}) string {
+	orgs, ok := authClaims["organizations"].([]interface{})
+	if !ok {
+		return ""
+	}
+	first := ""
+	for _, raw := range orgs {
+		org, ok := raw.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		id, _ := org["id"].(string)
+		if id == "" {
+			continue
+		}
+		if first == "" {
+			first = id
+		}
+		if isDefault, _ := org["is_default"].(bool); isDefault {
+			return id
+		}
+	}
+	return first
+}
+
+func (g *OpenAIGateway) enrichTokenInfo(ctx context.Context, info *idTokenInfo, accessToken, proxyURL string) *idTokenInfo {
+	accountInfo := g.fetchChatGPTAccountInfo(ctx, accessToken, proxyURL, info.OrganizationID)
+	if accountInfo == nil {
+		return info
+	}
+	if accountInfo.PlanType != "" {
+		info.PlanType = accountInfo.PlanType
+	}
+	if accountInfo.SubscriptionActiveUntil != "" {
+		info.SubscriptionActiveUntil = accountInfo.SubscriptionActiveUntil
+	}
+	if info.Email == "" && accountInfo.Email != "" {
+		info.Email = accountInfo.Email
+	}
+	return info
+}
+
+type chatGPTAccountInfo struct {
+	PlanType                string
+	Email                   string
+	SubscriptionActiveUntil string
+	AccountKey              string
+	SelectionReason         string
+	PlanSource              string
+	AccountPlanType         string
+	EntitlementPlan         string
+	IsDefault               bool
+}
+
+func (g *OpenAIGateway) fetchChatGPTAccountInfo(ctx context.Context, accessToken, proxyURL, orgID string) *chatGPTAccountInfo {
+	if accessToken == "" {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, accountsCheckURL, nil)
+	if err != nil {
+		return nil
+	}
+	setChatGPTAccountsCheckHeaders(httpReq, accessToken)
+
+	client := g.buildHTTPClient(&sdk.Account{ProxyURL: proxyURL})
+	resp, err := client.Do(httpReq)
+	if err != nil {
+		if g.logger != nil {
+			g.logger.Warn("chatgpt_account_check_request_failed", sdk.LogFieldError, err, "org_id", orgID)
+		}
+		return nil
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		if g.logger != nil {
+			g.logger.Warn("chatgpt_account_check_read_failed", sdk.LogFieldError, err, "status", resp.StatusCode, "org_id", orgID)
+		}
+		return nil
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		if g.logger != nil {
+			g.logger.Warn("chatgpt_account_check_failed", "status", resp.StatusCode, "org_id", orgID, "body_preview", truncate(string(body), 500))
+		}
+		return nil
+	}
+
+	var result map[string]interface{}
+	if err := json.Unmarshal(body, &result); err != nil {
+		if g.logger != nil {
+			g.logger.Warn("chatgpt_account_check_decode_failed", sdk.LogFieldError, err, "org_id", orgID, "body_preview", truncate(string(body), 500))
+		}
+		return nil
+	}
+	info := selectChatGPTAccountInfo(result, orgID)
+	if info == nil || info.PlanType == "" {
+		if g.logger != nil {
+			g.logger.Warn("chatgpt_account_check_no_plan", "org_id", orgID)
+		}
+		return nil
+	}
+	return info
+}
+
+func setChatGPTAccountsCheckHeaders(req *http.Request, accessToken string) {
+	req.Header.Set("Authority", "chatgpt.com")
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("Accept-Language", "zh-CN,zh;q=0.9,en;q=0.8,en-GB;q=0.7,en-US;q=0.6")
+	req.Header.Set("Authorization", "Bearer "+accessToken)
+	req.Header.Set("Cache-Control", "no-cache")
+	req.Header.Set("Origin", "https://chatgpt.com")
+	req.Header.Set("Pragma", "no-cache")
+	req.Header.Set("Priority", "u=1, i")
+	req.Header.Set("Referer", "https://chatgpt.com/")
+	req.Header.Set("User-Agent", chatGPTBrowserUserAgent)
+	req.Header.Set("Sec-Ch-Ua", `"Chromium";v="131", "Microsoft Edge";v="131", "Not A(Brand";v="24"`)
+	req.Header.Set("Sec-Ch-Ua-Arch", `"x86"`)
+	req.Header.Set("Sec-Ch-Ua-Bitness", `"64"`)
+	req.Header.Set("Sec-Ch-Ua-Full-Version", `"131.0.0.0"`)
+	req.Header.Set("Sec-Ch-Ua-Full-Version-List", `"Chromium";v="131.0.0.0", "Microsoft Edge";v="131.0.0.0", "Not A(Brand";v="24.0.0.0"`)
+	req.Header.Set("Sec-Ch-Ua-Mobile", "?0")
+	req.Header.Set("Sec-Ch-Ua-Model", `""`)
+	req.Header.Set("Sec-Ch-Ua-Platform", `"Windows"`)
+	req.Header.Set("Sec-Ch-Ua-Platform-Version", `"19.0.0"`)
+	req.Header.Set("Sec-Fetch-Dest", "empty")
+	req.Header.Set("Sec-Fetch-Mode", "cors")
+	req.Header.Set("Sec-Fetch-Site", "same-origin")
+}
+
+func selectChatGPTAccountInfo(result map[string]interface{}, orgID string) *chatGPTAccountInfo {
+	accounts, ok := result["accounts"].(map[string]interface{})
+	if !ok {
+		return nil
+	}
+	if orgID != "" {
+		if account, ok := accounts[orgID].(map[string]interface{}); ok {
+			info := accountInfoFromAccount(account)
+			info.AccountKey = orgID
+			if info.PlanType != "" {
+				info.SelectionReason = "requested_org_id"
+				return info
+			}
+		}
+	}
+
+	var defaultAccount, paidAccount, anyAccount *chatGPTAccountInfo
+	for accountKey, raw := range accounts {
+		account, ok := raw.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		info := accountInfoFromAccount(account)
+		info.AccountKey = accountKey
+		if info.PlanType == "" {
+			continue
+		}
+		if anyAccount == nil {
+			anyAccount = info
+		}
+		if info.IsDefault {
+			defaultAccount = info
+		}
+		if !strings.EqualFold(info.PlanType, "free") && paidAccount == nil {
+			paidAccount = info
+		}
+	}
+	switch {
+	case defaultAccount != nil:
+		defaultAccount.SelectionReason = "default_account"
+		return defaultAccount
+	case paidAccount != nil:
+		paidAccount.SelectionReason = "first_paid_account"
+		return paidAccount
+	default:
+		if anyAccount != nil {
+			anyAccount.SelectionReason = "first_account_with_plan"
+		}
+		return anyAccount
+	}
+}
+
+func accountInfoFromAccount(account map[string]interface{}) *chatGPTAccountInfo {
+	info := &chatGPTAccountInfo{}
+	if accountData, ok := account["account"].(map[string]interface{}); ok {
+		if planType, ok := accountData["plan_type"].(string); ok {
+			info.AccountPlanType = planType
+			info.PlanType = planType
+			info.PlanSource = "account.plan_type"
+		}
+		if email, ok := accountData["email"].(string); ok {
+			info.Email = email
+		}
+		info.IsDefault, _ = accountData["is_default"].(bool)
+	}
+	if entitlement, ok := account["entitlement"].(map[string]interface{}); ok {
+		if planType, ok := entitlement["subscription_plan"].(string); ok {
+			info.EntitlementPlan = planType
+			if info.PlanType == "" {
+				info.PlanType = planType
+				info.PlanSource = "entitlement.subscription_plan"
+			}
+		}
+		if expiresAt, ok := entitlement["expires_at"].(string); ok {
+			info.SubscriptionActiveUntil = expiresAt
+		}
+	}
+	return info
+}
+
+func normalizeOAuthClientID(clientID string) string {
+	clientID = strings.TrimSpace(clientID)
+	if clientID == "" {
+		return oauthClientID
+	}
+	return clientID
+}
+
 // refreshTokens 使用 refresh_token 刷新获取新的 token 组
-func (g *OpenAIGateway) refreshTokens(ctx context.Context, refreshToken, proxyURL string) (*tokenResponse, error) {
+func (g *OpenAIGateway) refreshTokens(ctx context.Context, refreshToken, proxyURL, clientID string) (*tokenResponse, error) {
+	clientID = normalizeOAuthClientID(clientID)
+
 	form := url.Values{}
 	form.Set("grant_type", "refresh_token")
 	form.Set("refresh_token", refreshToken)
-	form.Set("client_id", oauthClientID)
+	form.Set("client_id", clientID)
+	form.Set("scope", oauthRefreshScope)
 
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost,
 		oauthTokenURL, strings.NewReader(form.Encode()))
@@ -400,6 +674,7 @@ func (g *OpenAIGateway) refreshTokens(ctx context.Context, refreshToken, proxyUR
 		return nil, err
 	}
 	httpReq.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	httpReq.Header.Set("User-Agent", "codex-cli/0.91.0")
 
 	client := g.buildHTTPClient(&sdk.Account{ProxyURL: proxyURL})
 	resp, err := client.Do(httpReq)

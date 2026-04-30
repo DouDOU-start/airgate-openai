@@ -36,12 +36,12 @@ export interface AccountFormProps {
       accountName: string;
       credentials: Record<string, string>;
     }>;
-    importRefresh?: (refreshToken: string) => Promise<{
+    importRefresh?: (refreshToken: string, clientId?: string) => Promise<{
       accountType: string;
       accountName: string;
       credentials: Record<string, string>;
     }>;
-    batchImportRefresh?: (refreshTokens: string[]) => Promise<BatchExchangeResult[]>;
+    batchImportRefresh?: (refreshTokens: string[], clientId?: string) => Promise<BatchExchangeResult[]>;
   };
 }
 
@@ -137,6 +137,9 @@ type AccountType = 'apikey' | 'oauth';
 
 /** OAuth 导入模式：浏览器授权 / 单个 Refresh Token / 批量 Refresh Token */
 type OAuthMode = 'browser' | 'refresh_single' | 'refresh_batch';
+type RefreshTokenImportType = 'codex' | 'mobile';
+
+const mobileRefreshTokenClientID = 'app_LlGpXReQgckcGGUo2JrYvtJK';
 
 function detectType(credentials: Record<string, string>): AccountType | '' {
   if (credentials.api_key) return 'apikey';
@@ -206,6 +209,7 @@ export function AccountForm({
   const [authorizeURL, setAuthorizeURL] = useState('');
   const [callbackURL, setCallbackURL] = useState('');
   const [refreshTokenInput, setRefreshTokenInput] = useState('');
+  const [refreshTokenImportType, setRefreshTokenImportType] = useState<RefreshTokenImportType>('codex');
   const [batchText, setBatchText] = useState('');
   const [batchPhase, setBatchPhase] = useState<'input' | 'running' | 'result'>('input');
   const [batchResults, setBatchResults] = useState<BatchExchangeResult[]>([]);
@@ -243,6 +247,7 @@ export function AccountForm({
       setOAuthStatus(null);
       setOauthMode('browser');
       setRefreshTokenInput('');
+      setRefreshTokenImportType('codex');
       setBatchText('');
       setBatchPhase('input');
       setBatchResults([]);
@@ -300,10 +305,11 @@ export function AccountForm({
 
   const submitRefreshTokenImport = useCallback(async () => {
     if (!oauth?.importRefresh || !refreshTokenInput.trim()) return;
+    const clientId = refreshTokenImportType === 'mobile' ? mobileRefreshTokenClientID : undefined;
     setOAuthLoading(true);
     setOAuthStatus({ type: 'info', text: '正在使用 Refresh Token 换取凭证...' });
     try {
-      const result = await oauth.importRefresh(refreshTokenInput.trim());
+      const result = await oauth.importRefresh(refreshTokenInput.trim(), clientId);
       onAccountTypeChange?.(result.accountType || 'oauth');
       onChange({ ...credentials, ...result.credentials });
       if (result.accountName) {
@@ -319,7 +325,7 @@ export function AccountForm({
     } finally {
       setOAuthLoading(false);
     }
-  }, [oauth, refreshTokenInput, onAccountTypeChange, onChange, credentials, onSuggestedName]);
+  }, [oauth, refreshTokenInput, refreshTokenImportType, onAccountTypeChange, onChange, credentials, onSuggestedName]);
 
   const submitBatchRefreshImport = useCallback(async () => {
     if (!oauth?.batchImportRefresh || !onBatchImport) {
@@ -331,10 +337,11 @@ export function AccountForm({
       setOAuthStatus({ type: 'error', text: '请至少粘贴一个 Refresh Token（每行一个）' });
       return;
     }
+    const clientId = refreshTokenImportType === 'mobile' ? mobileRefreshTokenClientID : undefined;
     setBatchPhase('running');
     setOAuthStatus({ type: 'info', text: `正在批量换取 ${tokens.length} 个 Token...` });
     try {
-      const results = await oauth.batchImportRefresh(tokens);
+      const results = await oauth.batchImportRefresh(tokens, clientId);
       setBatchResults(results);
       const successItems = results.filter((r) => r.status === 'ok' && r.credentials);
       if (successItems.length > 0) {
@@ -352,10 +359,11 @@ export function AccountForm({
       setBatchPhase('input');
       setOAuthStatus({ type: 'error', text: err instanceof Error ? err.message : '批量导入失败' });
     }
-  }, [batchText, oauth, onBatchImport]);
+  }, [batchText, refreshTokenImportType, oauth, onBatchImport]);
 
   const resetBatch = useCallback(() => {
     setBatchText('');
+    setRefreshTokenImportType('codex');
     setBatchPhase('input');
     setBatchResults([]);
     setBatchImportedCount(0);
@@ -431,6 +439,21 @@ export function AccountForm({
     opacity: disabled ? 0.6 : 1,
   });
 
+  const refreshTokenTypeField = (
+    <div style={{ marginBottom: '0.75rem' }}>
+      <label style={labelStyle}>Refresh Token 类型</label>
+      <select
+        style={inputStyle}
+        value={refreshTokenImportType}
+        onChange={(e) => setRefreshTokenImportType(e.target.value as RefreshTokenImportType)}
+      >
+        <option value="codex">普通 RT</option>
+        <option value="mobile">Mobile RT</option>
+      </select>
+      <div style={descStyle}>普通 RT 使用后端默认 client_id；Mobile RT 使用 Sora Mobile client_id。</div>
+    </div>
+  );
+
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: '1rem' }}>
       {/* 账号类型选择（编辑模式下只读） */}
@@ -467,7 +490,9 @@ export function AccountForm({
               API Key <span style={{ color: cssVar('danger') }}>*</span>
             </label>
             <input
+              name="api_key"
               type="password"
+              autoComplete="off"
               style={inputStyle}
               placeholder="sk-..."
               value={credentials.api_key ?? ''}
@@ -613,6 +638,7 @@ export function AccountForm({
                   <div style={{ ...descStyle, marginTop: 0, marginBottom: '0.75rem' }}>
                     粘贴已有的 Refresh Token，后台会自动刷新拿回 access_token 并解析用户信息。
                   </div>
+                  {refreshTokenTypeField}
                   <div style={{ marginBottom: '0.75rem' }}>
                     <label style={labelStyle}>Refresh Token</label>
                     <textarea
@@ -644,6 +670,7 @@ export function AccountForm({
                       <div style={{ ...descStyle, marginTop: 0, marginBottom: '0.75rem' }}>
                         每行一个 Refresh Token，批量换取凭证并一键创建账号（# 开头的行视为注释）。
                       </div>
+                      {refreshTokenTypeField}
                       <div style={{ marginBottom: '0.75rem' }}>
                         <label style={labelStyle}>Refresh Tokens</label>
                         <textarea
@@ -740,6 +767,17 @@ export function AccountForm({
                   placeholder="授权后自动填充"
                   value={credentials.refresh_token ?? ''}
                   onChange={(e) => updateField('refresh_token', e.target.value)}
+                />
+              </div>
+              <div>
+                <label style={labelStyle}>Client ID</label>
+                <input
+                  type="text"
+                  autoComplete="off"
+                  style={inputStyle}
+                  placeholder="留空使用默认 Codex Client ID"
+                  value={credentials.client_id ?? ''}
+                  onChange={(e) => updateField('client_id', e.target.value)}
                 />
               </div>
               <div>

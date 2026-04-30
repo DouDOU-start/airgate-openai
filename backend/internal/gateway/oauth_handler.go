@@ -151,6 +151,13 @@ func (h *OAuthDevHandler) handleQuota(w http.ResponseWriter, r *http.Request) {
 			h.Store.Update(id, *account)
 		}
 
+		sdk.LoggerFromContext(r.Context()).Info("oauth_quota_response",
+			sdk.LogFieldAccountID, id,
+			"source", "realtime",
+			"plan_type", quota.Extra["plan_type"],
+			"subscription_active_until", quota.ExpiresAt,
+			"updated_credentials", updated,
+		)
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]interface{}{
 			"plan_type":                 quota.Extra["plan_type"],
@@ -164,6 +171,12 @@ func (h *OAuthDevHandler) handleQuota(w http.ResponseWriter, r *http.Request) {
 	sdk.LoggerFromContext(r.Context()).Warn("oauth_quota_realtime_query_failed",
 		sdk.LogFieldAccountID, id,
 		sdk.LogFieldError, queryErr,
+	)
+	sdk.LoggerFromContext(r.Context()).Info("oauth_quota_response",
+		sdk.LogFieldAccountID, id,
+		"source", "cached",
+		"plan_type", account.Credentials["plan_type"],
+		"subscription_active_until", account.Credentials["subscription_active_until"],
 	)
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]interface{}{

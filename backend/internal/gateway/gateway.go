@@ -209,7 +209,11 @@ func (g *OpenAIGateway) QueryQuota(ctx context.Context, credentials map[string]s
 	}
 
 	// 用 refresh_token 换取新的 token 组，从中获取最新订阅状态
-	tokens, err := g.refreshTokens(ctx, refreshToken, credentials["proxy_url"])
+	clientID := credentials["client_id"]
+	if clientID == "" {
+		clientID = credentials["clinet_id"]
+	}
+	tokens, err := g.refreshTokens(ctx, refreshToken, credentials["proxy_url"], clientID)
 	if err != nil {
 		// refresh_token 失效，但只要 access_token 还在就降级使用它：
 		// access_token 是一个 JWT，不验签也能读 claims 拿到 plan_type / email /
@@ -222,12 +226,11 @@ func (g *OpenAIGateway) QueryQuota(ctx context.Context, credentials map[string]s
 		// "需要重新授权"，其实账号还能正常服务请求。现在放宽：有 access_token
 		// 就成功返回，带上 refresh_warning 标记数据陈旧即可。
 		if access := credentials["access_token"]; access != "" {
-			info := parseIDToken(access)
+			info := g.enrichTokenInfo(ctx, parseIDToken(access), access, credentials["proxy_url"])
 			extra := map[string]string{
-				"refresh_warning": "refresh_token_invalid: " + err.Error(),
-			}
-			if info.PlanType != "" {
-				extra["plan_type"] = info.PlanType
+				"refresh_warning":           "refresh_token_invalid: " + err.Error(),
+				"plan_type":                 info.PlanType,
+				"subscription_active_until": info.SubscriptionActiveUntil,
 			}
 			if info.AccountID != "" {
 				extra["chatgpt_account_id"] = info.AccountID
@@ -238,13 +241,6 @@ func (g *OpenAIGateway) QueryQuota(ctx context.Context, credentials map[string]s
 			if info.Email != "" {
 				extra["email"] = info.Email
 			}
-			if g.logger != nil {
-				g.logger.Warn("query_quota_refresh_failed_fallback_jwt",
-					sdk.LogFieldError, err,
-					"plan_type", info.PlanType,
-					"has_email", info.Email != "",
-				)
-			}
 			return &sdk.QuotaInfo{
 				ExpiresAt: info.SubscriptionActiveUntil,
 				Extra:     extra,
@@ -253,11 +249,11 @@ func (g *OpenAIGateway) QueryQuota(ctx context.Context, credentials map[string]s
 		return nil, fmt.Errorf("%srefresh_token 已失效，请重新授权 OAuth (原因: %s)", ReauthRequiredPrefix, err.Error())
 	}
 
-	info := parseIDToken(tokens.IDToken)
+	info := g.enrichTokenInfo(ctx, parseTokenInfo(tokens.IDToken, tokens.AccessToken), tokens.AccessToken, credentials["proxy_url"])
 
-	extra := map[string]string{}
-	if info.PlanType != "" {
-		extra["plan_type"] = info.PlanType
+	extra := map[string]string{
+		"plan_type":                 info.PlanType,
+		"subscription_active_until": info.SubscriptionActiveUntil,
 	}
 	if info.AccountID != "" {
 		extra["chatgpt_account_id"] = info.AccountID
@@ -637,11 +633,17 @@ func (g *OpenAIGateway) HandleRequest(ctx context.Context, _, path, _ string, _ 
 		var raw struct {
 			RefreshToken string `json:"refresh_token"`
 			ProxyURL     string `json:"proxy_url"`
+			ClientID     string `json:"client_id"`
+			ClinetID     string `json:"clinet_id"`
 		}
 		if err := json.Unmarshal(body, &raw); err != nil || strings.TrimSpace(raw.RefreshToken) == "" {
 			return http.StatusBadRequest, nil, jsonError("缺少 refresh_token 参数"), nil
 		}
-		result, err := g.ImportFromRefreshToken(context.Background(), raw.RefreshToken, raw.ProxyURL)
+		clientID := raw.ClientID
+		if clientID == "" {
+			clientID = raw.ClinetID
+		}
+		result, err := g.ImportFromRefreshToken(context.Background(), raw.RefreshToken, raw.ProxyURL, clientID)
 		if err != nil {
 			return http.StatusInternalServerError, nil, jsonError(err.Error()), nil
 		}
@@ -655,6 +657,8 @@ func (g *OpenAIGateway) HandleRequest(ctx context.Context, _, path, _ string, _ 
 		var raw struct {
 			RefreshTokens []string `json:"refresh_tokens"`
 			ProxyURL      string   `json:"proxy_url"`
+			ClientID      string   `json:"client_id"`
+			ClinetID      string   `json:"clinet_id"`
 		}
 		if err := json.Unmarshal(body, &raw); err != nil || len(raw.RefreshTokens) == 0 {
 			return http.StatusBadRequest, nil, jsonError("缺少 refresh_tokens 参数"), nil
@@ -668,12 +672,17 @@ func (g *OpenAIGateway) HandleRequest(ctx context.Context, _, path, _ string, _ 
 			Error       string            `json:"error,omitempty"`
 		}
 
+		clientID := raw.ClientID
+		if clientID == "" {
+			clientID = raw.ClinetID
+		}
+
 		results := make([]batchResult, 0, len(raw.RefreshTokens))
 		for _, rt := range raw.RefreshTokens {
 			if strings.TrimSpace(rt) == "" {
 				continue
 			}
-			imported, err := g.ImportFromRefreshToken(context.Background(), rt, raw.ProxyURL)
+			imported, err := g.ImportFromRefreshToken(context.Background(), rt, raw.ProxyURL, clientID)
 			if err != nil {
 				results = append(results, batchResult{Status: "failed", Error: err.Error()})
 				continue
