@@ -75,10 +75,13 @@ func writeSSEDone(w http.ResponseWriter) {
 	}
 }
 
-func writeSSEError(w http.ResponseWriter, _ string) {
+func writeSSEError(w http.ResponseWriter, message string) {
+	if message != imageTooLargeSSEErrorMessage {
+		message = sanitizedImageSSEErrorMessage
+	}
 	errEvent, _ := json.Marshal(map[string]any{
 		"error": map[string]any{
-			"message": sanitizedImageSSEErrorMessage,
+			"message": message,
 			"type":    "server_error",
 		},
 	})

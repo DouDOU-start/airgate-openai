@@ -2,8 +2,10 @@ package gateway
 
 import (
 	"bytes"
+	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"image"
 	"image/color"
@@ -18,6 +20,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/gorilla/websocket"
 	"github.com/tidwall/gjson"
 
 	sdk "github.com/DouDOU-start/airgate-sdk"
@@ -38,6 +41,12 @@ func testPNGDataURL(width, height int, pixel func(int, int) color.RGBA) string {
 func testPNGBase64(width, height int, pixel func(int, int) color.RGBA) string {
 	dataURL := testPNGDataURL(width, height, pixel)
 	return strings.TrimPrefix(dataURL, "data:image/png;base64,")
+}
+
+func testPNGDataURLFromImage(img image.Image) string {
+	var buf bytes.Buffer
+	_ = png.Encode(&buf, img)
+	return "data:image/png;base64," + base64.StdEncoding.EncodeToString(buf.Bytes())
 }
 
 func TestIsImagesRequest(t *testing.T) {
@@ -816,6 +825,72 @@ func TestBuildImagesToolCreateMsg_Edit_MissingImage(t *testing.T) {
 	)
 	if err == nil {
 		t.Fatal("expected err for missing image, got nil")
+	}
+}
+
+type noopWSEventHandler struct{}
+
+func (noopWSEventHandler) OnTextDelta(string)        {}
+func (noopWSEventHandler) OnReasoningDelta(string)   {}
+func (noopWSEventHandler) OnRawEvent(string, []byte) {}
+func (noopWSEventHandler) OnRateLimits(float64)      {}
+
+func TestReceiveWSResponseClassifiesMessageTooBigAsClientError(t *testing.T) {
+	upgrader := websocket.Upgrader{ReadBufferSize: 1024, WriteBufferSize: 1024}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			t.Errorf("upgrade websocket: %v", err)
+			return
+		}
+		_ = conn.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseMessageTooBig, "message too big"), time.Now().Add(time.Second))
+		_ = conn.Close()
+	}))
+	defer server.Close()
+
+	url := "ws" + strings.TrimPrefix(server.URL, "http")
+	conn, _, err := websocket.DefaultDialer.Dial(url, nil)
+	if err != nil {
+		t.Fatalf("dial websocket: %v", err)
+	}
+	defer func() { _ = conn.Close() }()
+
+	result := ReceiveWSResponse(context.Background(), conn, noopWSEventHandler{})
+	var failure *responsesFailureError
+	if !errors.As(result.Err, &failure) {
+		t.Fatalf("Err = %T %v, want responsesFailureError", result.Err, result.Err)
+	}
+	if failure.Kind != responsesFailureKindClient || failure.StatusCode != http.StatusRequestEntityTooLarge {
+		t.Fatalf("failure = %#v, want client 413", failure)
+	}
+}
+
+func TestBuildImagesToolCreateMsg_Edit_ShrinksLargeInputImage(t *testing.T) {
+	img := image.NewRGBA(image.Rect(0, 0, 1600, 1600))
+	seed := uint32(1)
+	for y := 0; y < 1600; y++ {
+		for x := 0; x < 1600; x++ {
+			seed = seed*1664525 + 1013904223
+			img.SetRGBA(x, y, color.RGBA{R: uint8(seed >> 16), G: uint8(seed >> 8), B: uint8(seed), A: 255})
+		}
+	}
+	imageRef := testPNGDataURLFromImage(img)
+	body := []byte(fmt.Sprintf(`{"prompt":"edit this","image":%q}`, imageRef))
+	msg, _, _, err := buildImagesToolCreateMsg(body, "application/json", true, openAISessionResolution{})
+	if err != nil {
+		t.Fatalf("buildImagesToolCreateMsg returned err: %v", err)
+	}
+	got := gjson.GetBytes(msg, "input.0.content.1.image_url").String()
+	if !strings.HasPrefix(got, "data:image/jpeg;base64,") {
+		t.Fatalf("image_url prefix = %.32q, want jpeg data URL", got)
+	}
+	comma := strings.IndexByte(got, ',')
+	data, err := base64.StdEncoding.DecodeString(got[comma+1:])
+	if err != nil {
+		t.Fatalf("decoded shrunk image: %v", err)
+	}
+	if len(data) > maxResponsesInputImageBytes {
+		t.Fatalf("shrunk image bytes = %d, want <= %d", len(data), maxResponsesInputImageBytes)
 	}
 }
 

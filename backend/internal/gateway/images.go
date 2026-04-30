@@ -10,7 +10,7 @@ import (
 	"image"
 	"image/color"
 	"image/draw"
-	_ "image/jpeg"
+	"image/jpeg"
 	"image/png"
 	"io"
 	"log/slog"
@@ -43,6 +43,9 @@ const imagesOAuthChatModel = "gpt-5.4"
 //   - 这里用极简指令把 gpt-5.4 的角色压缩成"透传路由"，只会补合规改写（如真实人物
 //     换成匿名替身，这是 OpenAI 侧硬编码的安全策略，instruction 拦不住）。
 const imagesPassthroughInstructions = "Use the user's image description and appended Image API constraints as the image_generation prompt. Preserve the user's original description verbatim; do not rewrite, elaborate, or add details about style, composition, lighting, color, mood, or any elements the user did not explicitly request. Treat Image API constraints as generation parameters, not visible text. Do not answer with text."
+
+const maxResponsesInputImageBytes = 2 * 1024 * 1024
+const maxRemoteImageBytes = 25 * 1024 * 1024
 
 // imageGenOutputTokenTable 按 OpenAI 官方 image_generation tool 的 token 换算表，
 // 用于 ChatGPT OAuth 账号（上游 tool_usage.image_gen 永远为 0）时估算 output token。
@@ -715,6 +718,88 @@ func sampleImageRGBA(img image.Image, x, y, width, height int) color.RGBA {
 	return color.RGBA{R: uint8(r >> 8), G: uint8(g >> 8), B: uint8(b >> 8), A: uint8(a >> 8)}
 }
 
+func shrinkResponsesInputImages(req *imagesRequest) error {
+	if req == nil {
+		return nil
+	}
+	for i, ref := range req.Images {
+		shrunk, err := shrinkResponsesInputImageRef(ref)
+		if err != nil {
+			return err
+		}
+		req.Images[i] = shrunk
+	}
+	return nil
+}
+
+func shrinkResponsesInputImageRef(ref string) (string, error) {
+	if !strings.HasPrefix(ref, "data:") {
+		return ref, nil
+	}
+	commaIdx := strings.IndexByte(ref, ',')
+	if commaIdx < 0 {
+		return ref, nil
+	}
+	data, err := base64.StdEncoding.DecodeString(ref[commaIdx+1:])
+	if err != nil {
+		data, err = base64.RawStdEncoding.DecodeString(ref[commaIdx+1:])
+		if err != nil {
+			return "", err
+		}
+	}
+	if len(data) <= maxResponsesInputImageBytes {
+		return ref, nil
+	}
+	img, _, err := image.Decode(bytes.NewReader(data))
+	if err != nil {
+		return "", fmt.Errorf("图片过大且无法压缩: %w", err)
+	}
+	return encodeJPEGDataURLWithinLimit(img, maxResponsesInputImageBytes)
+}
+
+func encodeJPEGDataURLWithinLimit(img image.Image, limit int) (string, error) {
+	bounds := img.Bounds()
+	width, height := bounds.Dx(), bounds.Dy()
+	if width <= 0 || height <= 0 {
+		return "", fmt.Errorf("图片尺寸无效")
+	}
+	current := img
+	for range 10 {
+		var buf bytes.Buffer
+		if err := jpeg.Encode(&buf, flattenForJPEG(current), &jpeg.Options{Quality: 85}); err != nil {
+			return "", err
+		}
+		if buf.Len() <= limit {
+			return "data:image/jpeg;base64," + base64.StdEncoding.EncodeToString(buf.Bytes()), nil
+		}
+		width = width * 3 / 4
+		height = height * 3 / 4
+		if width < 256 || height < 256 {
+			break
+		}
+		current = resizeImageNearest(img, width, height)
+	}
+	return "", fmt.Errorf("图片过大，请压缩到 %dMB 以内后重试", limit/(1024*1024))
+}
+
+func flattenForJPEG(img image.Image) *image.RGBA {
+	bounds := img.Bounds()
+	out := image.NewRGBA(image.Rect(0, 0, bounds.Dx(), bounds.Dy()))
+	draw.Draw(out, out.Bounds(), image.NewUniform(color.White), image.Point{}, draw.Src)
+	draw.Draw(out, out.Bounds(), img, bounds.Min, draw.Over)
+	return out
+}
+
+func resizeImageNearest(img image.Image, width, height int) *image.RGBA {
+	out := image.NewRGBA(image.Rect(0, 0, width, height))
+	for y := range height {
+		for x := range width {
+			out.SetRGBA(x, y, sampleImageRGBA(img, x, y, width, height))
+		}
+	}
+	return out
+}
+
 func encodePNGBase64(img image.Image) (string, error) {
 	var buf bytes.Buffer
 	if err := png.Encode(&buf, img); err != nil {
@@ -772,9 +857,18 @@ func buildImagesToolCreateMsg(
 	if req.N > 1 {
 		return nil, 0, 0, fmt.Errorf("OAuth 模式下 n 只能为 1（REST→tools 翻译路径暂不支持多图）")
 	}
+	if err := shrinkResponsesInputImages(req); err != nil {
+		return nil, 0, 0, err
+	}
 	regionAnnotation, err := buildEditRegionAnnotation(req)
 	if err != nil {
 		return nil, 0, 0, err
+	}
+	if regionAnnotation != "" {
+		regionAnnotation, err = shrinkResponsesInputImageRef(regionAnnotation)
+		if err != nil {
+			return nil, 0, 0, err
+		}
 	}
 	outputFormat := normalizedImageOutputFormat(req.OutputFormat)
 	if isEdit && req.Mask != "" {
@@ -981,7 +1075,11 @@ func (g *OpenAIGateway) forwardImagesViaResponsesTool(ctx context.Context, req *
 					sseKA.Stop()
 					g.logger.Warn("Images OAuth 上游返回客户端错误，已脱敏响应",
 						"path", reqPath, "model", imgReq.Model, "status_code", failure.StatusCode, "reason", failure.Message)
-					writeSSEError(req.Writer, sanitizedImageSSEErrorMessage)
+					clientMsg := sanitizedImageSSEErrorMessage
+					if failure.StatusCode == http.StatusRequestEntityTooLarge {
+						clientMsg = imageTooLargeSSEErrorMessage
+					}
+					writeSSEError(req.Writer, clientMsg)
 				}
 				return sdk.ForwardOutcome{
 					Kind: sdk.OutcomeClientError,

@@ -9,6 +9,7 @@ import (
 	"image"
 	_ "image/jpeg"
 	_ "image/png"
+	"io"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -28,37 +29,69 @@ func decodeImageRefs(refs []string) ([]imgen.ImageInput, error) {
 		return nil, nil
 	}
 	out := make([]imgen.ImageInput, 0, len(refs))
+	client := &http.Client{Timeout: 30 * time.Second}
 	for _, ref := range refs {
-		if !strings.HasPrefix(ref, "data:") {
-			continue
-		}
-		// data:image/png;base64,iVBOR...
-		commaIdx := strings.Index(ref, ",")
-		if commaIdx < 0 {
-			continue
-		}
-		header := ref[:commaIdx] // "data:image/png;base64"
-		b64 := ref[commaIdx+1:]
-		data, err := base64.StdEncoding.DecodeString(b64)
-		if err != nil {
-			data, err = base64.RawStdEncoding.DecodeString(b64)
+		if strings.HasPrefix(ref, "data:") {
+			input, err := decodeDataImageRef(ref)
 			if err != nil {
-				return nil, fmt.Errorf("base64 解码失败: %w", err)
+				return nil, err
 			}
+			out = append(out, input)
+			continue
 		}
-		mime := ""
-		if strings.HasPrefix(header, "data:") {
-			mime = strings.TrimPrefix(header, "data:")
-			if semi := strings.Index(mime, ";"); semi >= 0 {
-				mime = mime[:semi]
+		if strings.HasPrefix(ref, "http://") || strings.HasPrefix(ref, "https://") {
+			input, err := downloadImageRef(client, ref)
+			if err != nil {
+				return nil, err
 			}
+			out = append(out, input)
 		}
-		out = append(out, imgen.ImageInput{
-			Data:     data,
-			MimeType: mime,
-		})
 	}
 	return out, nil
+}
+
+func decodeDataImageRef(ref string) (imgen.ImageInput, error) {
+	commaIdx := strings.Index(ref, ",")
+	if commaIdx < 0 {
+		return imgen.ImageInput{}, fmt.Errorf("data URL 缺少 base64 数据")
+	}
+	header := ref[:commaIdx]
+	b64 := ref[commaIdx+1:]
+	data, err := base64.StdEncoding.DecodeString(b64)
+	if err != nil {
+		data, err = base64.RawStdEncoding.DecodeString(b64)
+		if err != nil {
+			return imgen.ImageInput{}, fmt.Errorf("base64 解码失败: %w", err)
+		}
+	}
+	mime := strings.TrimPrefix(header, "data:")
+	if semi := strings.Index(mime, ";"); semi >= 0 {
+		mime = mime[:semi]
+	}
+	return imgen.ImageInput{Data: data, MimeType: mime}, nil
+}
+
+func downloadImageRef(client *http.Client, ref string) (imgen.ImageInput, error) {
+	resp, err := client.Get(ref)
+	if err != nil {
+		return imgen.ImageInput{}, fmt.Errorf("下载参考图片失败: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return imgen.ImageInput{}, fmt.Errorf("下载参考图片返回 HTTP %d", resp.StatusCode)
+	}
+	contentType := strings.TrimSpace(strings.Split(resp.Header.Get("Content-Type"), ";")[0])
+	if !strings.HasPrefix(strings.ToLower(contentType), "image/") {
+		return imgen.ImageInput{}, fmt.Errorf("参考图片 Content-Type 不是 image/*: %s", contentType)
+	}
+	data, err := io.ReadAll(io.LimitReader(resp.Body, maxRemoteImageBytes+1))
+	if err != nil {
+		return imgen.ImageInput{}, fmt.Errorf("读取参考图片失败: %w", err)
+	}
+	if len(data) > maxRemoteImageBytes {
+		return imgen.ImageInput{}, fmt.Errorf("参考图片过大")
+	}
+	return imgen.ImageInput{Data: data, MimeType: contentType}, nil
 }
 
 // imagesWebReverseModel 专用于触发 chatgpt.com 网页端逆向通道的 model id。

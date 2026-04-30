@@ -99,8 +99,12 @@ func (g *OpenAIGateway) forwardChatCompletionsAsImages(ctx context.Context, req 
 			if errMsg == "" {
 				errMsg = "image generation failed"
 			}
+			clientMsg := sanitizedImageSSEErrorMessage
+			if outcome.Kind == sdk.OutcomeClientError && outcome.Upstream.StatusCode == http.StatusRequestEntityTooLarge {
+				clientMsg = imageTooLargeSSEErrorMessage
+			}
 			g.logger.Warn("图片生成流式失败，已脱敏响应", "kind", outcome.Kind, "status_code", outcome.Upstream.StatusCode, "error", errMsg)
-			writeSSEError(req.Writer, sanitizedImageSSEErrorMessage)
+			writeSSEError(req.Writer, clientMsg)
 		}
 		return outcome, err
 	}
@@ -123,6 +127,7 @@ func (g *OpenAIGateway) forwardChatCompletionsAsImages(ctx context.Context, req 
 }
 
 const sanitizedImageSSEErrorMessage = "请求暂时无法完成，请稍后重试"
+const imageTooLargeSSEErrorMessage = "图片过大，请压缩后重试"
 
 // dispatchImageRequest 根据账号凭证类型分发到对应的图像生成管线。
 func (g *OpenAIGateway) dispatchImageRequest(ctx context.Context, origReq *sdk.ForwardRequest, imageReq *sdk.ForwardRequest) (sdk.ForwardOutcome, error) {
