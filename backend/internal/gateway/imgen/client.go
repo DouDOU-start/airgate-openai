@@ -38,7 +38,7 @@ func NewClient(accessToken string, proxyURL *url.URL) *Client {
 	return &Client{
 		http: &http.Client{
 			Transport: transport,
-			Timeout:   180 * time.Second,
+			Timeout:   300 * time.Second,
 			Jar:       jar,
 		},
 		accessToken: accessToken,

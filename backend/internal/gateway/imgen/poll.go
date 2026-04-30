@@ -142,6 +142,18 @@ func (c *Client) asyncStatus(conversationID string) (*AsyncStatusResult, error) 
 //
 // 不区分 IMG1/IMG2 —— sediment:// 在当前现网就是终稿。
 
+const (
+	defaultImagePollAttempts = 30
+	gptImage2PollAttempts    = 100
+)
+
+func imagePollAttempts(model string) int {
+	if strings.HasPrefix(strings.ToLower(strings.TrimSpace(model)), "gpt-image-2") {
+		return gptImage2PollAttempts
+	}
+	return defaultImagePollAttempts
+}
+
 func (c *Client) pollForImages(conversationID string, maxAttempts int) ([]string, error) {
 	const (
 		interval     = 3 * time.Second

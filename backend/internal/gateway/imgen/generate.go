@@ -118,7 +118,7 @@ func (c *Client) GenerateImage(ctx context.Context, prompt string, images []Imag
 	case hasFileService(sr.ImageRefs):
 		imageRefs = filterFileService(sr.ImageRefs)
 	case sr.ConversationID != "":
-		refs, perr := c.pollForImages(sr.ConversationID, 30)
+		refs, perr := c.pollForImages(sr.ConversationID, imagePollAttempts("gpt-image-2"))
 		if perr != nil {
 			return nil, fmt.Errorf("轮询失败: %w", perr)
 		}
