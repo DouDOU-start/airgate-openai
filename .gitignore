@@ -8,6 +8,10 @@
 
 # 运行时数据
 /backend/devdata/
+tmp/
+backend/config.yaml
+backend/config.docker.yaml
+.env
 
 # 前端
 /web/node_modules/
@@ -28,3 +32,5 @@ bin/
 # Go workspace（本地开发用，不提交到 CI）
 go.work
 go.work.sum
+backend/go.work
+backend/go.work.sum

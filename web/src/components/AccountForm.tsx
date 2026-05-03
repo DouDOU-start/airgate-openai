@@ -1,49 +1,13 @@
 import { useState, useCallback, useEffect } from 'react';
 import { cssVar } from '@airgate/theme';
+import type {
+  AccountFormProps,
+  PluginBatchAccountInput,
+  PluginOAuthBatchExchangeResult,
+} from '@airgate/theme/plugin';
 
-/** 批量导入单条结果 */
-export interface BatchExchangeResult {
-  accountType: string;
-  accountName: string;
-  credentials: Record<string, string>;
-  status: 'ok' | 'failed';
-  error?: string;
-}
-
-/** 批量导入账号项 */
-export interface BatchAccountInput {
-  name: string;
-  type: string;
-  credentials: Record<string, string>;
-}
-
-/** 账号表单 Props（由核心 AccountsPage 注入） */
-export interface AccountFormProps {
-  credentials: Record<string, string>;
-  onChange: (credentials: Record<string, string>) => void;
-  mode: 'create' | 'edit';
-  accountType?: string;
-  onAccountTypeChange?: (type: string) => void;
-  onSuggestedName?: (name: string) => void;
-  /** 进入/退出批量模式时通知外层，用于隐藏"下一步/创建"按钮 */
-  onBatchModeChange?: (isBatch: boolean) => void;
-  /** 批量导入账号，由核心侧调用 accountsApi.import 完成落库 */
-  onBatchImport?: (accounts: BatchAccountInput[]) => Promise<{ imported: number; failed: number }>;
-  oauth?: {
-    start: () => Promise<{ authorizeURL: string; state: string }>;
-    exchange: (callbackURL: string) => Promise<{
-      accountType: string;
-      accountName: string;
-      credentials: Record<string, string>;
-    }>;
-    importRefresh?: (refreshToken: string, clientId?: string) => Promise<{
-      accountType: string;
-      accountName: string;
-      credentials: Record<string, string>;
-    }>;
-    batchImportRefresh?: (refreshTokens: string[], clientId?: string) => Promise<BatchExchangeResult[]>;
-  };
-}
+type BatchExchangeResult = PluginOAuthBatchExchangeResult;
+type BatchAccountInput = PluginBatchAccountInput;
 
 /** 订阅计划显示名称和颜色映射 */
 const planDisplayMap: Record<string, { label: string; color: string; bg: string }> = {
