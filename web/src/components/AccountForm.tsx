@@ -59,8 +59,8 @@ const inputStyle: React.CSSProperties = {
   borderRadius: cssVar('radiusMd'),
   borderWidth: '1px',
   borderStyle: 'solid',
-  borderColor: cssVar('glassBorder'),
-  backgroundColor: cssVar('bgSurface'),
+  borderColor: cssVar('border'),
+  backgroundColor: cssVar('fieldBackground'),
   padding: '0.5rem 0.75rem',
   fontSize: '0.875rem',
   color: cssVar('text'),
@@ -88,7 +88,7 @@ const labelStyle: React.CSSProperties = {
 const cardStyle: React.CSSProperties = {
   borderWidth: '1px',
   borderStyle: 'solid',
-  borderColor: cssVar('glassBorder'),
+  borderColor: cssVar('border'),
   borderRadius: cssVar('radiusLg'),
   padding: '1rem',
   cursor: 'pointer',
@@ -121,7 +121,7 @@ const pillStyle: React.CSSProperties = {
   transition: 'all 0.15s',
   borderWidth: '1px',
   borderStyle: 'solid',
-  borderColor: cssVar('glassBorder'),
+  borderColor: cssVar('border'),
   color: cssVar('textSecondary'),
   backgroundColor: 'transparent',
 };
@@ -413,7 +413,7 @@ export function AccountForm({
     ...inputStyle,
     cursor: disabled ? 'not-allowed' : 'pointer',
     backgroundColor: cssVar('primary'),
-    color: 'white',
+    color: cssVar('primaryForeground'),
     borderColor: 'transparent',
     fontWeight: 500,
     width: 'auto',
@@ -423,7 +423,7 @@ export function AccountForm({
   const ghostBtnStyle = (disabled: boolean): React.CSSProperties => ({
     ...inputStyle,
     cursor: disabled ? 'not-allowed' : 'pointer',
-    backgroundColor: 'transparent',
+    backgroundColor: cssVar('fieldBackground'),
     color: cssVar('text'),
     width: 'auto',
     opacity: disabled ? 0.6 : 1,
@@ -432,7 +432,7 @@ export function AccountForm({
   const outlineBtnStyle = (disabled: boolean): React.CSSProperties => ({
     ...inputStyle,
     cursor: disabled ? 'not-allowed' : 'pointer',
-    backgroundColor: 'transparent',
+    backgroundColor: cssVar('fieldBackground'),
     color: cssVar('primary'),
     borderColor: cssVar('primary'),
     width: 'auto',
@@ -522,10 +522,10 @@ export function AccountForm({
             <div style={{
               borderWidth: '1px',
               borderStyle: 'solid',
-              borderColor: cssVar('glassBorder'),
+              borderColor: cssVar('border'),
               borderRadius: cssVar('radiusLg'),
               padding: '0.875rem 1rem',
-              backgroundColor: cssVar('bgSurface'),
+              backgroundColor: cssVar('surfaceSecondary'),
               display: 'flex',
               alignItems: 'center',
               gap: '0.75rem',
@@ -535,7 +535,7 @@ export function AccountForm({
                 订阅
               </div>
               {planType && (() => {
-                const plan = planDisplayMap[planType] || { label: planType, color: cssVar('text'), bg: cssVar('bgSurface') };
+                const plan = planDisplayMap[planType] || { label: planType, color: cssVar('text'), bg: cssVar('surfaceSecondary') };
                 return (
                   <span style={{
                     display: 'inline-block',
@@ -559,7 +559,7 @@ export function AccountForm({
           )}
 
           {oauth && mode === 'create' && (
-            <div style={{ borderWidth: '1px', borderStyle: 'solid', borderColor: cssVar('glassBorder'), borderRadius: cssVar('radiusLg'), padding: '1rem', backgroundColor: cssVar('bgSurface') }}>
+            <div style={{ borderWidth: '1px', borderStyle: 'solid', borderColor: cssVar('border'), borderRadius: cssVar('radiusLg'), padding: '1rem', backgroundColor: cssVar('surfaceSecondary') }}>
               <div style={{ fontSize: '0.875rem', fontWeight: 600, color: cssVar('text'), marginBottom: '0.5rem' }}>
                 授权方式
               </div>
@@ -711,7 +711,7 @@ export function AccountForm({
                         overflowY: 'auto',
                         borderWidth: '1px',
                         borderStyle: 'solid',
-                        borderColor: cssVar('glassBorder'),
+                        borderColor: cssVar('border'),
                         borderRadius: cssVar('radiusMd'),
                         padding: '0.5rem 0.75rem',
                         marginBottom: '0.75rem',
@@ -720,7 +720,7 @@ export function AccountForm({
                           <div key={idx} style={{
                             fontSize: '0.75rem',
                             padding: '0.375rem 0',
-                            borderBottom: idx < batchResults.length - 1 ? `1px solid ${cssVar('glassBorder')}` : 'none',
+                            borderBottom: idx < batchResults.length - 1 ? `1px solid ${cssVar('border')}` : 'none',
                             color: r.status === 'ok' ? cssVar('success') : cssVar('danger'),
                           }}>
                             <span style={{ fontWeight: 500 }}>
