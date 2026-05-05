@@ -54,10 +54,7 @@ func GenerateRequirementsToken(userAgent string) string {
 		configJSON, _ := json.Marshal(config)
 		configB64 := base64.StdEncoding.EncodeToString(configJSON)
 
-		h := sha3.New512()
-		h.Write([]byte(seed))
-		h.Write([]byte(configB64))
-		hash := h.Sum(nil)
+		hash := sha3.Sum512([]byte(seed + configB64))
 
 		// bytes 级比较
 		if bytes.Compare(hash[:diffLen], diffBytes) <= 0 {
@@ -106,11 +103,8 @@ func SolveProofToken(seed, difficulty, userAgent string) string {
 		configJSON, _ := json.Marshal(config)
 		configB64 := base64.StdEncoding.EncodeToString(configJSON)
 
-		h := sha3.New512()
-		h.Write([]byte(seed))
-		h.Write([]byte(configB64))
-		hashBytes := h.Sum(nil)
-		hashHex := hex.EncodeToString(hashBytes)
+		hashBytes := sha3.Sum512([]byte(seed + configB64))
+		hashHex := hex.EncodeToString(hashBytes[:])
 
 		if hashHex[:diffLen] <= difficulty {
 			return prefix + configB64
