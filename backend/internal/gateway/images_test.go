@@ -195,7 +195,7 @@ func TestApplyWebReverseSizeHint(t *testing.T) {
 // TestHandleImagesResponse_TokenAttribution 覆盖官方响应格式：
 //   - usage.input_tokens / output_tokens 落入 Outcome.Usage
 //   - cached tokens 从 input 中扣减，避免重复计费
-//   - fillUsageCost 根据 gpt-image-1.5 定价填充费用
+//   - API Key Images 按请求 size 分档计费
 func TestHandleImagesResponse_TokenAttribution(t *testing.T) {
 	body := `{
 		"created": 1713833628,
@@ -214,7 +214,7 @@ func TestHandleImagesResponse_TokenAttribution(t *testing.T) {
 	}
 	w := httptest.NewRecorder()
 
-	outcome, err := handleImagesResponse(resp, w, nil, time.Now(), "gpt-image-1.5")
+	outcome, err := handleImagesResponse(resp, w, nil, time.Now(), "gpt-image-1.5", "2048x2048")
 	if err != nil {
 		t.Fatalf("handleImagesResponse returned err: %v", err)
 	}
@@ -238,12 +238,11 @@ func TestHandleImagesResponse_TokenAttribution(t *testing.T) {
 		t.Errorf("CachedInputTokens = %d, want 10", u.CachedInputTokens)
 	}
 
-	// 按张计费：data 数组有 1 张图 × $0.20 = 0.20
 	if !almostEqual(u.InputCost, 0, 1e-9) {
 		t.Errorf("InputCost = %v, want 0 (per-image billing)", u.InputCost)
 	}
 	if !almostEqual(u.OutputCost, 0.20, 1e-9) {
-		t.Errorf("OutputCost = %v, want 0.20 (1 image × $0.20)", u.OutputCost)
+		t.Errorf("OutputCost = %v, want 0.20 (1 image × 2K tier $0.20)", u.OutputCost)
 	}
 
 	if w.Code != http.StatusOK {
@@ -297,6 +296,26 @@ func TestHandleImagesResponse_StreamWrapsRESTJSONAsSSE(t *testing.T) {
 	wantBody := "data: " + body + "\n\ndata: [DONE]\n\n"
 	if gotBody != wantBody {
 		t.Fatalf("writer body = %q, want %q", gotBody, wantBody)
+	}
+}
+
+func TestHandleImagesResponse_APIKeyBillingUsesRequestSize(t *testing.T) {
+	body := `{"data":[{"url":"https://example/a.png"},{"url":"https://example/b.png"}],"usage":{"input_tokens":10,"output_tokens":100}}`
+	resp := &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": []string{"application/json"}},
+		Body:       ioNopCloserFromString(body),
+	}
+
+	outcome, err := handleImagesResponse(resp, nil, nil, time.Now(), "gpt-image-1.5", "3840x2160")
+	if err != nil {
+		t.Fatalf("handleImagesResponse returned err: %v", err)
+	}
+	if got, want := outcome.Usage.OutputCost, 0.80; !almostEqual(got, want, 1e-9) {
+		t.Fatalf("OutputCost = %v, want %v (2 images × 4K tier $0.40)", got, want)
+	}
+	if got, want := outcome.Usage.OutputPrice, 0.40; !almostEqual(got, want, 1e-9) {
+		t.Fatalf("OutputPrice = %v, want %v", got, want)
 	}
 }
 
@@ -896,6 +915,37 @@ func TestBuildImagesToolCreateMsg_Edit_ShrinksLargeInputImage(t *testing.T) {
 
 // TestParseImagesEditMultipart 覆盖 OpenAI SDK 标准的 multipart/form-data 请求：
 // image 文件 + prompt 文本 + mask 文件 → 规范化后 images / mask 都应是 data URL。
+func TestBuildAPIKeyImagesEditMultipartBody(t *testing.T) {
+	pngBytes := []byte{0x89, 0x50, 0x4E, 0x47}
+	body := []byte(fmt.Sprintf(`{
+		"prompt":"relight the scene",
+		"model":"gpt-image-2",
+		"size":"1024x1024",
+		"quality":"auto",
+		"n":1,
+		"image":"data:image/png;base64,%s"
+	}`, base64.StdEncoding.EncodeToString(pngBytes)))
+
+	multipartBody, contentType, err := buildAPIKeyImagesEditMultipartBody(body, "application/json")
+	if err != nil {
+		t.Fatalf("buildAPIKeyImagesEditMultipartBody err: %v", err)
+	}
+	if !strings.HasPrefix(contentType, "multipart/form-data; boundary=") {
+		t.Fatalf("contentType = %q", contentType)
+	}
+
+	req, err := parseImagesRequest(multipartBody, contentType, true)
+	if err != nil {
+		t.Fatalf("parseImagesRequest err: %v", err)
+	}
+	if req.Prompt != "relight the scene" || req.Model != "gpt-image-2" || req.Size != "1024x1024" || req.Quality != "auto" || req.N != 1 {
+		t.Fatalf("fields wrong: %+v", req)
+	}
+	if len(req.Images) != 1 || req.Images[0] != "data:image/png;base64,"+base64.StdEncoding.EncodeToString(pngBytes) {
+		t.Fatalf("image wrong: %+v", req.Images)
+	}
+}
+
 func TestParseImagesEditMultipart(t *testing.T) {
 	pngBytes := []byte{0x89, 0x50, 0x4E, 0x47}
 	maskBytes := []byte{0x89, 0x50, 0x4E, 0x47, 0xFF}

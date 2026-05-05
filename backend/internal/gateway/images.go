@@ -17,6 +17,7 @@ import (
 	"mime"
 	"mime/multipart"
 	"net/http"
+	"net/textproto"
 	"strconv"
 	"strings"
 	"sync"
@@ -183,6 +184,94 @@ type imagesRequest struct {
 // parseImagesRequest 把原始请求体按内容类型解析成 imagesRequest。
 // /generations 只支持 application/json；/edits 同时支持 JSON（image 字段是 data URL/http(s) URL/数组）
 // 与 multipart/form-data（OpenAI SDK 标准）。
+func buildAPIKeyImagesEditMultipartBody(body []byte, contentType string) ([]byte, string, error) {
+	req, err := parseImagesRequest(body, contentType, true)
+	if err != nil {
+		return nil, "", err
+	}
+
+	var buf bytes.Buffer
+	mw := multipart.NewWriter(&buf)
+	fields := map[string]string{
+		"model":          req.Model,
+		"prompt":         req.Prompt,
+		"size":           req.Size,
+		"quality":        req.Quality,
+		"background":     req.Background,
+		"output_format":  req.OutputFormat,
+		"input_fidelity": req.InputFidelity,
+	}
+	for name, value := range fields {
+		if value != "" {
+			_ = mw.WriteField(name, value)
+		}
+	}
+	if req.N > 0 {
+		_ = mw.WriteField("n", strconv.Itoa(req.N))
+	}
+	for i, ref := range req.Images {
+		fieldName := "image"
+		if len(req.Images) > 1 {
+			fieldName = "image[]"
+		}
+		if err := writeMultipartImageRef(mw, fieldName, fmt.Sprintf("image-%d", i+1), ref); err != nil {
+			_ = mw.Close()
+			return nil, "", err
+		}
+	}
+	if req.Mask != "" {
+		if err := writeMultipartImageRef(mw, "mask", "mask", req.Mask); err != nil {
+			_ = mw.Close()
+			return nil, "", err
+		}
+	}
+	if err := mw.Close(); err != nil {
+		return nil, "", err
+	}
+	return buf.Bytes(), mw.FormDataContentType(), nil
+}
+
+func writeMultipartImageRef(mw *multipart.Writer, fieldName, baseName, ref string) error {
+	mimeType, data, err := decodeDataImageURL(ref)
+	if err != nil {
+		return err
+	}
+	ext := ".png"
+	switch mimeType {
+	case "image/jpeg", "image/jpg":
+		ext = ".jpg"
+	case "image/webp":
+		ext = ".webp"
+	case "image/gif":
+		ext = ".gif"
+	}
+	header := textproto.MIMEHeader{}
+	header.Set("Content-Disposition", fmt.Sprintf(`form-data; name=%q; filename=%q`, fieldName, baseName+ext))
+	header.Set("Content-Type", mimeType)
+	part, err := mw.CreatePart(header)
+	if err != nil {
+		return err
+	}
+	_, err = part.Write(data)
+	return err
+}
+
+func decodeDataImageURL(ref string) (string, []byte, error) {
+	comma := strings.IndexByte(ref, ',')
+	if comma < 0 || !strings.HasPrefix(strings.ToLower(ref[:comma]), "data:image/") {
+		return "", nil, fmt.Errorf("API key /v1/images/edits 仅支持 data URL 图片")
+	}
+	mimeType := ref[len("data:"):comma]
+	if semi := strings.IndexByte(mimeType, ';'); semi >= 0 {
+		mimeType = mimeType[:semi]
+	}
+	data, err := base64.StdEncoding.DecodeString(ref[comma+1:])
+	if err != nil {
+		return "", nil, fmt.Errorf("图片 base64 解码失败: %w", err)
+	}
+	return strings.ToLower(mimeType), data, nil
+}
+
 func parseImagesRequest(body []byte, contentType string, isEdit bool) (*imagesRequest, error) {
 	if isEdit {
 		// 去掉 Content-Type 参数只保留主类型
@@ -1301,15 +1390,15 @@ func buildImagesErrorBody(status int, message string) []byte {
 // 计费字段复用 parseUsage：gpt-image-1 / gpt-image-1.5 返回的
 // usage.input_tokens / usage.output_tokens / usage.input_tokens_details.cached_tokens
 // 与 Responses API 字段同构，parseUsage 已经处理了 cached token 扣减。
-func handleImagesResponse(resp *http.Response, w http.ResponseWriter, sseKA *ssePingKeepAlive, start time.Time, fallbackModel string) (sdk.ForwardOutcome, error) {
-	return handleImagesResponseWithLogger(nil, resp, w, sseKA, start, fallbackModel)
+func handleImagesResponse(resp *http.Response, w http.ResponseWriter, sseKA *ssePingKeepAlive, start time.Time, fallbackModel string, billingSize ...string) (sdk.ForwardOutcome, error) {
+	return handleImagesResponseWithLogger(nil, resp, w, sseKA, start, fallbackModel, billingSize...)
 }
 
-func (g *OpenAIGateway) handleImagesResponse(resp *http.Response, w http.ResponseWriter, sseKA *ssePingKeepAlive, start time.Time, fallbackModel string) (sdk.ForwardOutcome, error) {
-	return handleImagesResponseWithLogger(g.logger, resp, w, sseKA, start, fallbackModel)
+func (g *OpenAIGateway) handleImagesResponse(resp *http.Response, w http.ResponseWriter, sseKA *ssePingKeepAlive, start time.Time, fallbackModel string, billingSize ...string) (sdk.ForwardOutcome, error) {
+	return handleImagesResponseWithLogger(g.logger, resp, w, sseKA, start, fallbackModel, billingSize...)
 }
 
-func handleImagesResponseWithLogger(logger *slog.Logger, resp *http.Response, w http.ResponseWriter, sseKA *ssePingKeepAlive, start time.Time, fallbackModel string) (sdk.ForwardOutcome, error) {
+func handleImagesResponseWithLogger(logger *slog.Logger, resp *http.Response, w http.ResponseWriter, sseKA *ssePingKeepAlive, start time.Time, fallbackModel string, billingSize ...string) (sdk.ForwardOutcome, error) {
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		reason := fmt.Sprintf("读取 Images 响应失败: %v", err)
@@ -1349,10 +1438,15 @@ func handleImagesResponseWithLogger(logger *slog.Logger, resp *http.Response, w 
 	if logger == nil {
 		logger = slog.Default()
 	}
+	billSize := ""
+	if len(billingSize) > 0 {
+		billSize = billingSize[0]
+	}
 	logger.Debug("images_native_result_returned",
 		"request_model", fallbackModel,
 		sdk.LogFieldModel, modelName,
 		"num_images", numImages,
+		"billing_size", billSize,
 	)
 
 	elapsed := time.Since(start)
@@ -1363,7 +1457,7 @@ func handleImagesResponseWithLogger(logger *slog.Logger, resp *http.Response, w 
 		Model:             modelName,
 		FirstTokenMs:      elapsed.Milliseconds(),
 	}
-	fillUsageCostPerImage(usage, numImages)
+	fillUsageCostPerImageBySize(usage, numImages, billSize)
 
 	outcome := sdk.ForwardOutcome{
 		Kind:     sdk.OutcomeSuccess,

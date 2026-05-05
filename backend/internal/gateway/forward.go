@@ -188,7 +188,35 @@ func (g *OpenAIGateway) forwardAPIKey(ctx context.Context, req *sdk.ForwardReque
 
 	reqMethod, reqPath := resolveAPIKeyRoute(req)
 	targetURL := buildAPIKeyURL(account, reqPath)
-	if isImagesRequest(reqPath) && len(req.Body) > 0 && !strings.HasPrefix(req.Headers.Get("Content-Type"), "multipart/") {
+	imagesBillingSize := ""
+	if isImagesRequest(reqPath) && len(req.Body) > 0 {
+		if parsed, err := parseImagesRequest(req.Body, req.Headers.Get("Content-Type"), isImagesEditRequest(reqPath)); err == nil {
+			imagesBillingSize = parsed.Size
+		}
+	}
+	if isImagesEditRequest(reqPath) && len(req.Body) > 0 && !strings.HasPrefix(strings.ToLower(req.Headers.Get("Content-Type")), "multipart/") {
+		body, contentType, err := buildAPIKeyImagesEditMultipartBody(req.Body, req.Headers.Get("Content-Type"))
+		if err != nil {
+			errBody := jsonError(err.Error())
+			if req.Writer != nil {
+				req.Writer.Header().Set("Content-Type", "application/json")
+				req.Writer.WriteHeader(http.StatusBadRequest)
+				_, _ = req.Writer.Write(errBody)
+			}
+			return sdk.ForwardOutcome{
+				Kind: sdk.OutcomeClientError,
+				Upstream: sdk.UpstreamResponse{
+					StatusCode: http.StatusBadRequest,
+					Headers:    http.Header{"Content-Type": []string{"application/json"}},
+					Body:       errBody,
+				},
+				Reason:   err.Error(),
+				Duration: time.Since(start),
+			}, nil
+		}
+		req.Body = body
+		req.Headers.Set("Content-Type", contentType)
+	} else if isImagesRequest(reqPath) && len(req.Body) > 0 && !strings.HasPrefix(req.Headers.Get("Content-Type"), "multipart/") {
 		if patched, err := sjson.DeleteBytes(req.Body, "stream"); err == nil {
 			req.Body = patched
 		}
@@ -313,7 +341,7 @@ func (g *OpenAIGateway) forwardAPIKey(ctx context.Context, req *sdk.ForwardReque
 
 	// Images API 响应体无 model 字段，另走专用处理器回填后再 fillCost
 	if isImagesRequest(reqPath) {
-		return g.handleImagesResponse(resp, req.Writer, sseKA, start, req.Model)
+		return g.handleImagesResponse(resp, req.Writer, sseKA, start, req.Model, imagesBillingSize)
 	}
 
 	if req.Stream && req.Writer != nil {
