@@ -341,6 +341,43 @@ func (g *OpenAIGateway) forwardAPIKey(ctx context.Context, req *sdk.ForwardReque
 
 	// Images API 响应体无 model 字段，另走专用处理器回填后再 fillCost
 	if isImagesRequest(reqPath) {
+		// 检测异步任务模式（如 apimart.ai gpt-image-2 返回 task_id）
+		body, readErr := io.ReadAll(resp.Body)
+		_ = resp.Body.Close()
+		if readErr != nil {
+			reason := fmt.Sprintf("读取 Images 响应失败: %v", readErr)
+			if sseKA != nil {
+				sseKA.Stop()
+				writeSSEError(req.Writer, sanitizedImageSSEErrorMessage)
+			}
+			return transientOutcome(reason), fmt.Errorf("%s", reason)
+		}
+
+		if taskID, ok := isAsyncImageTaskResponse(body); ok {
+			logger.Debug("images_async_task_detected",
+				sdk.LogFieldAccountID, account.ID,
+				sdk.LogFieldModel, req.Model,
+				"task_id", taskID,
+			)
+			finalBody, pollErr := g.pollAsyncImageTask(ctx, account, taskID, logger)
+			if pollErr != nil {
+				reason := fmt.Sprintf("异步图片任务轮询失败: %v", pollErr)
+				logger.Warn("images_async_task_poll_failed",
+					sdk.LogFieldAccountID, account.ID,
+					sdk.LogFieldModel, req.Model,
+					"task_id", taskID,
+					sdk.LogFieldError, pollErr,
+				)
+				if sseKA != nil {
+					sseKA.Stop()
+					writeSSEError(req.Writer, sanitizedImageSSEErrorMessage)
+				}
+				return transientOutcome(reason), fmt.Errorf("%s", reason)
+			}
+			body = finalBody
+		}
+
+		resp.Body = io.NopCloser(bytes.NewReader(body))
 		return g.handleImagesResponse(resp, req.Writer, sseKA, start, req.Model, imagesBillingSize)
 	}
 

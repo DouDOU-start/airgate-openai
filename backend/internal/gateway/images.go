@@ -1489,3 +1489,134 @@ func handleImagesResponseWithLogger(logger *slog.Logger, resp *http.Response, w 
 	}
 	return outcome, nil
 }
+
+// ──────────────────────────────────────────────────────
+// 异步图片任务轮询（apimart.ai 等异步上游）
+// ──────────────────────────────────────────────────────
+
+const (
+	asyncImagePollInitialDelay = 10 * time.Second
+	asyncImagePollInterval     = 5 * time.Second
+	asyncImagePollMaxAttempts  = 60
+)
+
+// isAsyncImageTaskResponse 检测上游响应是否为异步任务模式（返回 task_id 而非图片数据）。
+func isAsyncImageTaskResponse(body []byte) (taskID string, ok bool) {
+	tid := gjson.GetBytes(body, "data.0.task_id").String()
+	if tid != "" {
+		return tid, true
+	}
+	tid = gjson.GetBytes(body, "data.task_id").String()
+	if tid != "" {
+		return tid, true
+	}
+	return "", false
+}
+
+// pollAsyncImageTask 轮询异步图片任务直到完成，返回转换为 OpenAI Images API 标准格式的响应体。
+func (g *OpenAIGateway) pollAsyncImageTask(
+	ctx context.Context,
+	account *sdk.Account,
+	taskID string,
+	logger *slog.Logger,
+) ([]byte, error) {
+	baseURL := strings.TrimRight(account.Credentials["base_url"], "/")
+	if baseURL == "" {
+		baseURL = "https://api.openai.com"
+	}
+	baseURL = strings.TrimSuffix(baseURL, "/v1")
+
+	pollURL := baseURL + "/v1/tasks/" + taskID
+	client := g.buildHTTPClient(account)
+
+	logger.Debug("images_async_task_poll_start", "task_id", taskID)
+
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case <-time.After(asyncImagePollInitialDelay):
+	}
+
+	for attempt := range asyncImagePollMaxAttempts {
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		default:
+		}
+
+		pollReq, err := http.NewRequestWithContext(ctx, http.MethodGet, pollURL, nil)
+		if err != nil {
+			return nil, fmt.Errorf("构建轮询请求失败: %w", err)
+		}
+		setAuthHeaders(pollReq, account)
+
+		pollResp, err := client.Do(pollReq)
+		if err != nil {
+			logger.Warn("images_async_task_poll_error",
+				"task_id", taskID, "attempt", attempt, sdk.LogFieldError, err)
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-time.After(asyncImagePollInterval):
+			}
+			continue
+		}
+		body, _ := io.ReadAll(pollResp.Body)
+		_ = pollResp.Body.Close()
+
+		status := gjson.GetBytes(body, "data.status").String()
+		logger.Debug("images_async_task_poll_status",
+			"task_id", taskID, "attempt", attempt, "status", status)
+
+		switch status {
+		case "completed":
+			return transformAsyncImageResult(body)
+		case "failed", "error":
+			reason := gjson.GetBytes(body, "data.result.error").String()
+			if reason == "" {
+				reason = gjson.GetBytes(body, "data.error").String()
+			}
+			if reason == "" {
+				reason = "unknown error"
+			}
+			return nil, fmt.Errorf("异步图片任务失败: %s", reason)
+		}
+
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(asyncImagePollInterval):
+		}
+	}
+	return nil, fmt.Errorf("异步图片任务 %s 超时", taskID)
+}
+
+// transformAsyncImageResult 将异步任务完成响应转换为 OpenAI Images API 标准格式。
+func transformAsyncImageResult(body []byte) ([]byte, error) {
+	images := gjson.GetBytes(body, "data.result.images")
+	if !images.Exists() || !images.IsArray() {
+		return nil, fmt.Errorf("异步任务结果中未找到图片数据")
+	}
+
+	var dataItems []map[string]any
+	for _, img := range images.Array() {
+		urls := img.Get("url")
+		if urls.IsArray() {
+			for _, u := range urls.Array() {
+				dataItems = append(dataItems, map[string]any{"url": u.String()})
+			}
+		} else if urls.Type == gjson.String {
+			dataItems = append(dataItems, map[string]any{"url": urls.String()})
+		}
+	}
+
+	if len(dataItems) == 0 {
+		return nil, fmt.Errorf("异步任务结果中图片 URL 为空")
+	}
+
+	result := map[string]any{
+		"created": time.Now().Unix(),
+		"data":    dataItems,
+	}
+	return json.Marshal(result)
+}
