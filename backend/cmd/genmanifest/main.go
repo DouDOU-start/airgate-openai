@@ -10,7 +10,8 @@ import (
 	"gopkg.in/yaml.v3"
 
 	"github.com/DouDOU-start/airgate-openai/backend/internal/gateway"
-	sdk "github.com/DouDOU-start/airgate-sdk"
+	"github.com/DouDOU-start/airgate-openai/backend/internal/model"
+	sdk "github.com/DouDOU-start/airgate-sdk/sdkgo"
 )
 
 const generatedComment = "# 本文件由 backend/cmd/genmanifest 自动生成，请勿手工修改。\n\n"
@@ -44,13 +45,14 @@ type routeDef struct {
 }
 
 type modelInfo struct {
-	ID               string  `yaml:"id"`
-	Name             string  `yaml:"name"`
-	ContextWindow    int     `yaml:"context_window"`
-	MaxOutputTokens  int     `yaml:"max_output_tokens"`
-	InputPrice       float64 `yaml:"input_price"`
-	OutputPrice      float64 `yaml:"output_price"`
-	CachedInputPrice float64 `yaml:"cached_input_price,omitempty"`
+	ID               string   `yaml:"id"`
+	Name             string   `yaml:"name"`
+	ContextWindow    int      `yaml:"context_window"`
+	MaxOutputTokens  int      `yaml:"max_output_tokens"`
+	Capabilities     []string `yaml:"capabilities,omitempty"`
+	InputPrice       float64  `yaml:"input_price"`
+	OutputPrice      float64  `yaml:"output_price"`
+	CachedInputPrice float64  `yaml:"cached_input_price,omitempty"`
 
 	// Priority 档单价（$/1M tokens）
 	InputPricePriority       float64 `yaml:"input_price_priority,omitempty"`
@@ -142,7 +144,7 @@ func renderManifest() ([]byte, error) {
 			Platform:     plugin.Platform(),
 			Mode:         gateway.PluginMode,
 			Routes:       convertRoutes(plugin.Routes()),
-			Models:       convertModels(plugin.Models()),
+			Models:       convertModels(model.AllPricingSpecs()),
 			AccountTypes: convertAccountTypes(info.AccountTypes),
 		},
 	}
@@ -183,33 +185,42 @@ func convertRoutes(routes []sdk.RouteDefinition) []routeDef {
 	return items
 }
 
-func convertModels(models []sdk.ModelInfo) []modelInfo {
+func convertModels(models []model.NamedSpec) []modelInfo {
 	items := make([]modelInfo, 0, len(models))
 	for _, m := range models {
+		spec := m.Spec
 		items = append(items, modelInfo{
 			ID:                          m.ID,
-			Name:                        m.Name,
-			ContextWindow:               m.ContextWindow,
-			MaxOutputTokens:             m.MaxOutputTokens,
-			InputPrice:                  m.InputPrice,
-			OutputPrice:                 m.OutputPrice,
-			CachedInputPrice:            m.CachedInputPrice,
-			InputPricePriority:          m.InputPricePriority,
-			OutputPricePriority:         m.OutputPricePriority,
-			CachedInputPricePriority:    m.CachedInputPricePriority,
-			InputPriceFast:              m.InputPriceFast,
-			OutputPriceFast:             m.OutputPriceFast,
-			CachedInputPriceFast:        m.CachedInputPriceFast,
-			InputPriceFlex:              m.InputPriceFlex,
-			OutputPriceFlex:             m.OutputPriceFlex,
-			CachedInputPriceFlex:        m.CachedInputPriceFlex,
-			LongContextThreshold:        m.LongContextThreshold,
-			LongContextInputMultiplier:  m.LongContextInputMultiplier,
-			LongContextOutputMultiplier: m.LongContextOutputMultiplier,
-			LongContextCachedMultiplier: m.LongContextCachedMultiplier,
+			Name:                        spec.Name,
+			ContextWindow:               spec.ContextWindow,
+			MaxOutputTokens:             spec.MaxOutputTokens,
+			Capabilities:                modelCapabilities(spec),
+			InputPrice:                  spec.InputPrice,
+			OutputPrice:                 spec.OutputPrice,
+			CachedInputPrice:            spec.CachedPrice,
+			InputPricePriority:          spec.InputPricePriority,
+			OutputPricePriority:         spec.OutputPricePriority,
+			CachedInputPricePriority:    spec.CachedPricePriority,
+			InputPriceFast:              spec.InputPriceFast,
+			OutputPriceFast:             spec.OutputPriceFast,
+			CachedInputPriceFast:        spec.CachedPriceFast,
+			InputPriceFlex:              spec.InputPriceFlex,
+			OutputPriceFlex:             spec.OutputPriceFlex,
+			CachedInputPriceFlex:        spec.CachedPriceFlex,
+			LongContextThreshold:        spec.LongContextThreshold,
+			LongContextInputMultiplier:  spec.LongContextInputMultiplier,
+			LongContextOutputMultiplier: spec.LongContextOutputMultiplier,
+			LongContextCachedMultiplier: spec.LongContextCachedMultiplier,
 		})
 	}
 	return items
+}
+
+func modelCapabilities(spec model.Spec) []string {
+	if spec.ImagePrice > 0 {
+		return []string{sdk.ModelCapImageGeneration}
+	}
+	return []string{sdk.ModelCapChat, sdk.ModelCapReasoning}
 }
 
 func convertAccountTypes(types []sdk.AccountType) []accountType {

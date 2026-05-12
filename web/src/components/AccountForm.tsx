@@ -1,10 +1,10 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
-import { cssVar } from '@airgate/theme';
+import { cssVar } from '@doudou-start/airgate-theme';
 import type {
   AccountFormProps,
   PluginBatchAccountInput,
   PluginOAuthBatchExchangeResult,
-} from '@airgate/theme/plugin';
+} from '@doudou-start/airgate-theme/plugin';
 
 type BatchExchangeResult = PluginOAuthBatchExchangeResult;
 type BatchAccountInput = PluginBatchAccountInput;

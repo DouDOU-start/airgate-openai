@@ -13,7 +13,7 @@ import (
 
 	"github.com/DouDOU-start/airgate-openai/backend/internal/model"
 	"github.com/DouDOU-start/airgate-openai/backend/resources"
-	sdk "github.com/DouDOU-start/airgate-sdk"
+	sdk "github.com/DouDOU-start/airgate-sdk/sdkgo"
 )
 
 // modelMetadataOverrides 仅用于 /v1/models 响应补齐。

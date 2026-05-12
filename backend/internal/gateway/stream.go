@@ -15,7 +15,7 @@ import (
 
 	"github.com/tidwall/gjson"
 
-	sdk "github.com/DouDOU-start/airgate-sdk"
+	sdk "github.com/DouDOU-start/airgate-sdk/sdkgo"
 )
 
 // upstreamSSEMaxLineBytes 是上游 SSE 单行最大字节数。
@@ -36,7 +36,7 @@ func handleStreamResponse(resp *http.Response, w http.ResponseWriter, start time
 	w.Header().Set("X-Accel-Buffering", "no")
 	passCodexRateLimitHeaders(resp.Header, w.Header())
 
-	usage := &sdk.Usage{ServiceTier: reqServiceTier}
+	usage := newTokenUsage("", reqServiceTier, 0, 0, 0, 0, 0)
 	scanner := bufio.NewScanner(resp.Body)
 	scanner.Buffer(make([]byte, 64*1024), upstreamSSEMaxLineBytes)
 	var streamErr error
@@ -166,15 +166,15 @@ func handleNonStreamResponse(resp *http.Response, w http.ResponseWriter, start t
 	}
 
 	elapsed := time.Since(start)
-	usage := &sdk.Usage{
-		InputTokens:           parsed.inputTokens,
-		OutputTokens:          parsed.outputTokens,
-		CachedInputTokens:     parsed.cachedInputTokens,
-		ReasoningOutputTokens: parsed.reasoningOutputTokens,
-		ServiceTier:           firstNonEmptyTier(reqServiceTier, normalizeOpenAIServiceTier(gjson.GetBytes(body, "service_tier").String())),
-		Model:                 gjson.GetBytes(body, "model").String(),
-		FirstTokenMs:          elapsed.Milliseconds(),
-	}
+	usage := newTokenUsage(
+		gjson.GetBytes(body, "model").String(),
+		firstNonEmptyTier(reqServiceTier, normalizeOpenAIServiceTier(gjson.GetBytes(body, "service_tier").String())),
+		parsed.inputTokens,
+		parsed.outputTokens,
+		parsed.cachedInputTokens,
+		parsed.reasoningOutputTokens,
+		elapsed.Milliseconds(),
+	)
 	fillUsageCostWithImageTool(usage, estimateImageCountFromTokens(parsed.toolImageOutputTokens))
 
 	outcome := sdk.ForwardOutcome{
@@ -327,18 +327,20 @@ func parseSSEUsage(data []byte, out *sdk.Usage, toolImageIn, toolImageOut *int) 
 			return
 		}
 		out.Model = resp.Get("model").String()
-		if out.ServiceTier == "" {
-			out.ServiceTier = normalizeOpenAIServiceTier(resp.Get("service_tier").String())
+		setUsageModelAttribute(out, out.Model)
+		if usageServiceTier(out) == "" {
+			setUsageServiceTier(out, resp.Get("service_tier").String())
 		}
 		usage := resp.Get("usage")
 		if usage.Exists() {
-			out.InputTokens = int(usage.Get("input_tokens").Int())
-			out.OutputTokens = int(usage.Get("output_tokens").Int())
-			out.CachedInputTokens = int(usage.Get("input_tokens_details.cached_tokens").Int())
-			out.ReasoningOutputTokens = int(usage.Get("output_tokens_details.reasoning_tokens").Int())
-			if out.CachedInputTokens > 0 && out.InputTokens >= out.CachedInputTokens {
-				out.InputTokens -= out.CachedInputTokens
+			inputTokens := int(usage.Get("input_tokens").Int())
+			outputTokens := int(usage.Get("output_tokens").Int())
+			cachedInputTokens := int(usage.Get("input_tokens_details.cached_tokens").Int())
+			reasoningOutputTokens := int(usage.Get("output_tokens_details.reasoning_tokens").Int())
+			if cachedInputTokens > 0 && inputTokens >= cachedInputTokens {
+				inputTokens -= cachedInputTokens
 			}
+			setUsageTokens(out, inputTokens, outputTokens, cachedInputTokens, reasoningOutputTokens)
 		}
 		if imgTool := resp.Get("tool_usage.image_gen"); imgTool.Exists() {
 			if toolImageIn != nil {
@@ -354,14 +356,16 @@ func parseSSEUsage(data []byte, out *sdk.Usage, toolImageIn, toolImageOut *int) 
 		if !usage.Exists() {
 			return
 		}
-		out.InputTokens = int(usage.Get("prompt_tokens").Int())
-		out.OutputTokens = int(usage.Get("completion_tokens").Int())
+		inputTokens := int(usage.Get("prompt_tokens").Int())
+		outputTokens := int(usage.Get("completion_tokens").Int())
+		cachedInputTokens := int(usage.Get("prompt_tokens_details.cached_tokens").Int())
+		reasoningOutputTokens := int(usage.Get("completion_tokens_details.reasoning_tokens").Int())
 		out.Model = gjson.GetBytes(data, "model").String()
-		out.CachedInputTokens = int(usage.Get("prompt_tokens_details.cached_tokens").Int())
-		out.ReasoningOutputTokens = int(usage.Get("completion_tokens_details.reasoning_tokens").Int())
-		if out.CachedInputTokens > 0 && out.InputTokens >= out.CachedInputTokens {
-			out.InputTokens -= out.CachedInputTokens
+		setUsageModelAttribute(out, out.Model)
+		if cachedInputTokens > 0 && inputTokens >= cachedInputTokens {
+			inputTokens -= cachedInputTokens
 		}
+		setUsageTokens(out, inputTokens, outputTokens, cachedInputTokens, reasoningOutputTokens)
 	}
 }
 

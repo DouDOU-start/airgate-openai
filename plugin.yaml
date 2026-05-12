@@ -9,9 +9,12 @@ type: gateway
 min_core_version: 1.0.0
 dependencies: []
 frontend_widgets:
-  - slot: account-form
+  - slot: account-create
     entry_file: index.js
-    title: 账号表单
+    title: 创建 OpenAI 账号
+  - slot: account-edit
+    entry_file: index.js
+    title: 编辑 OpenAI 账号
 gateway:
   platform: openai
   mode: simple
@@ -37,6 +40,12 @@ gateway:
     - method: POST
       path: /v1/images/edits
       description: Images API（图生图 / 编辑）
+    - method: GET
+      path: /v1/images/tasks
+      description: Images Task 状态查询
+    - method: GET
+      path: /v1/images/tasks/list
+      description: Images Task 历史列表
     - method: WS
       path: /v1/responses
       description: Responses API（WebSocket）
@@ -61,6 +70,12 @@ gateway:
     - method: POST
       path: /images/edits
       description: Images API（图生图，无 /v1 前缀）
+    - method: GET
+      path: /images/tasks
+      description: Images Task 状态查询（无 /v1 前缀）
+    - method: GET
+      path: /images/tasks/list
+      description: Images Task 历史列表（无 /v1 前缀）
     - method: WS
       path: /responses
       description: Responses API WebSocket（无 /v1 前缀）
@@ -69,6 +84,9 @@ gateway:
       name: GPT 5.2
       context_window: 272000
       max_output_tokens: 128000
+      capabilities:
+        - chat
+        - reasoning
       input_price: 1.75
       output_price: 14
       cached_input_price: 0.175
@@ -82,6 +100,9 @@ gateway:
       name: GPT 5.3 Codex
       context_window: 272000
       max_output_tokens: 128000
+      capabilities:
+        - chat
+        - reasoning
       input_price: 1.75
       output_price: 14
       cached_input_price: 0.175
@@ -95,6 +116,9 @@ gateway:
       name: GPT 5.3 Codex Spark
       context_window: 128000
       max_output_tokens: 128000
+      capabilities:
+        - chat
+        - reasoning
       input_price: 1.75
       output_price: 14
       cached_input_price: 0.175
@@ -108,6 +132,9 @@ gateway:
       name: GPT 5.4
       context_window: 272000
       max_output_tokens: 128000
+      capabilities:
+        - chat
+        - reasoning
       input_price: 2.5
       output_price: 15
       cached_input_price: 0.25
@@ -125,6 +152,9 @@ gateway:
       name: GPT 5.4 Mini
       context_window: 128000
       max_output_tokens: 128000
+      capabilities:
+        - chat
+        - reasoning
       input_price: 0.75
       output_price: 4.5
       cached_input_price: 0.075
@@ -138,6 +168,9 @@ gateway:
       name: GPT 5.5
       context_window: 400000
       max_output_tokens: 128000
+      capabilities:
+        - chat
+        - reasoning
       input_price: 5
       output_price: 30
       cached_input_price: 0.5
@@ -151,18 +184,24 @@ gateway:
       name: GPT Image 1
       context_window: 32000
       max_output_tokens: 0
+      capabilities:
+        - image_generation
       input_price: 0
       output_price: 0
     - id: gpt-image-1.5
       name: GPT Image 1.5
       context_window: 32000
       max_output_tokens: 0
+      capabilities:
+        - image_generation
       input_price: 0
       output_price: 0
     - id: gpt-image-2
       name: GPT Image 2
       context_window: 32000
       max_output_tokens: 0
+      capabilities:
+        - image_generation
       input_price: 0
       output_price: 0
   account_types:

@@ -6,7 +6,7 @@ import (
 	"log"
 	"net/http"
 
-	"github.com/DouDOU-start/airgate-sdk/devserver"
+	"github.com/DouDOU-start/airgate-sdk/devkit/devserver"
 
 	"github.com/DouDOU-start/airgate-openai/backend/internal/gateway"
 )

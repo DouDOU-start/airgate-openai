@@ -13,7 +13,7 @@ import (
 	"strings"
 	"time"
 
-	sdk "github.com/DouDOU-start/airgate-sdk"
+	sdk "github.com/DouDOU-start/airgate-sdk/sdkgo"
 
 	"github.com/DouDOU-start/airgate-openai/backend/internal/model"
 )
@@ -23,6 +23,7 @@ import (
 type OpenAIGateway struct {
 	logger        *slog.Logger
 	ctx           sdk.PluginContext
+	host          sdk.Host
 	snapshotStore *codexUsagePersistenceStore
 	transportPool *TransportPool
 }
@@ -39,6 +40,9 @@ func (g *OpenAIGateway) Init(ctx sdk.PluginContext) error {
 	}
 	if g.logger == nil {
 		g.logger = slog.Default()
+	}
+	if hostAware, ok := ctx.(sdk.HostAware); ok {
+		g.host = hostAware.Host()
 	}
 	if ctx != nil && ctx.Config() != nil {
 		if dsn := ctx.Config().GetString("db_dsn"); dsn != "" {
@@ -202,7 +206,7 @@ const ReauthRequiredPrefix = "reauth_required: "
 // QueryQuota 查询账号额度
 // OAuth 账号：刷新 token 并从 id_token 中提取订阅信息；refresh_token 失效时降级解析存储的 access_token
 // API Key 账号：不支持额度查询
-func (g *OpenAIGateway) QueryQuota(ctx context.Context, credentials map[string]string) (*sdk.QuotaInfo, error) {
+func (g *OpenAIGateway) QueryQuota(ctx context.Context, credentials map[string]string) (*quotaInfo, error) {
 	refreshToken := credentials["refresh_token"]
 	if refreshToken == "" {
 		return nil, sdk.ErrNotSupported
@@ -241,7 +245,7 @@ func (g *OpenAIGateway) QueryQuota(ctx context.Context, credentials map[string]s
 			if info.Email != "" {
 				extra["email"] = info.Email
 			}
-			return &sdk.QuotaInfo{
+			return &quotaInfo{
 				ExpiresAt: info.SubscriptionActiveUntil,
 				Extra:     extra,
 			}, nil
@@ -272,7 +276,7 @@ func (g *OpenAIGateway) QueryQuota(ctx context.Context, credentials map[string]s
 		extra["refresh_token"] = tokens.RefreshToken
 	}
 
-	return &sdk.QuotaInfo{
+	return &quotaInfo{
 		ExpiresAt: info.SubscriptionActiveUntil,
 		Extra:     extra,
 	}, nil
@@ -399,7 +403,7 @@ func (g *OpenAIGateway) probeOAuthUsage(ctx context.Context, accountID int64, cr
 }
 
 func appendCodexUsageWindow(
-	windows []sdk.AccountUsageWindow,
+	windows []accountUsageWindow,
 	key string,
 	label string,
 	usedPercent *float64,
@@ -407,7 +411,7 @@ func appendCodexUsageWindow(
 	base time.Time,
 	now time.Time,
 	force bool,
-) []sdk.AccountUsageWindow {
+) []accountUsageWindow {
 	if !force && usedPercent == nil && resetAfterSeconds == nil {
 		return windows
 	}
@@ -417,13 +421,13 @@ func appendCodexUsageWindow(
 	}
 	var resetAt *time.Time
 	if resetAfterSeconds != nil {
-		resetAt = sdk.ResetAtFromBase(base, *resetAfterSeconds)
+		resetAt = resetAtFromBase(base, *resetAfterSeconds)
 	}
-	return append(windows, sdk.NewAccountUsageWindow(key, label, used, resetAt, now))
+	return append(windows, newAccountUsageWindow(key, label, used, resetAt, now))
 }
 
-func buildCodexUsageWindows(snapshot *CodexUsageSnapshot, limitName string, now time.Time) []sdk.AccountUsageWindow {
-	windows := make([]sdk.AccountUsageWindow, 0, 4)
+func buildCodexUsageWindows(snapshot *CodexUsageSnapshot, limitName string, now time.Time) []accountUsageWindow {
+	windows := make([]accountUsageWindow, 0, 4)
 	if snapshot == nil {
 		return windows
 	}
@@ -517,13 +521,13 @@ func (g *OpenAIGateway) HandleRequest(ctx context.Context, _, path, _ string, _ 
 			return http.StatusBadRequest, nil, jsonError("invalid request body"), nil
 		}
 
-		result := make(map[string]sdk.AccountUsageInfo)
-		var probeErrors []sdk.AccountUsageError
+		result := make(map[string]accountUsageInfo)
+		var probeErrors []accountUsageError
 		now := time.Now()
 		for _, a := range accounts {
 			// 检查是否有探测时发现的凭证错误
 			if errMsg := GetProbeError(a.ID); errMsg != "" {
-				probeErrors = append(probeErrors, sdk.AccountUsageError{ID: a.ID, Message: errMsg})
+				probeErrors = append(probeErrors, accountUsageError{ID: a.ID, Message: errMsg})
 			}
 			snapshot := GetCodexUsage(a.ID)
 			if snapshot == nil {
@@ -531,19 +535,19 @@ func (g *OpenAIGateway) HandleRequest(ctx context.Context, _, path, _ string, _ 
 			}
 			// 再次检查（ProbeUsage 刚产生的错误）
 			if errMsg := GetProbeError(a.ID); errMsg != "" {
-				probeErrors = append(probeErrors, sdk.AccountUsageError{ID: a.ID, Message: errMsg})
+				probeErrors = append(probeErrors, accountUsageError{ID: a.ID, Message: errMsg})
 			}
 			if snapshot == nil {
 				continue
 			}
 
-			usage := sdk.AccountUsageInfo{
+			usage := accountUsageInfo{
 				UpdatedAt: snapshot.CapturedAt.UTC().Format(time.RFC3339),
 				Windows:   buildCodexUsageWindows(snapshot, snapshot.LimitName, now),
 			}
 			// Credits
 			if snapshot.CreditsHasCredits {
-				usage.Credits = &sdk.AccountUsageCredits{
+				usage.Credits = &accountUsageCredits{
 					Balance:   snapshot.CreditsBalance,
 					Unlimited: snapshot.CreditsUnlimited,
 				}
@@ -553,7 +557,7 @@ func (g *OpenAIGateway) HandleRequest(ctx context.Context, _, path, _ string, _ 
 				result[strconv.FormatInt(a.ID, 10)] = usage
 			}
 		}
-		return http.StatusOK, nil, jsonMarshal(sdk.AccountUsageAccountsResponse{
+		return http.StatusOK, nil, jsonMarshal(accountUsageAccountsResponse{
 			Accounts: result,
 			Errors:   probeErrors,
 		}), nil

@@ -12,7 +12,7 @@ import (
 
 	"github.com/tidwall/gjson"
 
-	sdk "github.com/DouDOU-start/airgate-sdk"
+	sdk "github.com/DouDOU-start/airgate-sdk/sdkgo"
 )
 
 func TestEstimateAnthropicInputTokensCountsSystemMessagesAndTools(t *testing.T) {

@@ -4,7 +4,7 @@ import (
 	"sort"
 	"strings"
 
-	sdk "github.com/DouDOU-start/airgate-sdk"
+	sdk "github.com/DouDOU-start/airgate-sdk/sdkgo"
 )
 
 // ──────────────────────────────────────────────────────
@@ -198,7 +198,7 @@ func AllSpecs(includeImages bool) []sdk.ModelInfo {
 	return models
 }
 
-// AllModels 返回所有注册模型（不过滤），用于插件 manifest 注册。
+// AllModels 返回所有注册模型（不过滤），用于插件运行时声明。
 func AllModels() []sdk.ModelInfo {
 	models := make([]sdk.ModelInfo, 0, len(registry))
 	for id, spec := range registry {
@@ -210,28 +210,41 @@ func AllModels() []sdk.ModelInfo {
 	return models
 }
 
-// toModelInfo 将内部 Spec 映射为 SDK ModelInfo，供 manifest 生成与费用计算共用。
+// AllPricingSpecs 返回所有注册模型的插件私有规格（按 ID 排序）。
+//
+// SDK 的 ModelInfo 不承载价格；manifest 如需展示标准价格，应从这里读取插件自己的
+// 计费规格，而不是把价格重新塞回 SDK 结构。
+func AllPricingSpecs() []NamedSpec {
+	items := make([]NamedSpec, 0, len(registry))
+	for id, spec := range registry {
+		items = append(items, NamedSpec{ID: id, Spec: spec})
+	}
+	sort.Slice(items, func(i, j int) bool {
+		return items[i].ID < items[j].ID
+	})
+	return items
+}
+
+// NamedSpec 是带模型 ID 的插件私有规格。
+type NamedSpec struct {
+	ID   string
+	Spec Spec
+}
+
+// toModelInfo 将内部 Spec 映射为 SDK ModelInfo。
 func toModelInfo(id string, spec Spec) sdk.ModelInfo {
 	return sdk.ModelInfo{
-		ID:                          id,
-		Name:                        spec.Name,
-		ContextWindow:               spec.ContextWindow,
-		MaxOutputTokens:             spec.MaxOutputTokens,
-		InputPrice:                  spec.InputPrice,
-		OutputPrice:                 spec.OutputPrice,
-		CachedInputPrice:            spec.CachedPrice,
-		InputPricePriority:          spec.InputPricePriority,
-		OutputPricePriority:         spec.OutputPricePriority,
-		CachedInputPricePriority:    spec.CachedPricePriority,
-		InputPriceFast:              spec.InputPriceFast,
-		OutputPriceFast:             spec.OutputPriceFast,
-		CachedInputPriceFast:        spec.CachedPriceFast,
-		InputPriceFlex:              spec.InputPriceFlex,
-		OutputPriceFlex:             spec.OutputPriceFlex,
-		CachedInputPriceFlex:        spec.CachedPriceFlex,
-		LongContextThreshold:        spec.LongContextThreshold,
-		LongContextInputMultiplier:  spec.LongContextInputMultiplier,
-		LongContextOutputMultiplier: spec.LongContextOutputMultiplier,
-		LongContextCachedMultiplier: spec.LongContextCachedMultiplier,
+		ID:              id,
+		Name:            spec.Name,
+		ContextWindow:   spec.ContextWindow,
+		MaxOutputTokens: spec.MaxOutputTokens,
+		Capabilities:    modelCapabilities(spec),
 	}
+}
+
+func modelCapabilities(spec Spec) []string {
+	if spec.ImagePrice > 0 {
+		return []string{sdk.ModelCapImageGeneration}
+	}
+	return []string{sdk.ModelCapChat, sdk.ModelCapReasoning}
 }

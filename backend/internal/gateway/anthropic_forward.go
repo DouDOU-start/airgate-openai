@@ -13,7 +13,7 @@ import (
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 
-	sdk "github.com/DouDOU-start/airgate-sdk"
+	sdk "github.com/DouDOU-start/airgate-sdk/sdkgo"
 )
 
 // ──────────────────────────────────────────────────────
@@ -540,15 +540,15 @@ func (g *OpenAIGateway) handleAnthropicNonStreamFromResponses(
 	)
 
 	elapsed := time.Since(start)
-	usage := &sdk.Usage{
-		Model:                 billingModel,
-		InputTokens:           wsResult.InputTokens,
-		OutputTokens:          wsResult.OutputTokens,
-		CachedInputTokens:     wsResult.CachedInputTokens,
-		ReasoningOutputTokens: wsResult.ReasoningOutputTokens,
-		ServiceTier:           serviceTier,
-		FirstTokenMs:          elapsed.Milliseconds(),
-	}
+	usage := newTokenUsage(
+		billingModel,
+		serviceTier,
+		wsResult.InputTokens,
+		wsResult.OutputTokens,
+		wsResult.CachedInputTokens,
+		wsResult.ReasoningOutputTokens,
+		elapsed.Milliseconds(),
+	)
 	fillUsageCost(usage)
 	return sdk.ForwardOutcome{
 		Kind:     sdk.OutcomeSuccess,

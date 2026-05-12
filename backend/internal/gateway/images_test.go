@@ -23,7 +23,7 @@ import (
 	"github.com/gorilla/websocket"
 	"github.com/tidwall/gjson"
 
-	sdk "github.com/DouDOU-start/airgate-sdk"
+	sdk "github.com/DouDOU-start/airgate-sdk/sdkgo"
 )
 
 func testPNGDataURL(width, height int, pixel func(int, int) color.RGBA) string {
@@ -228,21 +228,21 @@ func TestHandleImagesResponse_TokenAttribution(t *testing.T) {
 	if u.Model != "gpt-image-1.5" {
 		t.Errorf("Model = %q, want gpt-image-1.5", u.Model)
 	}
-	if u.InputTokens != 40 {
-		t.Errorf("InputTokens = %d, want 40 (50 - 10 cached)", u.InputTokens)
+	if got := usageMetricInt(u, usageMetricInputTokens); got != 40 {
+		t.Errorf("input_tokens = %d, want 40 (50 - 10 cached)", got)
 	}
-	if u.OutputTokens != 4160 {
-		t.Errorf("OutputTokens = %d, want 4160", u.OutputTokens)
+	if got := usageMetricInt(u, usageMetricOutputTokens); got != 4160 {
+		t.Errorf("output_tokens = %d, want 4160", got)
 	}
-	if u.CachedInputTokens != 10 {
-		t.Errorf("CachedInputTokens = %d, want 10", u.CachedInputTokens)
+	if got := usageMetricInt(u, usageMetricCachedInputTokens); got != 10 {
+		t.Errorf("cached_input_tokens = %d, want 10", got)
 	}
 
-	if !almostEqual(u.InputCost, 0, 1e-9) {
-		t.Errorf("InputCost = %v, want 0 (per-image billing)", u.InputCost)
+	if got := usageCostByKey(u, usageCostInput); !almostEqual(got, 0, 1e-9) {
+		t.Errorf("input cost = %v, want 0 (per-image billing)", got)
 	}
-	if !almostEqual(u.OutputCost, 0.20, 1e-9) {
-		t.Errorf("OutputCost = %v, want 0.20 (1 image × 2K tier $0.20)", u.OutputCost)
+	if !almostEqual(u.AccountCost, 0.20, 1e-9) {
+		t.Errorf("AccountCost = %v, want 0.20 (1 image × 2K tier $0.20)", u.AccountCost)
 	}
 
 	if w.Code != http.StatusOK {
@@ -311,11 +311,11 @@ func TestHandleImagesResponse_APIKeyBillingUsesRequestSize(t *testing.T) {
 	if err != nil {
 		t.Fatalf("handleImagesResponse returned err: %v", err)
 	}
-	if got, want := outcome.Usage.OutputCost, 0.80; !almostEqual(got, want, 1e-9) {
-		t.Fatalf("OutputCost = %v, want %v (2 images × 4K tier $0.40)", got, want)
+	if got, want := outcome.Usage.AccountCost, 0.80; !almostEqual(got, want, 1e-9) {
+		t.Fatalf("AccountCost = %v, want %v (2 images × 4K tier $0.40)", got, want)
 	}
-	if got, want := outcome.Usage.OutputPrice, 0.40; !almostEqual(got, want, 1e-9) {
-		t.Fatalf("OutputPrice = %v, want %v", got, want)
+	if got, want := usageImageUnitPrice(outcome.Usage), "0.4"; got != want {
+		t.Fatalf("image unit_price = %q, want %q", got, want)
 	}
 }
 
@@ -363,8 +363,8 @@ func TestHandleImagesResponse_FallbackModelWhenBodyLacksModel(t *testing.T) {
 	if outcome.Upstream.Headers.Get("Content-Type") != "application/json" {
 		t.Errorf("Upstream.Headers Content-Type not preserved")
 	}
-	if outcome.Usage.OutputCost <= 0 {
-		t.Errorf("OutputCost = %v, want > 0", outcome.Usage.OutputCost)
+	if outcome.Usage.AccountCost <= 0 {
+		t.Errorf("AccountCost = %v, want > 0", outcome.Usage.AccountCost)
 	}
 }
 
@@ -375,11 +375,11 @@ func TestFillUsageCostPerImage(t *testing.T) {
 	}
 	fillUsageCostPerImage(usage, 3)
 	// 3 张 × $0.20 = 0.60
-	if !almostEqual(usage.OutputCost, 0.60, 1e-9) {
-		t.Errorf("OutputCost = %v, want 0.60", usage.OutputCost)
+	if !almostEqual(usage.AccountCost, 0.60, 1e-9) {
+		t.Errorf("AccountCost = %v, want 0.60", usage.AccountCost)
 	}
-	if !almostEqual(usage.InputCost, 0, 1e-9) {
-		t.Errorf("InputCost = %v, want 0", usage.InputCost)
+	if !almostEqual(usageCostByKey(usage, usageCostInput), 0, 1e-9) {
+		t.Errorf("input cost = %v, want 0", usageCostByKey(usage, usageCostInput))
 	}
 }
 
@@ -455,14 +455,38 @@ func TestFillUsageCostPerImageBySize(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			usage := &sdk.Usage{Model: "gpt-image-2"}
 			fillUsageCostPerImageBySize(usage, tc.numImages, tc.size)
-			if !almostEqual(usage.OutputCost, tc.want, 1e-9) {
-				t.Errorf("OutputCost = %v, want %v", usage.OutputCost, tc.want)
+			if !almostEqual(usage.AccountCost, tc.want, 1e-9) {
+				t.Errorf("AccountCost = %v, want %v", usage.AccountCost, tc.want)
 			}
-			if !almostEqual(usage.InputCost, 0, 1e-9) {
-				t.Errorf("InputCost = %v, want 0", usage.InputCost)
+			if !almostEqual(usageCostByKey(usage, usageCostInput), 0, 1e-9) {
+				t.Errorf("input cost = %v, want 0", usageCostByKey(usage, usageCostInput))
 			}
 		})
 	}
+}
+
+func usageCostByKey(usage *sdk.Usage, key string) float64 {
+	if usage == nil {
+		return 0
+	}
+	for _, detail := range usage.CostDetails {
+		if detail.Key == key {
+			return detail.AccountCost
+		}
+	}
+	return 0
+}
+
+func usageImageUnitPrice(usage *sdk.Usage) string {
+	if usage == nil {
+		return ""
+	}
+	for _, detail := range usage.CostDetails {
+		if detail.Key == usageCostImage {
+			return detail.Metadata["unit_price"]
+		}
+	}
+	return ""
 }
 
 func almostEqual(a, b, eps float64) bool {
@@ -511,8 +535,8 @@ func TestParseSSEUsage_ToolImageGen(t *testing.T) {
 	if usage.Model != "gpt-5.4" {
 		t.Errorf("Model = %q, want gpt-5.4", usage.Model)
 	}
-	if usage.InputTokens != 100 || usage.OutputTokens != 50 {
-		t.Errorf("Input/Output = %d/%d, want 100/50", usage.InputTokens, usage.OutputTokens)
+	if usageMetricInt(usage, usageMetricInputTokens) != 100 || usageMetricInt(usage, usageMetricOutputTokens) != 50 {
+		t.Errorf("Input/Output = %d/%d, want 100/50", usageMetricInt(usage, usageMetricInputTokens), usageMetricInt(usage, usageMetricOutputTokens))
 	}
 	if toolIn != 8 || toolOut != 4160 {
 		t.Errorf("toolIn/Out = %d/%d, want 8/4160", toolIn, toolOut)
@@ -522,41 +546,32 @@ func TestParseSSEUsage_ToolImageGen(t *testing.T) {
 // TestFillUsageCostWithImageTool 叠加计费：主 model (gpt-5.4) 的 chat token 按
 // 其单价、image tool 按张计费 $0.20/张。
 func TestFillUsageCostWithImageTool(t *testing.T) {
-	usage := &sdk.Usage{
-		Model:        "gpt-5.4",
-		InputTokens:  1000,
-		OutputTokens: 500,
-	}
+	usage := newTokenUsage("gpt-5.4", "", 1000, 500, 0, 0, 0)
 	fillUsageCostWithImageTool(usage, 1)
 
 	// 主 gpt-5.4 standard: input=$2.5/1M → 0.0025, output=$15/1M → 0.0075
 	// image tool: 1 张 × $0.20 = 0.20
-	// total InputCost  = 0.0025
-	// total OutputCost = 0.0075 + 0.20 = 0.2075
-	if !almostEqual(usage.InputCost, 0.0025, 1e-9) {
-		t.Errorf("InputCost = %v, want 0.0025", usage.InputCost)
+	// total account cost = 0.0025 + 0.0075 + 0.20 = 0.2100
+	if !almostEqual(usageCostByKey(usage, usageCostInput), 0.0025, 1e-9) {
+		t.Errorf("input cost = %v, want 0.0025", usageCostByKey(usage, usageCostInput))
 	}
-	if !almostEqual(usage.OutputCost, 0.2075, 1e-9) {
-		t.Errorf("OutputCost = %v, want 0.2075", usage.OutputCost)
+	if !almostEqual(usage.AccountCost, 0.2100, 1e-9) {
+		t.Errorf("AccountCost = %v, want 0.2100", usage.AccountCost)
 	}
-	if !almostEqual(usage.InputPrice, 2.5, 1e-9) {
-		t.Errorf("InputPrice = %v, want 2.5 (gpt-5.4 standard)", usage.InputPrice)
+	if got := usage.Metrics[0].Metadata["unit_price"]; got != "2.5" {
+		t.Errorf("input unit_price = %q, want 2.5", got)
 	}
 }
 
 // TestFillUsageCostWithImageTool_NoToolUsage 退化为 fillUsageCost 行为不变。
 func TestFillUsageCostWithImageTool_NoToolUsage(t *testing.T) {
-	usage := &sdk.Usage{
-		Model:        "gpt-5.4",
-		InputTokens:  1000,
-		OutputTokens: 500,
-	}
+	usage := newTokenUsage("gpt-5.4", "", 1000, 500, 0, 0, 0)
 	fillUsageCostWithImageTool(usage, 0)
-	if usage.InputTokens != 1000 || usage.OutputTokens != 500 {
+	if usageMetricInt(usage, usageMetricInputTokens) != 1000 || usageMetricInt(usage, usageMetricOutputTokens) != 500 {
 		t.Errorf("token counts mutated when no image tool usage")
 	}
-	if !almostEqual(usage.InputCost, 0.0025, 1e-9) {
-		t.Errorf("InputCost = %v, want 0.0025", usage.InputCost)
+	if !almostEqual(usageCostByKey(usage, usageCostInput), 0.0025, 1e-9) {
+		t.Errorf("input cost = %v, want 0.0025", usageCostByKey(usage, usageCostInput))
 	}
 }
 
@@ -1100,24 +1115,16 @@ func TestBuildImagesRESTResponse_ChainedCostParity(t *testing.T) {
 	ws := WSResult{ImageGenCalls: []ImageGenCall{{Result: "X"}}}
 	body := buildImagesRESTResponse(ws, promptTokens, imageOut, "gpt-image-2")
 
-	inner := &sdk.Usage{
-		Model:        "gpt-image-2",
-		InputTokens:  promptTokens,
-		OutputTokens: imageOut,
-	}
+	inner := newTokenUsage("gpt-image-2", "", promptTokens, imageOut, 0, 0, 0)
 	fillUsageCost(inner)
-	innerCost := inner.InputCost + inner.OutputCost
+	innerCost := inner.AccountCost
 
 	var got map[string]any
 	_ = json.Unmarshal(body, &got)
 	u := got["usage"].(map[string]any)
-	outer := &sdk.Usage{
-		Model:        got["model"].(string),
-		InputTokens:  int(u["input_tokens"].(float64)),
-		OutputTokens: int(u["output_tokens"].(float64)),
-	}
+	outer := newTokenUsage(got["model"].(string), "", int(u["input_tokens"].(float64)), int(u["output_tokens"].(float64)), 0, 0, 0)
 	fillUsageCost(outer)
-	outerCost := outer.InputCost + outer.OutputCost
+	outerCost := outer.AccountCost
 
 	if innerCost != outerCost {
 		t.Errorf("cost mismatch: inner=%.6f outer=%.6f", innerCost, outerCost)

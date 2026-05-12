@@ -30,7 +30,7 @@ AirGate OpenAI 不是又一个"OpenAI 转发服务"，而是 [airgate-core](http
 - **🎯 模型降级与重试** — Anthropic 转发链路在模型不存在 / 被拒时自动降级到映射表里的下一个候选
 - **🧠 上下文裁剪** — 历史消息超窗时按规则截断，避免上游 400
 - **🪄 系统提示词预设** — 内置 default / simple / nsfw / cc 四套 Codex 提示词，按账号选择
-- **💼 完整账号 Widget** — 自带前端账号表单（OAuth 引导面板、字段提示、状态展示），由 core 自动嵌入管理后台
+- **💼 账号前端 Widget** — 自带创建/编辑账号表单（OAuth 引导面板、字段提示、状态展示），由 core 自动嵌入管理后台
 - **📦 一键发版** — git tag 触发 release workflow，矩阵构建 4 个平台（linux/darwin × amd64/arm64），自动注入版本号、上传 sha256
 
 ## 🧩 接入位置
@@ -77,11 +77,11 @@ AirGate OpenAI 不是又一个"OpenAI 转发服务"，而是 [airgate-core](http
                                           ▼
                                      ForwardResult
                                   ┌───────┴───────┐
-                              token 用量      账号状态反馈
-                              Core 计费       Core 更新账号
+                              标准用量/成本   账号状态反馈
+                              Core 入库扣费   Core 更新账号
 ```
 
-`Forward()` 拿到 core 调度好的账号，识别请求是 Anthropic Messages 还是 OpenAI 原生，再分发到 `forwardAPIKey`（HTTP/SSE 直连）或 `forwardOAuth`（WebSocket 桥接）。
+`Forward()` 拿到 core 调度好的账号，识别请求是 Anthropic Messages、OpenAI 原生还是 Images API，再分发到 `forwardAPIKey`（HTTP/SSE 直连）或 `forwardOAuth`（WebSocket 桥接）。插件负责计算平台标准用量与标准成本，core 负责统一入库并按用户倍率扣费。
 
 ## 🚦 路由
 
@@ -94,6 +94,10 @@ AirGate OpenAI 不是又一个"OpenAI 转发服务"，而是 [airgate-core](http
 | POST | `/v1/messages` | Anthropic Messages API（协议翻译）|
 | POST | `/v1/messages/count_tokens` | Anthropic Count Tokens（兼容回退）|
 | GET  | `/v1/models` | 模型列表 |
+| POST | `/v1/images/generations` | Images API（文生图） |
+| POST | `/v1/images/edits` | Images API（图生图 / 编辑） |
+| GET  | `/v1/images/tasks` | Images Task 状态查询 |
+| GET  | `/v1/images/tasks/list` | Images Task 历史列表 |
 | WS   | `/v1/responses` | Responses API（WebSocket）|
 
 另外提供不带 `/v1` 前缀的别名路由（`POST /responses`、`POST /chat/completions`、`POST /messages`、`GET /models`、`WS /responses` 等），方便客户端直接填站点根地址。
@@ -111,7 +115,7 @@ AirGate OpenAI 不是又一个"OpenAI 转发服务"，而是 [airgate-core](http
 
 | 层 | 技术 |
 |---|---|
-| 后端 | Go 1.25 · gRPC · gjson/sjson（零 struct）· nhooyr.io/websocket |
+| 后端 | Go 1.25 · gRPC · gjson/sjson（零 struct）· gorilla/websocket |
 | 前端 | React 19 · Vite · TypeScript（账号表单 Widget） |
 | 插件协议 | hashicorp/go-plugin (gRPC) |
 | 上游协议 | OpenAI Responses / Chat Completions · ChatGPT WebSocket · Anthropic Messages |

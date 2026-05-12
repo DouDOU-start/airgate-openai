@@ -4,7 +4,7 @@ import (
 	"net/http"
 	"testing"
 
-	sdk "github.com/DouDOU-start/airgate-sdk"
+	sdk "github.com/DouDOU-start/airgate-sdk/sdkgo"
 )
 
 func TestPassHeadersForAccount_Sub2APIStripsClientIdentityHeaders(t *testing.T) {

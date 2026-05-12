@@ -8,7 +8,7 @@ import (
 
 	"github.com/gorilla/websocket"
 
-	sdk "github.com/DouDOU-start/airgate-sdk"
+	sdk "github.com/DouDOU-start/airgate-sdk/sdkgo"
 )
 
 // wsDialResult 封装 DialWebSocket 的认证失败信息

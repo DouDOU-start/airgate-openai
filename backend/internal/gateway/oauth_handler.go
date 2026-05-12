@@ -8,8 +8,8 @@ import (
 	"strconv"
 	"strings"
 
-	sdk "github.com/DouDOU-start/airgate-sdk"
-	"github.com/DouDOU-start/airgate-sdk/devserver"
+	"github.com/DouDOU-start/airgate-sdk/devkit/devserver"
+	sdk "github.com/DouDOU-start/airgate-sdk/sdkgo"
 )
 
 // OAuthDevHandler devserver 的 OAuth HTTP handler

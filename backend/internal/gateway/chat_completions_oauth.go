@@ -12,7 +12,7 @@ import (
 
 	"github.com/tidwall/gjson"
 
-	sdk "github.com/DouDOU-start/airgate-sdk"
+	sdk "github.com/DouDOU-start/airgate-sdk/sdkgo"
 )
 
 // OAuth/Codex 上游永远返回 Responses API 的 SSE 流，但客户端走

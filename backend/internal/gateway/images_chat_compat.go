@@ -11,7 +11,7 @@ import (
 	"github.com/tidwall/gjson"
 
 	"github.com/DouDOU-start/airgate-openai/backend/internal/model"
-	sdk "github.com/DouDOU-start/airgate-sdk"
+	sdk "github.com/DouDOU-start/airgate-sdk/sdkgo"
 )
 
 // forwardChatCompletionsAsImages 拦截下游平台（如 new-api）把图像模型

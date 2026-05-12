@@ -1,6 +1,6 @@
 package gateway
 
-import sdk "github.com/DouDOU-start/airgate-sdk"
+import sdk "github.com/DouDOU-start/airgate-sdk/sdkgo"
 
 //go:generate go run ../../cmd/genmanifest
 
@@ -36,9 +36,14 @@ func BuildPluginInfo() sdk.PluginInfo {
 		Description: PluginDescription,
 		Author:      PluginAuthor,
 		Type:        sdk.PluginTypeGateway,
-		// gateway 插件不调用 HostService，不声明任何 capability。
-		// 显式声明空 slice 让 core 不再走 sdk_version 兼容路径，正式进入 0.3.0 capability 模型。
-		Capabilities: []sdk.Capability{},
+		Capabilities: []sdk.Capability{
+			sdk.CapabilityHostInvoke,
+			sdk.CapabilityForHostMethod(hostMethodTasksCreate),
+			sdk.CapabilityForHostMethod(hostMethodTasksUpdate),
+			sdk.CapabilityForHostMethod(hostMethodTasksGet),
+			sdk.CapabilityForHostMethod(hostMethodTasksList),
+			sdk.CapabilityForHostMethod(hostMethodGatewayForward),
+		},
 		AccountTypes: []sdk.AccountType{
 			{
 				Key:         "apikey",
@@ -61,7 +66,8 @@ func BuildPluginInfo() sdk.PluginInfo {
 			},
 		},
 		FrontendWidgets: []sdk.FrontendWidget{
-			{Slot: sdk.SlotAccountForm, EntryFile: "index.js", Title: "账号表单"},
+			{Slot: sdk.SlotAccountCreate, EntryFile: "index.js", Title: "创建 OpenAI 账号"},
+			{Slot: sdk.SlotAccountEdit, EntryFile: "index.js", Title: "编辑 OpenAI 账号"},
 		},
 		InstructionPresets: []string{"default", "simple", "nsfw", "cc"},
 	}
@@ -76,6 +82,8 @@ func PluginRouteDefinitions() []sdk.RouteDefinition {
 		{Method: "GET", Path: "/v1/models", Description: "模型列表"},
 		{Method: "POST", Path: "/v1/images/generations", Description: "Images API（文生图）"},
 		{Method: "POST", Path: "/v1/images/edits", Description: "Images API（图生图 / 编辑）"},
+		{Method: "GET", Path: "/v1/images/tasks", Description: "Images Task 状态查询"},
+		{Method: "GET", Path: "/v1/images/tasks/list", Description: "Images Task 历史列表"},
 		{Method: "WS", Path: "/v1/responses", Description: "Responses API（WebSocket）"},
 		// 不带 /v1 前缀的别名路由，方便用户配置时直接使用站点根地址
 		{Method: "POST", Path: "/responses", Description: "Responses API（无 /v1 前缀）"},
@@ -85,6 +93,8 @@ func PluginRouteDefinitions() []sdk.RouteDefinition {
 		{Method: "GET", Path: "/models", Description: "模型列表（无 /v1 前缀）"},
 		{Method: "POST", Path: "/images/generations", Description: "Images API（文生图，无 /v1 前缀）"},
 		{Method: "POST", Path: "/images/edits", Description: "Images API（图生图，无 /v1 前缀）"},
+		{Method: "GET", Path: "/images/tasks", Description: "Images Task 状态查询（无 /v1 前缀）"},
+		{Method: "GET", Path: "/images/tasks/list", Description: "Images Task 历史列表（无 /v1 前缀）"},
 		{Method: "WS", Path: "/responses", Description: "Responses API WebSocket（无 /v1 前缀）"},
 	}
 }

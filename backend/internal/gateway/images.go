@@ -26,7 +26,7 @@ import (
 
 	"github.com/tidwall/gjson"
 
-	sdk "github.com/DouDOU-start/airgate-sdk"
+	sdk "github.com/DouDOU-start/airgate-sdk/sdkgo"
 )
 
 // imagesOAuthChatModel OAuth 下 REST→tools 翻译时使用的主 chat 模型。
@@ -47,6 +47,11 @@ const imagesPassthroughInstructions = "Use the user's image description and appe
 
 const maxResponsesInputImageBytes = 2 * 1024 * 1024
 const maxRemoteImageBytes = 25 * 1024 * 1024
+
+// maxEditInputImageBytes 图生图（/images/edits）参考图单张上限。
+// API Key 和 Web Reverse 路径在转发前把超限图片压缩到此阈值以内，
+// 避免多张大图导致上游超时或拒绝。
+const maxEditInputImageBytes = 4 * 1024 * 1024
 
 // imageGenOutputTokenTable 按 OpenAI 官方 image_generation tool 的 token 换算表，
 // 用于 ChatGPT OAuth 账号（上游 tool_usage.image_gen 永远为 0）时估算 output token。
@@ -214,13 +219,14 @@ func buildAPIKeyImagesEditMultipartBody(body []byte, contentType string) ([]byte
 		if len(req.Images) > 1 {
 			fieldName = "image[]"
 		}
-		if err := writeMultipartImageRef(mw, fieldName, fmt.Sprintf("image-%d", i+1), ref); err != nil {
+		if err := writeMultipartImageRef(mw, fieldName, fmt.Sprintf("image-%d", i+1), ref, maxEditInputImageBytes); err != nil {
 			_ = mw.Close()
 			return nil, "", err
 		}
 	}
 	if req.Mask != "" {
-		if err := writeMultipartImageRef(mw, "mask", "mask", req.Mask); err != nil {
+		// mask 不压缩：透明度信息不能转 JPEG
+		if err := writeMultipartImageRef(mw, "mask", "mask", req.Mask, 0); err != nil {
 			_ = mw.Close()
 			return nil, "", err
 		}
@@ -231,10 +237,16 @@ func buildAPIKeyImagesEditMultipartBody(body []byte, contentType string) ([]byte
 	return buf.Bytes(), mw.FormDataContentType(), nil
 }
 
-func writeMultipartImageRef(mw *multipart.Writer, fieldName, baseName, ref string) error {
+func writeMultipartImageRef(mw *multipart.Writer, fieldName, baseName, ref string, shrinkLimit int) error {
 	mimeType, data, err := decodeDataImageURL(ref)
 	if err != nil {
 		return err
+	}
+	if shrinkLimit > 0 {
+		data, mimeType, err = shrinkImageBytes(data, mimeType, shrinkLimit)
+		if err != nil {
+			return err
+		}
 	}
 	ext := ".png"
 	switch mimeType {
@@ -847,28 +859,11 @@ func shrinkResponsesInputImageRef(ref string) (string, error) {
 }
 
 func encodeJPEGDataURLWithinLimit(img image.Image, limit int) (string, error) {
-	bounds := img.Bounds()
-	width, height := bounds.Dx(), bounds.Dy()
-	if width <= 0 || height <= 0 {
-		return "", fmt.Errorf("图片尺寸无效")
+	data, _, err := encodeJPEGWithinLimit(img, limit)
+	if err != nil {
+		return "", err
 	}
-	current := img
-	for range 10 {
-		var buf bytes.Buffer
-		if err := jpeg.Encode(&buf, flattenForJPEG(current), &jpeg.Options{Quality: 85}); err != nil {
-			return "", err
-		}
-		if buf.Len() <= limit {
-			return "data:image/jpeg;base64," + base64.StdEncoding.EncodeToString(buf.Bytes()), nil
-		}
-		width = width * 3 / 4
-		height = height * 3 / 4
-		if width < 256 || height < 256 {
-			break
-		}
-		current = resizeImageNearest(img, width, height)
-	}
-	return "", fmt.Errorf("图片过大，请压缩到 %dMB 以内后重试", limit/(1024*1024))
+	return "data:image/jpeg;base64," + base64.StdEncoding.EncodeToString(data), nil
 }
 
 func flattenForJPEG(img image.Image) *image.RGBA {
@@ -887,6 +882,46 @@ func resizeImageNearest(img image.Image, width, height int) *image.RGBA {
 		}
 	}
 	return out
+}
+
+// shrinkImageBytes 把原始图片字节压缩到 limit 以内。
+// 已经在限制内的直接返回；超限则转 JPEG 并逐步缩小尺寸。
+// 返回压缩后的字节和 MIME 类型。
+func shrinkImageBytes(data []byte, mimeType string, limit int) ([]byte, string, error) {
+	if len(data) <= limit {
+		return data, mimeType, nil
+	}
+	img, _, err := image.Decode(bytes.NewReader(data))
+	if err != nil {
+		return nil, "", fmt.Errorf("图片过大且无法解码进行压缩: %w", err)
+	}
+	return encodeJPEGWithinLimit(img, limit)
+}
+
+// encodeJPEGWithinLimit 把 image.Image 编码为 JPEG，逐步缩小直到字节数 <= limit。
+func encodeJPEGWithinLimit(img image.Image, limit int) ([]byte, string, error) {
+	bounds := img.Bounds()
+	width, height := bounds.Dx(), bounds.Dy()
+	if width <= 0 || height <= 0 {
+		return nil, "", fmt.Errorf("图片尺寸无效")
+	}
+	current := img
+	for range 10 {
+		var buf bytes.Buffer
+		if err := jpeg.Encode(&buf, flattenForJPEG(current), &jpeg.Options{Quality: 85}); err != nil {
+			return nil, "", err
+		}
+		if buf.Len() <= limit {
+			return buf.Bytes(), "image/jpeg", nil
+		}
+		width = width * 3 / 4
+		height = height * 3 / 4
+		if width < 256 || height < 256 {
+			break
+		}
+		current = resizeImageNearest(img, width, height)
+	}
+	return nil, "", fmt.Errorf("图片过大，请压缩到 %dMB 以内后重试", limit/(1024*1024))
 }
 
 func encodePNGBase64(img image.Image) (string, error) {
@@ -1266,11 +1301,7 @@ func (g *OpenAIGateway) forwardImagesViaResponsesTool(ctx context.Context, req *
 	// 计费按 OpenAI Images API 官方口径：prompt tokens + 图像输出 tokens。
 	// 上游 instructions / 工具调用包装产生的额外 chat tokens 由内层吸收（OAuth 订阅账号无逐 token 成本）。
 	billingModel := imageGenerationBillingModel(wsResult.ToolImageModel, imgReq.Model)
-	usage := &sdk.Usage{
-		InputTokens:  promptTokens,
-		Model:        billingModel,
-		FirstTokenMs: handler.firstTokenMs,
-	}
+	usage := newTokenUsage(billingModel, "", promptTokens, 0, 0, 0, handler.firstTokenMs)
 	g.logger.Debug("Images OAuth result",
 		"path", reqPath,
 		"request_model", imgReq.Model,
@@ -1310,10 +1341,7 @@ func (g *OpenAIGateway) forwardImagesViaResponsesTool(ctx context.Context, req *
 			billingSize = sz
 		}
 	}
-	// usage.ImageSize 透传到 Core 落到 usage_log.image_size 列，admin 后台用它解释计费
-	// 档位（1K/2K/4K）。auto 计费场景特别有用：用户看到 0.40 美元能立即对照 size 知道
-	// "上游真出了张 4K 图"，不用怀疑是不是算错了。
-	usage.ImageSize = billingSize
+	// 图片尺寸作为通用 UsageAttribute 入库，后台费用明细可用它解释 1K/2K/4K 分档。
 	fillUsageCostPerImageBySize(usage, numImages, billingSize)
 	return outcome, nil
 }
@@ -1466,14 +1494,7 @@ func handleImagesResponseWithLogger(logger *slog.Logger, resp *http.Response, w 
 	)
 
 	elapsed := time.Since(start)
-	usage := &sdk.Usage{
-		InputTokens:       parsed.inputTokens,
-		OutputTokens:      parsed.outputTokens,
-		CachedInputTokens: parsed.cachedInputTokens,
-		Model:             modelName,
-		FirstTokenMs:      elapsed.Milliseconds(),
-	}
-	usage.ImageSize = billSize
+	usage := newTokenUsage(modelName, "", parsed.inputTokens, parsed.outputTokens, parsed.cachedInputTokens, 0, elapsed.Milliseconds())
 	fillUsageCostPerImageBySize(usage, numImages, billSize)
 
 	outcome := sdk.ForwardOutcome{

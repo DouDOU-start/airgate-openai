@@ -16,7 +16,7 @@ import (
 	"strings"
 	"time"
 
-	sdk "github.com/DouDOU-start/airgate-sdk"
+	sdk "github.com/DouDOU-start/airgate-sdk/sdkgo"
 
 	"github.com/DouDOU-start/airgate-openai/backend/internal/gateway/imgen"
 )
@@ -64,11 +64,15 @@ func decodeDataImageRef(ref string) (imgen.ImageInput, error) {
 			return imgen.ImageInput{}, fmt.Errorf("base64 解码失败: %w", err)
 		}
 	}
-	mime := strings.TrimPrefix(header, "data:")
-	if semi := strings.Index(mime, ";"); semi >= 0 {
-		mime = mime[:semi]
+	mimeType := strings.TrimPrefix(header, "data:")
+	if semi := strings.Index(mimeType, ";"); semi >= 0 {
+		mimeType = mimeType[:semi]
 	}
-	return imgen.ImageInput{Data: data, MimeType: mime}, nil
+	data, mimeType, err = shrinkImageBytes(data, mimeType, maxEditInputImageBytes)
+	if err != nil {
+		return imgen.ImageInput{}, fmt.Errorf("压缩参考图片失败: %w", err)
+	}
+	return imgen.ImageInput{Data: data, MimeType: mimeType}, nil
 }
 
 func downloadImageRef(client *http.Client, ref string) (imgen.ImageInput, error) {
@@ -90,6 +94,10 @@ func downloadImageRef(client *http.Client, ref string) (imgen.ImageInput, error)
 	}
 	if len(data) > maxRemoteImageBytes {
 		return imgen.ImageInput{}, fmt.Errorf("参考图片过大")
+	}
+	data, contentType, err = shrinkImageBytes(data, contentType, maxEditInputImageBytes)
+	if err != nil {
+		return imgen.ImageInput{}, fmt.Errorf("压缩参考图片失败: %w", err)
 	}
 	return imgen.ImageInput{Data: data, MimeType: contentType}, nil
 }
@@ -191,7 +199,7 @@ func (g *OpenAIGateway) forwardImagesViaWebReverse(ctx context.Context, req *sdk
 			outcome := failureOutcome(status, nil, nil, err.Error(), parseRetryDelay(err.Error()))
 			outcome.Duration = time.Since(start)
 			if outcome.Usage == nil {
-				outcome.Usage = &sdk.Usage{Model: imagesWebReverseModel}
+				outcome.Usage = newTokenUsage(imagesWebReverseModel, "", 0, 0, 0, 0, 0)
 			}
 			return outcome, err
 		}
@@ -215,10 +223,7 @@ func (g *OpenAIGateway) forwardImagesViaWebReverse(ctx context.Context, req *sdk
 	}
 
 	elapsed := time.Since(start)
-	usage := &sdk.Usage{
-		Model:        imagesWebReverseModel,
-		FirstTokenMs: elapsed.Milliseconds(),
-	}
+	usage := newTokenUsage(imagesWebReverseModel, "", 0, 0, 0, 0, elapsed.Milliseconds())
 	// Web 逆向上游不返 size 字段，直接解码生成的 PNG header 拿真实宽高（O(1)）。
 	// 解码失败 fallback 到请求 size（auto/空时 imagePriceForSize 兜底 1K）。
 	billingSize := imgReq.Size
@@ -227,8 +232,7 @@ func (g *OpenAIGateway) forwardImagesViaWebReverse(ctx context.Context, req *sdk
 			billingSize = fmt.Sprintf("%dx%d", cfg.Width, cfg.Height)
 		}
 	}
-	// 透传到 usage_log.image_size 给 admin 后台展示（详见 forwardImagesViaResponsesTool 的注释）。
-	usage.ImageSize = billingSize
+	// 图片尺寸作为通用 UsageAttribute 入库，后台费用明细可用它解释分档。
 	fillUsageCostPerImageBySize(usage, numImages, billingSize)
 
 	outcome := sdk.ForwardOutcome{

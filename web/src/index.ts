@@ -1,9 +1,10 @@
 import { AccountForm } from './components/AccountForm';
-import type { PluginFrontendModule } from '@airgate/theme/plugin';
+import type { PluginFrontendModule } from '@doudou-start/airgate-theme/plugin';
 import { OpenAIIcon } from './components/OpenAIIcon';
 
 const plugin: PluginFrontendModule = {
-  accountForm: AccountForm,
+  accountCreate: AccountForm,
+  accountEdit: AccountForm,
   platformIcon: OpenAIIcon,
 };
 

@@ -8,7 +8,7 @@ import (
 	"log/slog"
 	"time"
 
-	sdk "github.com/DouDOU-start/airgate-sdk"
+	sdk "github.com/DouDOU-start/airgate-sdk/sdkgo"
 )
 
 // ChatRequirementsResult /backend-api/sentinel/chat-requirements 的产物。

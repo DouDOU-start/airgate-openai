@@ -5,7 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 
-	sdk "github.com/DouDOU-start/airgate-sdk"
+	sdk "github.com/DouDOU-start/airgate-sdk/sdkgo"
 )
 
 // forwardAnthropicCountTokens 返回本地估算，避免客户端把 404 当作不可计数并继续发送过长请求。

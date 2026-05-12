@@ -17,7 +17,7 @@ import (
 	"github.com/tidwall/sjson"
 
 	"github.com/DouDOU-start/airgate-openai/backend/internal/model"
-	sdk "github.com/DouDOU-start/airgate-sdk"
+	sdk "github.com/DouDOU-start/airgate-sdk/sdkgo"
 )
 
 // redactURL 去掉 query string，仅保留 host+path（避免敏感参数泄漏到日志）
@@ -69,6 +69,30 @@ func (g *OpenAIGateway) forwardHTTP(ctx context.Context, req *sdk.ForwardRequest
 
 	account := req.Account
 
+	// GET /v1/images/tasks/list：任务历史列表
+	if isImageTaskListRequest(reqPath) {
+		if g.host == nil {
+			body := jsonError("任务系统未启用")
+			return sdk.ForwardOutcome{
+				Kind:     sdk.OutcomeClientError,
+				Upstream: sdk.UpstreamResponse{StatusCode: http.StatusServiceUnavailable, Body: body},
+			}, nil
+		}
+		return g.handleImageTaskList(ctx, req)
+	}
+
+	// GET /v1/images/tasks：任务状态查询
+	if isImageTaskQuery(reqPath) {
+		if g.host == nil {
+			body := jsonError("任务系统未启用")
+			return sdk.ForwardOutcome{
+				Kind:     sdk.OutcomeClientError,
+				Upstream: sdk.UpstreamResponse{StatusCode: http.StatusServiceUnavailable, Body: body},
+			}, nil
+		}
+		return g.handleImageTaskQuery(ctx, req)
+	}
+
 	needsImage := isImagesRequest(reqPath) || isChatCompatImageModel(req.Model)
 	if needsImage && !isImageEnabled(req.Headers) {
 		body := jsonError("当前分组未开启图片生成功能")
@@ -86,6 +110,12 @@ func (g *OpenAIGateway) forwardHTTP(ctx context.Context, req *sdk.ForwardRequest
 			},
 			Reason: "分组未开启 image_enabled",
 		}, nil
+	}
+
+	// 图片生成任务持久化：host 可用、是 images 请求、非 ProcessTask 回调时，
+	// 创建 Core Task 并轮询结果，实现服务重启不丢任务。
+	if g.host != nil && isImagesRequest(reqPath) && !isTaskExecution(req.Headers) {
+		return g.forwardImagesViaTask(ctx, req, reqPath)
 	}
 
 	// 兼容下游平台（new-api 等）把图像模型误路由到 /v1/chat/completions：
@@ -113,6 +143,16 @@ func (g *OpenAIGateway) forwardHTTP(ctx context.Context, req *sdk.ForwardRequest
 		sdk.LogFieldError, reason,
 	)
 	return accountDeadOutcome(reason), fmt.Errorf("%s", reason)
+}
+
+// isImageTaskListRequest 判断是否为 GET /v1/images/tasks/list 历史列表查询。
+func isImageTaskListRequest(reqPath string) bool {
+	return strings.HasSuffix(reqPath, "/images/tasks/list")
+}
+
+// isImageTaskQuery 判断是否为 GET /v1/images/tasks 任务状态查询。
+func isImageTaskQuery(reqPath string) bool {
+	return strings.HasSuffix(reqPath, "/images/tasks")
 }
 
 // isImageEnabled 检查分组是否开启了图片生成功能。
@@ -660,15 +700,15 @@ func (g *OpenAIGateway) forwardOAuth(ctx context.Context, req *sdk.ForwardReques
 		firstTokenMs = lastResponsesSilent.firstTokenMs
 	}
 
-	usage := &sdk.Usage{
-		InputTokens:           result.InputTokens,
-		OutputTokens:          result.OutputTokens,
-		CachedInputTokens:     result.CachedInputTokens,
-		ReasoningOutputTokens: result.ReasoningOutputTokens,
-		ServiceTier:           normalizeOpenAIServiceTier(gjson.GetBytes(req.Body, "service_tier").String()),
-		Model:                 result.Model,
-		FirstTokenMs:          firstTokenMs,
-	}
+	usage := newTokenUsage(
+		result.Model,
+		normalizeOpenAIServiceTier(gjson.GetBytes(req.Body, "service_tier").String()),
+		result.InputTokens,
+		result.OutputTokens,
+		result.CachedInputTokens,
+		result.ReasoningOutputTokens,
+		firstTokenMs,
+	)
 	numImages := len(result.ImageGenCalls)
 
 	if result.Err != nil {

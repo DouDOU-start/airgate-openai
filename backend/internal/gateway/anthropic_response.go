@@ -13,7 +13,7 @@ import (
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 
-	sdk "github.com/DouDOU-start/airgate-sdk"
+	sdk "github.com/DouDOU-start/airgate-sdk/sdkgo"
 )
 
 // ──────────────────────────────────────────────────────
@@ -773,15 +773,15 @@ done:
 	}
 
 	elapsed := time.Since(start)
-	usage := &sdk.Usage{
-		InputTokens:           state.InputTokens,
-		OutputTokens:          state.OutputTokens,
-		CachedInputTokens:     state.CachedInputTokens,
-		ReasoningOutputTokens: state.ReasoningOutputTokens,
-		ServiceTier:           serviceTier,
-		Model:                 billingModel,
-		FirstTokenMs:          firstTokenMs,
-	}
+	usage := newTokenUsage(
+		billingModel,
+		serviceTier,
+		state.InputTokens,
+		state.OutputTokens,
+		state.CachedInputTokens,
+		state.ReasoningOutputTokens,
+		firstTokenMs,
+	)
 
 	if streamErr != nil {
 		var failure *responsesFailureError
