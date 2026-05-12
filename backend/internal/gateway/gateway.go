@@ -44,17 +44,15 @@ func (g *OpenAIGateway) Init(ctx sdk.PluginContext) error {
 	if hostAware, ok := ctx.(sdk.HostAware); ok {
 		g.host = hostAware.Host()
 	}
-	if ctx != nil && ctx.Config() != nil {
-		if dsn := ctx.Config().GetString("db_dsn"); dsn != "" {
-			store, err := newCodexUsagePersistenceStore(dsn, PluginID, g.logger)
-			if err != nil {
-				g.logger.Warn("初始化 Codex 用量快照持久化失败，将退回内存缓存", "error", err)
-			} else {
-				g.snapshotStore = store
-				setCodexUsagePersistenceStore(store)
-				if err := store.WarmCache(context.Background()); err != nil {
-					g.logger.Warn("预热 Codex 用量快照缓存失败", "error", err)
-				}
+	if dsn := sdk.GetPluginDSN(ctx); dsn != "" {
+		store, err := newCodexUsagePersistenceStore(dsn, PluginID, g.logger)
+		if err != nil {
+			g.logger.Warn("初始化 Codex 用量快照持久化失败，将退回内存缓存", "error", err)
+		} else {
+			g.snapshotStore = store
+			setCodexUsagePersistenceStore(store)
+			if err := store.WarmCache(context.Background()); err != nil {
+				g.logger.Warn("预热 Codex 用量快照缓存失败", "error", err)
 			}
 		}
 	}
@@ -214,9 +212,6 @@ func (g *OpenAIGateway) QueryQuota(ctx context.Context, credentials map[string]s
 
 	// 用 refresh_token 换取新的 token 组，从中获取最新订阅状态
 	clientID := credentials["client_id"]
-	if clientID == "" {
-		clientID = credentials["clinet_id"]
-	}
 	tokens, err := g.refreshTokens(ctx, refreshToken, credentials["proxy_url"], clientID)
 	if err != nil {
 		// refresh_token 失效，但只要 access_token 还在就降级使用它：
@@ -636,16 +631,11 @@ func (g *OpenAIGateway) HandleRequest(ctx context.Context, _, path, _ string, _ 
 			RefreshToken string `json:"refresh_token"`
 			ProxyURL     string `json:"proxy_url"`
 			ClientID     string `json:"client_id"`
-			ClinetID     string `json:"clinet_id"`
 		}
 		if err := json.Unmarshal(body, &raw); err != nil || strings.TrimSpace(raw.RefreshToken) == "" {
 			return http.StatusBadRequest, nil, jsonError("缺少 refresh_token 参数"), nil
 		}
-		clientID := raw.ClientID
-		if clientID == "" {
-			clientID = raw.ClinetID
-		}
-		result, err := g.ImportFromRefreshToken(context.Background(), raw.RefreshToken, raw.ProxyURL, clientID)
+		result, err := g.ImportFromRefreshToken(context.Background(), raw.RefreshToken, raw.ProxyURL, raw.ClientID)
 		if err != nil {
 			return http.StatusInternalServerError, nil, jsonError(err.Error()), nil
 		}
@@ -660,7 +650,6 @@ func (g *OpenAIGateway) HandleRequest(ctx context.Context, _, path, _ string, _ 
 			RefreshTokens []string `json:"refresh_tokens"`
 			ProxyURL      string   `json:"proxy_url"`
 			ClientID      string   `json:"client_id"`
-			ClinetID      string   `json:"clinet_id"`
 		}
 		if err := json.Unmarshal(body, &raw); err != nil || len(raw.RefreshTokens) == 0 {
 			return http.StatusBadRequest, nil, jsonError("缺少 refresh_tokens 参数"), nil
@@ -674,17 +663,12 @@ func (g *OpenAIGateway) HandleRequest(ctx context.Context, _, path, _ string, _ 
 			Error       string            `json:"error,omitempty"`
 		}
 
-		clientID := raw.ClientID
-		if clientID == "" {
-			clientID = raw.ClinetID
-		}
-
 		results := make([]batchResult, 0, len(raw.RefreshTokens))
 		for _, rt := range raw.RefreshTokens {
 			if strings.TrimSpace(rt) == "" {
 				continue
 			}
-			imported, err := g.ImportFromRefreshToken(context.Background(), rt, raw.ProxyURL, clientID)
+			imported, err := g.ImportFromRefreshToken(context.Background(), rt, raw.ProxyURL, raw.ClientID)
 			if err != nil {
 				results = append(results, batchResult{Status: "failed", Error: err.Error()})
 				continue

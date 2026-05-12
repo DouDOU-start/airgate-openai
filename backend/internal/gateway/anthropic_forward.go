@@ -165,28 +165,6 @@ func (g *OpenAIGateway) forwardAnthropicMessage(ctx context.Context, req *sdk.Fo
 		"digest_chain", session.DigestChain,
 		"digest_matched", session.MatchedDigest,
 	)
-	appendCacheDebugLog(
-		"anthropic_request",
-		"model", gjson.GetBytes(responsesBody, "model").String(),
-		"request_mode", requestMode,
-		"request_reason", requestReason,
-		"session_key", session.SessionKey,
-		"session_source", session.SessionSource,
-		"prompt_cache_key", session.PromptCacheKey,
-		"previous_response_id", session.PreviousRespID,
-		"history_trimmed", replayTrimmed,
-		"messages_hash", shortHashBytes([]byte(gjson.GetBytes(body, "messages").Raw)),
-		"system_hash", shortHashBytes([]byte(gjson.GetBytes(body, "system").Raw)),
-		"responses_input_hash", shortHashBytes([]byte(gjson.GetBytes(responsesBody, "input").Raw)),
-		"tool_choice_hash", shortHashBytes([]byte(gjson.GetBytes(responsesBody, "tool_choice").Raw)),
-		"tools_hash", shortHashBytes([]byte(gjson.GetBytes(responsesBody, "tools").Raw)),
-		"body_has_prompt_cache_key", gjson.GetBytes(responsesBody, "prompt_cache_key").Exists(),
-		"request_body_bytes", len(body),
-		"responses_body_bytes", len(responsesBody),
-		"input_items", gjson.GetBytes(responsesBody, "input.#").Int(),
-		"tools", gjson.GetBytes(responsesBody, "tools.#").Int(),
-		"input_prefix", summarizeResponsesInputPrefix(responsesBody, 16),
-	)
 
 	// 6. 转发上游（含模型降级重试）
 	fallbackModel := ""

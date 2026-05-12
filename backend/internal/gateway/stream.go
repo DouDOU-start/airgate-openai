@@ -42,7 +42,7 @@ func handleStreamResponse(resp *http.Response, w http.ResponseWriter, start time
 	var streamErr error
 	firstTokenRecorded := false
 	streamStarted := false
-	var toolImageIn, toolImageOut int // kept for SSE parsing compatibility
+	var toolImageIn, toolImageOut int // 接收 response.tool_usage.image_gen，用于图像工具计费。
 
 	for scanner.Scan() {
 		line := scanner.Text()

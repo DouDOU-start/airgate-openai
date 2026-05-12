@@ -166,7 +166,7 @@ type CodexUsageSnapshot struct {
 	CapturedAt time.Time `json:"captured_at"`
 }
 
-// NormalizedCodexLimits contains normalized 5h/7d limit data for generic rendering.
+// NormalizedCodexLimits 保存规范化后的 5h / 7d 限流窗口数据，供前端统一展示。
 type NormalizedCodexLimits struct {
 	Used5hPercent   *float64
 	Reset5hSeconds  *int
@@ -190,11 +190,10 @@ func codexWindowPointers(usedPercent float64, resetAfterSeconds int, windowMinut
 	return &used, &reset, &minutes
 }
 
-// Normalize converts primary/secondary fields to canonical 5h/7d fields.
-// Strategy matches sub2api:
-//  1. Prefer window_minutes to determine which window is shorter.
-//  2. When window_minutes are missing, fall back to legacy assumption:
-//     primary=7d, secondary=5h.
+// Normalize 把 primary / secondary 字段归一化为 5h / 7d 窗口。
+// 策略与 sub2api 一致：
+//  1. 优先用 window_minutes 判断短窗口和长窗口。
+//  2. 缺少 window_minutes 时按历史头部语义处理：primary=7d，secondary=5h。
 func (s *CodexUsageSnapshot) Normalize() *NormalizedCodexLimits {
 	if s == nil {
 		return nil

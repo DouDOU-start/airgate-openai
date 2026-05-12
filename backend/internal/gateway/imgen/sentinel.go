@@ -20,10 +20,10 @@ type ChatRequirementsResult struct {
 	ProofToken string
 }
 
-// getChatRequirements 拿 Sentinel 风控通行证。走的是 legacy 单接口
+// getChatRequirements 拿 Sentinel 风控通行证。当前走单接口
 // /backend-api/sentinel/chat-requirements（body 带 requirements token 的 "p"
-// 字段），不是网页端当前的 prepare + finalize 两步式。legacy 接口仍然可用，
-// 且 PoW 字段结构在本包里已验证；切换到两步式需要重新抓 body 样本。
+// 字段），不是网页端的 prepare + finalize 两步式。该接口在当前链路中已验证，
+// 且 PoW 字段结构稳定；切换到两步式需要重新抓 body 样本。
 func (c *Client) getChatRequirements() (*ChatRequirementsResult, error) {
 	reqToken := GenerateRequirementsToken(DefaultUA)
 

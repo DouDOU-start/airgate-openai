@@ -703,16 +703,6 @@ func translateResponsesSSEToAnthropicSSE(
 					"output_tokens", usageNode.Get("output_tokens").Int(),
 					"response_model", gjson.Get(data, "response.model").String(),
 				)
-				appendCacheDebugLog(
-					"anthropic_usage",
-					"session", session.SessionKey,
-					"response_id", gjson.Get(data, "response.id").String(),
-					"response_model", gjson.Get(data, "response.model").String(),
-					"input_tokens", usageNode.Get("input_tokens").Int(),
-					"cached_tokens", usageNode.Get("input_tokens_details.cached_tokens").Int(),
-					"output_tokens", usageNode.Get("output_tokens").Int(),
-					"usage_raw", usageNode.Raw,
-				)
 			}
 
 			// 检查错误事件 —— 先让 convertResponsesEventToAnthropic 输出错误事件再终止

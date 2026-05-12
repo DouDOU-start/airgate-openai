@@ -94,11 +94,7 @@ CREATE INDEX IF NOT EXISTS idx_%s_plugin_updated_at
 	if _, err := s.db.ExecContext(ctx, query); err != nil {
 		return fmt.Errorf("ensure snapshot schema: %w", err)
 	}
-	// 旧版本曾把 Anthropic digest 会话映射持久化到 plugin_anthropic_digest_sessions,
-	// 现已改为纯内存 LRU,这里顺手清理遗留表以免无人维护。
-	if _, err := s.db.ExecContext(ctx, `DROP TABLE IF EXISTS plugin_anthropic_digest_sessions`); err != nil {
-		return fmt.Errorf("drop legacy anthropic digest table: %w", err)
-	}
+
 	sessionQuery := fmt.Sprintf(`
 CREATE TABLE IF NOT EXISTS %s (
   plugin_id         text        NOT NULL,
