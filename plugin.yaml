@@ -9,12 +9,24 @@ type: gateway
 min_core_version: 1.0.0
 dependencies: []
 frontend_widgets:
+  - slot: account-identity
+    entry_file: index.js
+    title: OpenAI 账号身份
   - slot: account-create
     entry_file: index.js
     title: 创建 OpenAI 账号
   - slot: account-edit
     entry_file: index.js
     title: 编辑 OpenAI 账号
+  - slot: account-usage-window
+    entry_file: index.js
+    title: 账号用量窗口
+  - slot: usage-metric-detail
+    entry_file: index.js
+    title: OpenAI 计量明细
+  - slot: usage-cost-detail
+    entry_file: index.js
+    title: OpenAI 费用明细
 gateway:
   platform: openai
   mode: simple

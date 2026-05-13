@@ -113,6 +113,16 @@ func setUsageModelAttribute(usage *sdk.Usage, modelID string) {
 	})
 }
 
+func setUsageReasoningEffort(usage *sdk.Usage, effort string) {
+	if usage == nil || effort == "" {
+		return
+	}
+	if usage.Metadata == nil {
+		usage.Metadata = map[string]string{}
+	}
+	usage.Metadata["reasoning_effort"] = effort
+}
+
 func setUsageServiceTier(usage *sdk.Usage, tier string) {
 	if usage == nil {
 		return

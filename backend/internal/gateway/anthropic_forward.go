@@ -130,8 +130,9 @@ func (g *OpenAIGateway) forwardAnthropicMessage(ctx context.Context, req *sdk.Fo
 	}
 
 	// 5. 按需注入 web_search 工具
-	responsesBody = finalizeAnthropicResponsesBody(responsesBody, body, req.Headers.Get("X-Airgate-Service-Tier"), sparkOverride)
-	fullResponsesBody = finalizeAnthropicResponsesBody(fullResponsesBody, body, req.Headers.Get("X-Airgate-Service-Tier"), sparkOverride)
+	explicitServiceTier := explicitAnthropicRequestServiceTier(req)
+	responsesBody = finalizeAnthropicResponsesBody(responsesBody, body, explicitServiceTier, sparkOverride)
+	fullResponsesBody = finalizeAnthropicResponsesBody(fullResponsesBody, body, explicitServiceTier, sparkOverride)
 	responsesBody = injectAnthropicPromptCacheKey(responsesBody, strategy, session)
 	fullResponsesBody = injectAnthropicPromptCacheKey(fullResponsesBody, strategy, session)
 
@@ -248,6 +249,29 @@ func finalizeAnthropicResponsesBody(responsesBody []byte, originalBody []byte, s
 		result, _ = sjson.SetBytes(result, "text.verbosity", "low")
 	}
 	return result
+}
+
+func explicitAnthropicRequestServiceTier(req *sdk.ForwardRequest) string {
+	if req == nil {
+		return ""
+	}
+	headerTier := ""
+	if req.Headers != nil {
+		headerTier = req.Headers.Get("X-Airgate-Service-Tier")
+	}
+	return firstNonEmptyTier(headerTier, gjson.GetBytes(req.Body, "service_tier").String())
+}
+
+func defaultAnthropicUsageServiceTier(req *sdk.ForwardRequest) string {
+	if req == nil {
+		return ""
+	}
+	// ChatGPT Codex OAuth 翻译路径默认是前端语义里的 fast，
+	// 后端按 OpenAI service_tier=priority 记录。
+	if resolveAnthropicUpstreamStrategy(req.Account) == anthropicStrategyOAuth {
+		return "priority"
+	}
+	return ""
 }
 
 func injectAnthropicPromptCacheKey(responsesBody []byte, strategy anthropicUpstreamStrategy, session openAISessionResolution) []byte {
@@ -372,13 +396,16 @@ func (g *OpenAIGateway) forwardAnthropicResponses(
 		"protocol", "anthropic",
 	)
 
-	serviceTier := firstNonEmptyTier(req.Headers.Get("X-Airgate-Service-Tier"), gjson.GetBytes(req.Body, "service_tier").String())
+	requestServiceTier := explicitAnthropicRequestServiceTier(req)
+	defaultServiceTier := defaultAnthropicUsageServiceTier(req)
+	resolvedEffort := gjson.GetBytes(responsesBody, "reasoning.effort").String()
 	isStream := gjson.GetBytes(req.Body, "stream").Bool()
 	if isStream && w != nil {
 		if turnState := decodeTurnStateHeader(resp.Header); turnState != "" {
 			updateSessionStateTurnState(session.SessionKey, turnState)
 		}
-		outcome, err := translateResponsesSSEToAnthropicSSE(ctx, resp, w, originalModel, mappedModel, req.Body, serviceTier, start, session)
+		outcome, err := translateResponsesSSEToAnthropicSSE(ctx, resp, w, originalModel, mappedModel, req.Body, requestServiceTier, defaultServiceTier, start, session)
+		setUsageReasoningEffort(outcome.Usage, resolvedEffort)
 		return outcome, nil, err
 	}
 
@@ -389,7 +416,8 @@ func (g *OpenAIGateway) forwardAnthropicResponses(
 	if suppressErrorWrite {
 		nonStreamWriter = nil
 	}
-	outcome, err := g.handleAnthropicNonStreamFromResponses(resp, nonStreamWriter, originalModel, mappedModel, req.Body, serviceTier, start, session, req.Account.ID)
+	outcome, err := g.handleAnthropicNonStreamFromResponses(resp, nonStreamWriter, originalModel, mappedModel, req.Body, requestServiceTier, defaultServiceTier, start, session, req.Account.ID)
+	setUsageReasoningEffort(outcome.Usage, resolvedEffort)
 	if suppressErrorWrite && outcome.Kind == sdk.OutcomeClientError && outcome.Upstream.StatusCode >= 400 {
 		return outcome, []byte(outcome.Reason), err
 	}
@@ -457,6 +485,7 @@ func (g *OpenAIGateway) handleAnthropicNonStreamFromResponses(
 	mappedModel string,
 	originalRequest []byte,
 	requestServiceTier string,
+	defaultServiceTier string,
 	start time.Time,
 	session openAISessionResolution,
 	accountID int64,
@@ -515,6 +544,7 @@ func (g *OpenAIGateway) handleAnthropicNonStreamFromResponses(
 	serviceTier := firstNonEmptyTier(
 		requestServiceTier,
 		gjson.GetBytes(wsResult.CompletedEventRaw, "response.service_tier").String(),
+		defaultServiceTier,
 	)
 
 	elapsed := time.Since(start)

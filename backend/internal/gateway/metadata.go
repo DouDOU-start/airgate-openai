@@ -66,8 +66,12 @@ func BuildPluginInfo() sdk.PluginInfo {
 			},
 		},
 		FrontendWidgets: []sdk.FrontendWidget{
+			{Slot: sdk.SlotAccountIdentity, EntryFile: "index.js", Title: "OpenAI 账号身份"},
 			{Slot: sdk.SlotAccountCreate, EntryFile: "index.js", Title: "创建 OpenAI 账号"},
 			{Slot: sdk.SlotAccountEdit, EntryFile: "index.js", Title: "编辑 OpenAI 账号"},
+			{Slot: sdk.SlotAccountUsageWindow, EntryFile: "index.js", Title: "账号用量窗口"},
+			{Slot: sdk.SlotUsageMetricDetail, EntryFile: "index.js", Title: "OpenAI 计量明细"},
+			{Slot: sdk.SlotUsageCostDetail, EntryFile: "index.js", Title: "OpenAI 费用明细"},
 		},
 		InstructionPresets: []string{"default", "simple", "nsfw", "cc"},
 	}

@@ -152,6 +152,108 @@ func TestForwardAnthropicMessageNonStreamReturnsBodyForGRPC(t *testing.T) {
 	}
 }
 
+func TestExplicitAnthropicRequestServiceTier(t *testing.T) {
+	req := &sdk.ForwardRequest{
+		Headers: http.Header{"X-Airgate-Service-Tier": []string{"priority"}},
+		Body:    []byte(`{"service_tier":"flex"}`),
+	}
+	if got := explicitAnthropicRequestServiceTier(req); got != "priority" {
+		t.Fatalf("显式服务档位 = %q，期望 priority", got)
+	}
+
+	req.Headers = http.Header{}
+	if got := explicitAnthropicRequestServiceTier(req); got != "flex" {
+		t.Fatalf("请求体服务档位 = %q，期望 flex", got)
+	}
+}
+
+func TestDefaultAnthropicUsageServiceTierUsesPriorityForOAuth(t *testing.T) {
+	oauthReq := &sdk.ForwardRequest{
+		Account: &sdk.Account{Credentials: map[string]string{"access_token": "token"}},
+	}
+	if got := defaultAnthropicUsageServiceTier(oauthReq); got != "priority" {
+		t.Fatalf("OAuth 默认服务档位 = %q，期望 priority", got)
+	}
+
+	apiKeyReq := &sdk.ForwardRequest{
+		Account: &sdk.Account{Credentials: map[string]string{"api_key": "sk-test"}},
+	}
+	if got := defaultAnthropicUsageServiceTier(apiKeyReq); got != "" {
+		t.Fatalf("API Key 默认服务档位 = %q，期望空值", got)
+	}
+}
+
+func TestHandleAnthropicNonStreamRecordsDefaultPriority(t *testing.T) {
+	sse := strings.Join([]string{
+		`data: {"type":"response.output_text.delta","delta":"pong"}`,
+		`data: {"type":"response.completed","response":{"id":"resp_priority","model":"gpt-5.4","usage":{"input_tokens":10,"output_tokens":2}}}`,
+		"",
+	}, "\n")
+	resp := &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+		Body:       io.NopCloser(strings.NewReader(sse)),
+	}
+
+	outcome, err := (&OpenAIGateway{}).handleAnthropicNonStreamFromResponses(
+		resp,
+		nil,
+		"claude-sonnet-4-6",
+		"gpt-5.4",
+		[]byte(`{"model":"claude-sonnet-4-6","max_tokens":128,"messages":[{"role":"user","content":[{"type":"text","text":"ping"}]}]}`),
+		"",
+		"priority",
+		time.Now(),
+		openAISessionResolution{},
+		0,
+	)
+	if err != nil {
+		t.Fatalf("非流式回译失败: %v", err)
+	}
+	if outcome.Kind != sdk.OutcomeSuccess {
+		t.Fatalf("判决类型 = %v，期望成功；原因=%s", outcome.Kind, outcome.Reason)
+	}
+	if got := usageServiceTier(outcome.Usage); got != "priority" {
+		t.Fatalf("usage service_tier = %q，期望 priority", got)
+	}
+}
+
+func TestTranslateResponsesSSERecordsDefaultPriority(t *testing.T) {
+	sse := strings.Join([]string{
+		`data: {"type":"response.output_text.delta","delta":"pong"}`,
+		`data: {"type":"response.completed","response":{"id":"resp_priority","model":"gpt-5.4","usage":{"input_tokens":10,"output_tokens":2}}}`,
+		"",
+	}, "\n")
+	resp := &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+		Body:       io.NopCloser(strings.NewReader(sse)),
+	}
+	w := httptest.NewRecorder()
+
+	outcome, err := translateResponsesSSEToAnthropicSSE(
+		context.Background(),
+		resp,
+		w,
+		"claude-sonnet-4-6",
+		"gpt-5.4",
+		[]byte(`{"model":"claude-sonnet-4-6","stream":true,"max_tokens":128,"messages":[{"role":"user","content":[{"type":"text","text":"ping"}]}]}`),
+		"",
+		"priority",
+		time.Now(),
+		openAISessionResolution{},
+	)
+	if err != nil {
+		t.Fatalf("流式回译失败: %v", err)
+	}
+	if outcome.Kind != sdk.OutcomeSuccess {
+		t.Fatalf("判决类型 = %v，期望成功；原因=%s", outcome.Kind, outcome.Reason)
+	}
+	if got := usageServiceTier(outcome.Usage); got != "priority" {
+		t.Fatalf("usage service_tier = %q，期望 priority", got)
+	}
+}
+
 func TestForwardAnthropicCountTokensReturnsEstimate(t *testing.T) {
 	w := httptest.NewRecorder()
 	req := &sdk.ForwardRequest{
