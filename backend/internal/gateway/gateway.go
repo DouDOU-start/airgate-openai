@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -507,6 +508,41 @@ func buildCodexUsageWindows(snapshot *CodexUsageSnapshot, limitName string, now 
 // HandleRequest 处理 Core 透传的自定义请求（实现 sdk.RequestHandler 接口）
 func (g *OpenAIGateway) HandleRequest(ctx context.Context, _, path, _ string, _ http.Header, body []byte) (int, http.Header, []byte, error) {
 	switch path {
+	case "accounts/quota":
+		var req struct {
+			ID          int64             `json:"id"`
+			Credentials map[string]string `json:"credentials"`
+		}
+		if err := json.Unmarshal(body, &req); err != nil || req.ID == 0 {
+			return http.StatusBadRequest, nil, jsonError("invalid request body"), nil
+		}
+		quota, err := g.QueryQuota(ctx, req.Credentials)
+		if err != nil {
+			if errors.Is(err, sdk.ErrNotSupported) {
+				return http.StatusNotFound, nil, jsonError("quota refresh unsupported"), nil
+			}
+			if strings.HasPrefix(err.Error(), ReauthRequiredPrefix) {
+				return http.StatusUnauthorized, nil, jsonMarshal(map[string]string{
+					"error_code":    "reauth_required",
+					"error_message": strings.TrimPrefix(err.Error(), ReauthRequiredPrefix),
+				}), nil
+			}
+			return http.StatusInternalServerError, nil, jsonError(err.Error()), nil
+		}
+		if quota == nil {
+			return http.StatusNotFound, nil, jsonError("quota refresh unsupported"), nil
+		}
+		resp := map[string]any{
+			"expires_at": quota.ExpiresAt,
+			"extra":      quota.Extra,
+		}
+		if quota.Extra != nil {
+			if warning := quota.Extra["refresh_warning"]; warning != "" {
+				resp["reauth_warning"] = warning
+			}
+		}
+		return http.StatusOK, nil, jsonMarshal(resp), nil
+
 	case "usage/accounts":
 		var accounts []struct {
 			ID          int64             `json:"id"`
