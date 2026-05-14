@@ -3,7 +3,7 @@ module github.com/DouDOU-start/airgate-openai/backend
 go 1.25.7
 
 require (
-	github.com/DouDOU-start/airgate-sdk v0.0.0-20260409075603-72e675bf678d
+	github.com/DouDOU-start/airgate-sdk v0.2.0
 	github.com/google/uuid v1.6.0
 	github.com/gorilla/websocket v1.5.3
 	github.com/lib/pq v1.10.9
@@ -34,5 +34,3 @@ require (
 	google.golang.org/grpc v1.79.2 // indirect
 	google.golang.org/protobuf v1.36.11 // indirect
 )
-
-replace github.com/DouDOU-start/airgate-sdk => ../../airgate-sdk
