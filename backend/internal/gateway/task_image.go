@@ -245,7 +245,7 @@ func storeImageAssetsFromResponse(ctx context.Context, g *OpenAIGateway, userID 
 		if err != nil || localURL == "" {
 			continue
 		}
-		sb.WriteString(fmt.Sprintf("![image](%s)\n", localURL))
+		fmt.Fprintf(&sb, "![image](%s)\n", localURL)
 	}
 	return strings.TrimSpace(sb.String()), nil
 }
