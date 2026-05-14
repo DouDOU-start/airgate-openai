@@ -242,7 +242,7 @@ gateway:
           placeholder: 授权后自动填充
         - key: refresh_token
           label: Refresh Token
-          type: password
+          type: text
           required: false
           placeholder: 授权后自动填充
         - key: chatgpt_account_id
