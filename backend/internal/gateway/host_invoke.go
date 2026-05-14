@@ -57,15 +57,19 @@ func (g *OpenAIGateway) hostInvoke(ctx context.Context, method string, payload m
 	return resp.Payload, nil
 }
 
-func (g *OpenAIGateway) createHostTask(ctx context.Context, taskType string, userID int64, input map[string]interface{}, priority, maxAttempts int) (*sdk.HostTask, error) {
-	payload, err := g.hostInvoke(ctx, hostMethodTasksCreate, map[string]interface{}{
+func (g *OpenAIGateway) createHostTask(ctx context.Context, taskType string, userID int64, input map[string]interface{}, attributes map[string]string, priority, maxAttempts int) (*sdk.HostTask, error) {
+	payload := map[string]interface{}{
 		"plugin_id":    PluginID,
 		"task_type":    taskType,
 		"user_id":      userID,
 		"input":        input,
 		"priority":     priority,
 		"max_attempts": maxAttempts,
-	})
+	}
+	if len(attributes) > 0 {
+		payload["attributes"] = attributes
+	}
+	payload, err := g.hostInvoke(ctx, hostMethodTasksCreate, payload)
 	if err != nil {
 		return nil, err
 	}

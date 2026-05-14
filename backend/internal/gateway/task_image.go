@@ -1,0 +1,299 @@
+package gateway
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"strconv"
+
+	sdk "github.com/DouDOU-start/airgate-sdk/sdkgo"
+)
+
+const (
+	taskTypeImageGenerate = "image.generate"
+	taskTypeImageEdit     = "image.edit"
+)
+
+// ── image.generate handler ──
+
+type imageGenerateHandler struct{}
+
+func (h imageGenerateHandler) Type() string { return taskTypeImageGenerate }
+
+func (h imageGenerateHandler) BuildInput(req *sdk.ForwardRequest, reqPath string) (map[string]any, map[string]string, error) {
+	return buildImageTaskInput(req, reqPath, false)
+}
+
+func (h imageGenerateHandler) Execute(ctx context.Context, g *OpenAIGateway, task sdk.HostTask, rt *TaskRuntime) error {
+	return executeImageTask(ctx, g, task, rt, "/v1/images/generations")
+}
+
+func (h imageGenerateHandler) BuildResponse(task *sdk.HostTask) map[string]any {
+	return buildImageTaskResponse(task)
+}
+
+// ── image.edit handler ──
+
+type imageEditHandler struct{}
+
+func (h imageEditHandler) Type() string { return taskTypeImageEdit }
+
+func (h imageEditHandler) BuildInput(req *sdk.ForwardRequest, _ string) (map[string]any, map[string]string, error) {
+	return buildImageTaskInput(req, "", true)
+}
+
+func (h imageEditHandler) Execute(ctx context.Context, g *OpenAIGateway, task sdk.HostTask, rt *TaskRuntime) error {
+	return executeImageTask(ctx, g, task, rt, "/v1/images/edits")
+}
+
+func (h imageEditHandler) BuildResponse(task *sdk.HostTask) map[string]any {
+	return buildImageTaskResponse(task)
+}
+
+// ── 共享实现 ──
+
+func buildImageTaskInput(req *sdk.ForwardRequest, reqPath string, isEdit bool) (map[string]any, map[string]string, error) {
+	parsed, err := parseImagesRequest(req.Body, req.Headers.Get("Content-Type"), isEdit)
+	if err != nil {
+		return nil, nil, fmt.Errorf("解析图片请求失败: %w", err)
+	}
+
+	model := parsed.Model
+	if model == "" {
+		model = req.Model
+	}
+
+	// input 只含纯业务参数
+	input := map[string]any{
+		"prompt": parsed.Prompt,
+		"model":  model,
+		"n":      parsed.N,
+	}
+	if parsed.Size != "" {
+		input["size"] = parsed.Size
+	}
+	if parsed.Quality != "" {
+		input["quality"] = parsed.Quality
+	}
+	if parsed.Background != "" {
+		input["background"] = parsed.Background
+	}
+	if parsed.OutputFormat != "" {
+		input["output_format"] = parsed.OutputFormat
+	}
+	if parsed.InputFidelity != "" {
+		input["input_fidelity"] = parsed.InputFidelity
+	}
+	if len(parsed.Images) > 0 {
+		input["images"] = parsed.Images
+	}
+	if parsed.Mask != "" {
+		input["mask"] = parsed.Mask
+	}
+
+	// 路由元数据：group_id 由 Core 在创建任务时从上下文获取，
+	// 但当前 Core 还需要插件传递，暂时放在 input 内。
+	groupID, _ := strconv.ParseInt(req.Headers.Get("X-Airgate-Group-ID"), 10, 64)
+	if groupID > 0 {
+		input["group_id"] = groupID
+	}
+
+	// attributes 是少量展示/筛选维度
+	attributes := map[string]string{
+		"model": model,
+	}
+	if parsed.Size != "" {
+		attributes["size"] = parsed.Size
+	}
+
+	return input, attributes, nil
+}
+
+func executeImageTask(ctx context.Context, g *OpenAIGateway, task sdk.HostTask, rt *TaskRuntime, defaultPath string) error {
+	groupID, _ := intFromInput(task.Input, "group_id")
+	model, _ := task.Input["model"].(string)
+
+	reqBody, err := buildImageRequestBody(task.Input)
+	if err != nil {
+		return rt.Fail(ctx, &TaskError{
+			Type:    "invalid_request",
+			Message: "构建请求体失败: " + err.Error(),
+		})
+	}
+
+	headers := make(http.Header)
+	headers.Set("Content-Type", "application/json")
+	headers.Set("Accept", "application/json")
+	headers.Set(taskExecHeader, "true")
+
+	if err := rt.SetProgress(ctx, 30); err != nil {
+		return err
+	}
+
+	resp, err := g.forwardViaHost(ctx, task.UserID, groupID, model, http.MethodPost, defaultPath, headers, reqBody, false)
+	if err != nil {
+		return rt.Fail(ctx, &TaskError{
+			Type:      "upstream_error",
+			Message:   "upstream 转发失败: " + err.Error(),
+			Retryable: true,
+		})
+	}
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		taskErr := classifyUpstreamTaskError(resp.StatusCode, resp.Body)
+		return rt.Fail(ctx, taskErr)
+	}
+
+	output := map[string]any{
+		"status_code": resp.StatusCode,
+		"body":        json.RawMessage(resp.Body),
+	}
+	if resp.Usage != nil {
+		output["model"] = resp.Usage.Model
+		if v := usageMetricInt(resp.Usage, usageMetricInputTokens); v > 0 {
+			output["input_tokens"] = v
+		}
+		if v := usageMetricInt(resp.Usage, usageMetricOutputTokens); v > 0 {
+			output["output_tokens"] = v
+		}
+		if resp.Usage.AccountCost > 0 {
+			output["cost"] = resp.Usage.AccountCost
+		}
+	}
+	if resp.UsageID > 0 {
+		output["usage_id"] = resp.UsageID
+	}
+
+	return rt.Complete(ctx, output)
+}
+
+// classifyUpstreamTaskError 把上游 HTTP 错误映射为结构化 TaskError。
+func classifyUpstreamTaskError(statusCode int, body []byte) *TaskError {
+	msg := fmt.Sprintf("upstream HTTP %d", statusCode)
+	var errResp struct {
+		Error struct {
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if json.Unmarshal(body, &errResp) == nil && errResp.Error.Message != "" {
+		msg = errResp.Error.Message
+	}
+
+	switch {
+	case statusCode == 429 || isTemporaryRateLimitText(msg):
+		return &TaskError{Type: "rate_limited", Code: "rate_limited", Message: msg, Retryable: true}
+	case statusCode == 401 || statusCode == 403:
+		return &TaskError{Type: "auth_error", Code: "auth_failed", Message: msg}
+	case statusCode >= 500:
+		return &TaskError{Type: "upstream_error", Code: "server_error", Message: msg, Retryable: true}
+	case statusCode == 400:
+		return &TaskError{Type: "invalid_request", Code: "bad_request", Message: msg}
+	default:
+		return &TaskError{Type: "upstream_error", Code: fmt.Sprintf("http_%d", statusCode), Message: msg}
+	}
+}
+
+func buildImageTaskResponse(task *sdk.HostTask) map[string]any {
+	resp := map[string]any{
+		"task_id":    task.ID,
+		"status":     string(task.Status),
+		"progress":   task.Progress,
+		"created_at": task.CreatedAt,
+	}
+	if task.CompletedAt != nil {
+		resp["completed_at"] = *task.CompletedAt
+	}
+	if task.Output != nil {
+		if images, ok := task.Output["images"]; ok {
+			resp["images"] = images
+		}
+		if model, ok := task.Output["model"]; ok {
+			resp["model"] = model
+		}
+		for _, key := range []string{"input_tokens", "output_tokens", "cost"} {
+			if v, ok := task.Output[key]; ok {
+				resp[key] = v
+			}
+		}
+	}
+	if task.Input != nil {
+		if prompt, ok := task.Input["prompt"]; ok {
+			resp["prompt"] = prompt
+		}
+		if size, ok := task.Input["size"]; ok {
+			resp["image_size"] = size
+		}
+	}
+	if task.ErrorMessage != "" {
+		resp["error"] = task.ErrorMessage
+	}
+	return resp
+}
+
+func buildImageRequestBody(input map[string]any) ([]byte, error) {
+	body := map[string]any{
+		"prompt": input["prompt"],
+	}
+	if v, ok := input["model"]; ok && v != "" {
+		body["model"] = v
+	}
+	if v, _ := intFromInput(input, "n"); v > 0 {
+		body["n"] = v
+	}
+	for _, key := range []string{"size", "quality", "background", "output_format", "input_fidelity"} {
+		if v, ok := input[key].(string); ok && v != "" {
+			body[key] = v
+		}
+	}
+	if images := stringSliceFromInput(input, "images"); len(images) > 0 {
+		if len(images) == 1 {
+			body["image"] = images[0]
+		} else {
+			body["image"] = images
+		}
+	}
+	if v, ok := input["mask"].(string); ok && v != "" {
+		body["mask"] = v
+	}
+	return json.Marshal(body)
+}
+
+func intFromInput(input map[string]any, key string) (int64, bool) {
+	v, ok := input[key]
+	if !ok {
+		return 0, false
+	}
+	switch n := v.(type) {
+	case float64:
+		return int64(n), true
+	case int64:
+		return n, true
+	case int:
+		return int64(n), true
+	case json.Number:
+		i, err := n.Int64()
+		return i, err == nil
+	}
+	return 0, false
+}
+
+func stringSliceFromInput(input map[string]any, key string) []string {
+	v, ok := input[key]
+	if !ok {
+		return nil
+	}
+	switch s := v.(type) {
+	case []string:
+		return s
+	case []interface{}:
+		out := make([]string, 0, len(s))
+		for _, item := range s {
+			if str, ok := item.(string); ok {
+				out = append(out, str)
+			}
+		}
+		return out
+	}
+	return nil
+}

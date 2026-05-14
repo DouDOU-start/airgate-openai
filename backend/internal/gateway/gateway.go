@@ -20,13 +20,14 @@ import (
 )
 
 // OpenAIGateway OpenAI 网关插件（SimpleGatewayPlugin 实现）
-// 核心自动处理调度、计费、限流、并发控制，插件只负责转发
+// 核心处理鉴权、账号选择、计费、限流和并发控制，插件只负责协议适配与上游转发。
 type OpenAIGateway struct {
 	logger        *slog.Logger
 	ctx           sdk.PluginContext
 	host          sdk.Host
 	snapshotStore *codexUsagePersistenceStore
 	transportPool *TransportPool
+	tasks         *TaskRegistry
 }
 
 func (g *OpenAIGateway) Info() sdk.PluginInfo {
@@ -36,6 +37,9 @@ func (g *OpenAIGateway) Info() sdk.PluginInfo {
 func (g *OpenAIGateway) Init(ctx sdk.PluginContext) error {
 	g.ctx = ctx
 	g.transportPool = NewTransportPool()
+	g.tasks = NewTaskRegistry()
+	g.tasks.Register(imageGenerateHandler{})
+	g.tasks.Register(imageEditHandler{})
 	if ctx != nil {
 		g.logger = ctx.Logger()
 	}

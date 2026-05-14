@@ -17,6 +17,7 @@ const (
 	responsesFailureKindUnknown            responsesFailureKind = "unknown"
 	responsesFailureKindClient             responsesFailureKind = "client"
 	responsesFailureKindContinuationAnchor responsesFailureKind = "continuation_anchor"
+	responsesFailureKindModelUnsupported   responsesFailureKind = "model_unsupported"
 	responsesFailureKindRateLimited        responsesFailureKind = "rate_limited"
 	responsesFailureKindServer             responsesFailureKind = "server"
 )
@@ -39,6 +40,8 @@ func (e *responsesFailureError) outcomeKind() sdk.OutcomeKind {
 	switch e.Kind {
 	case responsesFailureKindClient, responsesFailureKindContinuationAnchor:
 		return sdk.OutcomeClientError
+	case responsesFailureKindModelUnsupported:
+		return sdk.OutcomeAccountModelUnsupported
 	case responsesFailureKindRateLimited:
 		return sdk.OutcomeAccountRateLimited
 	case responsesFailureKindServer:
@@ -57,6 +60,8 @@ func (e *responsesFailureError) Error() string {
 		return "上游续链锚点失效: " + e.Message
 	case responsesFailureKindClient:
 		return "上游请求无效: " + e.Message
+	case responsesFailureKindModelUnsupported:
+		return "当前账号不支持模型: " + e.Message
 	case responsesFailureKindRateLimited:
 		if e.RetryAfter > 0 {
 			return fmt.Sprintf("上游速率限制(建议 %s 后重试): %s", e.RetryAfter, e.Message)
@@ -120,6 +125,44 @@ func classifyWSErrorEvent(data []byte) *responsesFailureError {
 	return failure
 }
 
+func classifyGenericSSEErrorEvent(data []byte) *responsesFailureError {
+	errNode := gjson.GetBytes(data, "error")
+	eventType := strings.ToLower(strings.TrimSpace(gjson.GetBytes(data, "type").String()))
+	errType := ""
+	errCode := ""
+	msg := ""
+	if errNode.Exists() {
+		errType = strings.ToLower(strings.TrimSpace(errNode.Get("type").String()))
+		errCode = strings.ToLower(strings.TrimSpace(errNode.Get("code").String()))
+		msg = strings.TrimSpace(errNode.Get("message").String())
+		if msg == "" {
+			msg = strings.TrimSpace(errNode.String())
+		}
+	}
+	if msg == "" {
+		msg = strings.TrimSpace(gjson.GetBytes(data, "message").String())
+	}
+	if errType == "" {
+		errType = strings.ToLower(strings.TrimSpace(gjson.GetBytes(data, "error_type").String()))
+	}
+	if errType == "" {
+		errType = strings.ToLower(strings.TrimSpace(gjson.GetBytes(data, "type").String()))
+	}
+	if errCode == "" {
+		errCode = strings.ToLower(strings.TrimSpace(gjson.GetBytes(data, "code").String()))
+	}
+	if msg == "" {
+		return nil
+	}
+	hasErrorSignal := errNode.Exists() || errCode != "" || strings.Contains(eventType, "error") || strings.Contains(errType, "error")
+	if !hasErrorSignal {
+		return nil
+	}
+	failure := classifyResponsesError(errType, errCode, msg)
+	applyOpenAIRateLimitReset(failure, errNode)
+	return failure
+}
+
 // applyOpenAIRateLimitReset 把 OpenAI OAuth 错误体里的 resets_at / resets_in_seconds
 // 转换成精确的 RetryAfter，覆盖 parseRetryDelay 的文本估算。
 // 只在失败被归类为限流（Kind=RateLimited）时起作用。
@@ -169,7 +212,14 @@ func classifyResponsesError(errType, errCode, msg string) *responsesFailureError
 			AnthropicErrorType: "invalid_request_error",
 			Message:            msg,
 		}
-	case containsAny(errType, errCode, msg, "invalid_prompt", "invalid_request", "input_too_long", "is not supported", "unsupported", "model_not_found", "invalid model", "invalid_model"):
+	case isModelUnsupportedText(errType, errCode, msg):
+		return &responsesFailureError{
+			Kind:               responsesFailureKindClient,
+			StatusCode:         http.StatusBadRequest,
+			AnthropicErrorType: "invalid_model_error",
+			Message:            msg,
+		}
+	case containsAny(errType, errCode, msg, "invalid_prompt", "invalid_request", "input_too_long", "is not supported", "unsupported", "model_not_found", "model not found", "invalid model", "invalid_model", "does not exist"):
 		return &responsesFailureError{
 			Kind:               responsesFailureKindClient,
 			StatusCode:         http.StatusBadRequest,

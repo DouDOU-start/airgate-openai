@@ -96,6 +96,23 @@ func TestClassifyWSErrorEventOpenAICompatSSEError(t *testing.T) {
 	}
 }
 
+func TestClassifyGenericSSEErrorEventTopLevelModelNotFound(t *testing.T) {
+	raw := []byte(`{"message":"The model gpt-5.3-codex-spark does not exist.","type":"invalid_request_error","code":"model_not_found"}`)
+	failure := classifyGenericSSEErrorEvent(raw)
+	if failure == nil {
+		t.Fatalf("expected failure")
+	}
+	if failure.Kind != responsesFailureKindClient {
+		t.Fatalf("expected client kind, got %q", failure.Kind)
+	}
+	if failure.StatusCode != http.StatusBadRequest {
+		t.Fatalf("expected HTTP 400, got %d", failure.StatusCode)
+	}
+	if kind := failure.outcomeKind(); kind != sdk.OutcomeClientError {
+		t.Fatalf("expected OutcomeClientError, got %v", kind)
+	}
+}
+
 func TestHandleStreamResponseSanitizesFirstSSEError(t *testing.T) {
 	resp := &http.Response{
 		StatusCode: http.StatusOK,
@@ -114,6 +131,68 @@ func TestHandleStreamResponseSanitizesFirstSSEError(t *testing.T) {
 	body := w.Body.String()
 	if strings.Contains(body, "upstream secret") || strings.Contains(body, "349f8894") {
 		t.Fatalf("response leaked upstream error: %q", body)
+	}
+}
+
+func TestHandleStreamResponseTreatsCompletedEmptyStreamAsFailure(t *testing.T) {
+	body := strings.Join([]string{
+		`data: {"id":"chatcmpl_test","choices":[{"delta":{"role":"assistant"},"finish_reason":null}]}`,
+		"",
+		`data: {"id":"chatcmpl_test","choices":[{"delta":{},"finish_reason":"stop"}]}`,
+		"",
+		"data: [DONE]",
+		"",
+	}, "\n")
+	resp := &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+		Body:       io.NopCloser(strings.NewReader(body)),
+	}
+	w := httptest.NewRecorder()
+
+	outcome, err := handleStreamResponse(resp, w, time.Now(), "")
+	if err == nil {
+		t.Fatalf("expected empty stream error")
+	}
+	if outcome.Kind != sdk.OutcomeUpstreamTransient {
+		t.Fatalf("expected OutcomeUpstreamTransient, got %v", outcome.Kind)
+	}
+	if !strings.Contains(outcome.Reason, "上游流式响应为空") {
+		t.Fatalf("unexpected reason %q", outcome.Reason)
+	}
+	if w.Body.Len() != 0 {
+		t.Fatalf("empty stream should not be forwarded before validation, got %q", w.Body.String())
+	}
+}
+
+func TestHandleStreamResponseFlushesBufferedPreludeWhenOutputArrives(t *testing.T) {
+	body := strings.Join([]string{
+		`data: {"id":"chatcmpl_test","choices":[{"delta":{"role":"assistant"},"finish_reason":null}]}`,
+		"",
+		`data: {"id":"chatcmpl_test","choices":[{"delta":{"content":"ok"},"finish_reason":null}]}`,
+		"",
+		`data: {"id":"chatcmpl_test","choices":[{"delta":{},"finish_reason":"stop"}]}`,
+		"",
+		"data: [DONE]",
+		"",
+	}, "\n")
+	resp := &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+		Body:       io.NopCloser(strings.NewReader(body)),
+	}
+	w := httptest.NewRecorder()
+
+	outcome, err := handleStreamResponse(resp, w, time.Now(), "")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if outcome.Kind != sdk.OutcomeSuccess {
+		t.Fatalf("expected OutcomeSuccess, got %v", outcome.Kind)
+	}
+	got := w.Body.String()
+	if !strings.Contains(got, `"role":"assistant"`) || !strings.Contains(got, `"content":"ok"`) || !strings.Contains(got, "data: [DONE]") {
+		t.Fatalf("buffered stream was not forwarded completely: %q", got)
 	}
 }
 

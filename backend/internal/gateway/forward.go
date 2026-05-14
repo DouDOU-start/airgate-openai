@@ -49,9 +49,8 @@ func (g *OpenAIGateway) forwardHTTP(ctx context.Context, req *sdk.ForwardRequest
 	}
 
 	// GET /v1/models：用插件内置模型清单本地返回。
-	// image_enabled=true 时只返回图像模型，false 时只返回对话模型。
 	if isModelsListingRequest(req) {
-		return buildLocalModelsResponse(isImageEnabled(req.Headers)), nil
+		return buildLocalModelsResponse(), nil
 	}
 
 	// 统一预处理请求体。multipart 请求（images/edits 上传图片）body 是二进制，
@@ -70,19 +69,9 @@ func (g *OpenAIGateway) forwardHTTP(ctx context.Context, req *sdk.ForwardRequest
 	account := req.Account
 
 	// GET /v1/images/tasks/list：任务历史列表
-	if isImageTaskListRequest(reqPath) {
-		if g.host == nil {
-			body := jsonError("任务系统未启用")
-			return sdk.ForwardOutcome{
-				Kind:     sdk.OutcomeClientError,
-				Upstream: sdk.UpstreamResponse{StatusCode: http.StatusServiceUnavailable, Body: body},
-			}, nil
-		}
-		return g.handleImageTaskList(ctx, req)
-	}
-
 	// GET /v1/images/tasks：任务状态查询
-	if isImageTaskQuery(reqPath) {
+	// 两者都通过 image.generate handler 的 BuildResponse 投影响应。
+	if isImageTaskListRequest(reqPath) || isImageTaskQuery(reqPath) {
 		if g.host == nil {
 			body := jsonError("任务系统未启用")
 			return sdk.ForwardOutcome{
@@ -90,34 +79,22 @@ func (g *OpenAIGateway) forwardHTTP(ctx context.Context, req *sdk.ForwardRequest
 				Upstream: sdk.UpstreamResponse{StatusCode: http.StatusServiceUnavailable, Body: body},
 			}, nil
 		}
-		return g.handleImageTaskQuery(ctx, req)
-	}
-
-	if isImagesRequest(reqPath) && !isImageEnabled(req.Headers) {
-		body := jsonError("当前分组未开启图片生成功能")
-		if req.Writer != nil {
-			req.Writer.Header().Set("Content-Type", "application/json")
-			req.Writer.WriteHeader(http.StatusForbidden)
-			_, _ = req.Writer.Write(body)
+		handler := g.tasks.Get(taskTypeImageGenerate)
+		if handler == nil {
+			body := jsonError("任务类型未注册")
+			return sdk.ForwardOutcome{
+				Kind:     sdk.OutcomeClientError,
+				Upstream: sdk.UpstreamResponse{StatusCode: http.StatusInternalServerError, Body: body},
+			}, nil
 		}
-		return sdk.ForwardOutcome{
-			Kind: sdk.OutcomeClientError,
-			Upstream: sdk.UpstreamResponse{
-				StatusCode: http.StatusForbidden,
-				Headers:    http.Header{"Content-Type": []string{"application/json"}},
-				Body:       body,
-			},
-			Reason: "分组未开启 image_enabled",
-		}, nil
+		if isImageTaskListRequest(reqPath) {
+			return g.handleTaskList(ctx, req, handler)
+		}
+		return g.handleTaskQuery(ctx, req, handler)
 	}
 
 	if !isImagesRequest(reqPath) && model.IsImageOnly(req.Model) {
 		body := jsonError("图像模型不支持 Chat Completions，请使用 Images API")
-		if req.Writer != nil {
-			req.Writer.Header().Set("Content-Type", "application/json")
-			req.Writer.WriteHeader(http.StatusBadRequest)
-			_, _ = req.Writer.Write(body)
-		}
 		return sdk.ForwardOutcome{
 			Kind: sdk.OutcomeClientError,
 			Upstream: sdk.UpstreamResponse{
@@ -129,10 +106,16 @@ func (g *OpenAIGateway) forwardHTTP(ctx context.Context, req *sdk.ForwardRequest
 		}, nil
 	}
 
-	// 图片生成任务持久化：host 可用、是 images 请求、非 ProcessTask 回调时，
-	// 创建 Core Task 并轮询结果，实现服务重启不丢任务。
+	// 任务路径：host 可用、是 images 请求、非 ProcessTask 回调时，
+	// 通过 TaskRegistry 找到 handler，创建 Core Task 并立即返回 task_id。
 	if g.host != nil && isImagesRequest(reqPath) && !isTaskExecution(req.Headers) {
-		return g.forwardImagesViaTask(ctx, req, reqPath)
+		taskType := taskTypeImageGenerate
+		if isImagesEditRequest(reqPath) {
+			taskType = taskTypeImageEdit
+		}
+		if handler := g.tasks.Get(taskType); handler != nil {
+			return g.forwardTask(ctx, req, reqPath, handler)
+		}
 	}
 
 	if account.Credentials["api_key"] != "" {
@@ -166,12 +149,6 @@ func isImageTaskQuery(reqPath string) bool {
 	return strings.HasSuffix(reqPath, "/images/tasks")
 }
 
-// isImageEnabled 检查分组是否开启了图片生成功能。
-// Core 通过 X-Airgate-Plugin-Openai-Image-Enabled 头传递分组的 plugin_settings。
-func isImageEnabled(headers http.Header) bool {
-	return strings.EqualFold(headers.Get("X-Airgate-Plugin-Openai-Image-Enabled"), "true")
-}
-
 // isModelsListingRequest 判断当前请求是否为 GET /v1/models。
 //
 // Core 不会透传原始方法和路径，只能用既有线索推断：
@@ -188,16 +165,12 @@ func isModelsListingRequest(req *sdk.ForwardRequest) bool {
 }
 
 // buildLocalModelsResponse 用插件内置模型注册表合成 OpenAI 兼容的 /v1/models 响应。
-// imageOnly=true 时只返回图像模型，false 时只返回对话模型。
-func buildLocalModelsResponse(imageOnly bool) sdk.ForwardOutcome {
+func buildLocalModelsResponse() sdk.ForwardOutcome {
 	specs := model.AllSpecs(true)
 	data := make([]map[string]any, 0, len(specs))
 	created := time.Now().Unix()
 	for _, spec := range specs {
 		isImage := model.IsImageOnly(spec.ID)
-		if imageOnly != isImage {
-			continue
-		}
 		entry := map[string]any{
 			"id":           spec.ID,
 			"object":       "model",
@@ -249,11 +222,6 @@ func (g *OpenAIGateway) forwardAPIKey(ctx context.Context, req *sdk.ForwardReque
 		body, contentType, err := buildAPIKeyImagesEditMultipartBody(req.Body, req.Headers.Get("Content-Type"))
 		if err != nil {
 			errBody := jsonError(err.Error())
-			if req.Writer != nil {
-				req.Writer.Header().Set("Content-Type", "application/json")
-				req.Writer.WriteHeader(http.StatusBadRequest)
-				_, _ = req.Writer.Write(errBody)
-			}
 			return sdk.ForwardOutcome{
 				Kind: sdk.OutcomeClientError,
 				Upstream: sdk.UpstreamResponse{
@@ -328,7 +296,7 @@ func (g *OpenAIGateway) forwardAPIKey(ctx context.Context, req *sdk.ForwardReque
 				sdk.LogFieldModel, req.Model,
 				sdk.LogFieldError, err,
 			)
-			writeSSEError(req.Writer, sanitizedImageSSEErrorMessage)
+			writeSSEErrorIfStarted(req.Writer, sseKA, sanitizedImageSSEErrorMessage)
 		}
 		logger.Warn("upstream_request_failed",
 			sdk.LogFieldAccountID, account.ID,
@@ -357,7 +325,7 @@ func (g *OpenAIGateway) forwardAPIKey(ctx context.Context, req *sdk.ForwardReque
 				sdk.LogFieldStatus, resp.StatusCode,
 				sdk.LogFieldReason, errDetail,
 			)
-			writeSSEError(req.Writer, sanitizedImageSSEErrorMessage)
+			writeSSEErrorIfStarted(req.Writer, sseKA, sanitizedImageSSEErrorMessage)
 		}
 		logger.Warn("upstream_request_non_2xx",
 			sdk.LogFieldAccountID, account.ID,
@@ -399,7 +367,7 @@ func (g *OpenAIGateway) forwardAPIKey(ctx context.Context, req *sdk.ForwardReque
 			reason := fmt.Sprintf("读取 Images 响应失败: %v", readErr)
 			if sseKA != nil {
 				sseKA.Stop()
-				writeSSEError(req.Writer, sanitizedImageSSEErrorMessage)
+				writeSSEErrorIfStarted(req.Writer, sseKA, sanitizedImageSSEErrorMessage)
 			}
 			return transientOutcome(reason), fmt.Errorf("%s", reason)
 		}
@@ -421,7 +389,7 @@ func (g *OpenAIGateway) forwardAPIKey(ctx context.Context, req *sdk.ForwardReque
 				)
 				if sseKA != nil {
 					sseKA.Stop()
-					writeSSEError(req.Writer, sanitizedImageSSEErrorMessage)
+					writeSSEErrorIfStarted(req.Writer, sseKA, sanitizedImageSSEErrorMessage)
 				}
 				return transientOutcome(reason), fmt.Errorf("%s", reason)
 			}
@@ -433,7 +401,7 @@ func (g *OpenAIGateway) forwardAPIKey(ctx context.Context, req *sdk.ForwardReque
 	}
 
 	if req.Stream && req.Writer != nil {
-		return handleStreamResponse(resp, req.Writer, start, reqServiceTier)
+		return handleStreamResponseWithLogger(logger, resp, req.Writer, start, reqServiceTier)
 	}
 	return handleNonStreamResponse(resp, req.Writer, start, reqServiceTier)
 }
@@ -542,7 +510,8 @@ func (g *OpenAIGateway) forwardOAuth(ctx context.Context, req *sdk.ForwardReques
 				sdk.LogFieldReason, err.Error(),
 				"phase", "ws_handshake",
 			)
-			outcome := failureOutcome(wsResp.StatusCode, nil, wsResp.Header.Clone(), err.Error(), 0)
+			wsBody := openAIErrorJSON(openAIErrorTypeForStatus(wsResp.StatusCode), "", err.Error())
+			outcome := failureOutcome(wsResp.StatusCode, wsBody, wsResp.Header.Clone(), err.Error(), extractRetryAfterHeader(wsResp.Header))
 			outcome.Duration = time.Since(start)
 			return outcome, err
 		}
@@ -640,13 +609,13 @@ func (g *OpenAIGateway) forwardOAuth(ctx context.Context, req *sdk.ForwardReques
 
 	w := req.Writer
 
-	// 流式响应头在请求开始就写；非流式（chat.completions 或 responses）等 result 就绪后写 JSON。
+	// 流式响应先设置头，但不提前 WriteHeader。
+	// 如果上游在首个可转发事件前返回校验错误（例如模型不支持），调用方仍能写出 4xx JSON。
 	if w != nil && !silentBuffered {
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.Header().Set("Cache-Control", "no-cache")
 		w.Header().Set("Connection", "keep-alive")
 		w.Header().Set("X-Accel-Buffering", "no")
-		w.WriteHeader(http.StatusOK)
 	}
 
 	result, err := runAttempt(createMsg, w)
@@ -663,38 +632,6 @@ func (g *OpenAIGateway) forwardOAuth(ctx context.Context, req *sdk.ForwardReques
 	if session.SessionKey != "" {
 		if result.ResponseID != "" {
 			updateSessionStateResponseID(session.SessionKey, result.ResponseID)
-		}
-	}
-
-	// 结束标记 / 响应体写回
-	switch {
-	case isChatCompletions && req.Stream:
-		if lastChatWriter != nil {
-			lastChatWriter.finalize()
-		}
-	case isChatCompletions && !req.Stream:
-		if result.Err == nil && w != nil {
-			body := buildNonStreamChatCompletion(result, req.Model)
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusOK)
-			_, _ = w.Write(body)
-		}
-	case !isChatCompletions && !req.Stream:
-		// /v1/responses 非流式：从 WSResult 抽 response 字段回写 JSON
-		if result.Err == nil && w != nil {
-			body := buildNonStreamResponses(result)
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusOK)
-			_, _ = w.Write(body)
-		}
-	default:
-		// /v1/responses 流式：补 [DONE] 标记
-		if w != nil {
-			if _, err := fmt.Fprint(w, "data: [DONE]\n\n"); err == nil {
-				if flusher, ok := w.(http.Flusher); ok {
-					flusher.Flush()
-				}
-			}
 		}
 	}
 
@@ -734,10 +671,13 @@ func (g *OpenAIGateway) forwardOAuth(ctx context.Context, req *sdk.ForwardReques
 			message = failure.Message
 			retryAfter = failure.RetryAfter
 		}
-		// 流已开写的场景：Client 错误仍按 ClientError 透传；其它非账号错误视为 StreamAborted。
-		if req.Stream && kind != sdk.OutcomeClientError {
+		streamOutputStarted := (lastChatWriter != nil && lastChatWriter.wrote) ||
+			(lastSSEHandler != nil && lastSSEHandler.wrote)
+		// 只有已经向客户端写过可见输出时才视为流中断；首包前错误仍交给 Core failover。
+		if req.Stream && streamOutputStarted && kind != sdk.OutcomeClientError && kind != sdk.OutcomeAccountModelUnsupported {
 			kind = sdk.OutcomeStreamAborted
 		}
+		errBody := openAIErrorJSON(openAIErrorTypeForStatus(statusCode), kind.String(), message)
 		logger.Warn("upstream_request_non_2xx",
 			sdk.LogFieldAccountID, account.ID,
 			sdk.LogFieldModel, req.Model,
@@ -748,11 +688,44 @@ func (g *OpenAIGateway) forwardOAuth(ctx context.Context, req *sdk.ForwardReques
 		)
 		return sdk.ForwardOutcome{
 			Kind:       kind,
-			Upstream:   sdk.UpstreamResponse{StatusCode: statusCode},
+			Upstream:   sdk.UpstreamResponse{StatusCode: statusCode, Headers: http.Header{"Content-Type": []string{"application/json"}}, Body: errBody},
 			Reason:     message,
 			RetryAfter: retryAfter,
 			Duration:   elapsed,
 		}, result.Err
+	}
+
+	// 结束标记 / 响应体写回。必须在 result.Err 判定之后执行，避免把上游错误补成
+	// finish_reason=stop + [DONE] 的空成功流。
+	switch {
+	case isChatCompletions && req.Stream:
+		if lastChatWriter != nil {
+			lastChatWriter.finalize()
+		}
+	case isChatCompletions && !req.Stream:
+		if w != nil {
+			body := buildNonStreamChatCompletion(result, req.Model)
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write(body)
+		}
+	case !isChatCompletions && !req.Stream:
+		// /v1/responses 非流式：从 WSResult 抽 response 字段回写 JSON
+		if w != nil {
+			body := buildNonStreamResponses(result)
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write(body)
+		}
+	default:
+		// /v1/responses 流式：补 [DONE] 标记
+		if w != nil {
+			if _, err := fmt.Fprint(w, "data: [DONE]\n\n"); err == nil {
+				if flusher, ok := w.(http.Flusher); ok {
+					flusher.Flush()
+				}
+			}
+		}
 	}
 
 	logger.Debug("upstream_request_completed",
@@ -787,6 +760,7 @@ type sseEventWriter struct {
 	start          time.Time // 请求开始时间，用于计算首 token 延迟
 	firstTokenMs   int64     // 首 token 到达时间（毫秒）
 	firstTokenOnce sync.Once // 确保只记录一次
+	wrote          bool
 }
 
 func (s *sseEventWriter) OnTextDelta(string)      {}
@@ -827,6 +801,7 @@ func (s *sseEventWriter) OnRawEvent(eventType string, data []byte) {
 	if _, err := fmt.Fprintf(s.w, "event: %s\ndata: %s\n\n", eventType, strings.ReplaceAll(string(data), "\n", "")); err != nil {
 		return
 	}
+	s.wrote = true
 	if s.flusher != nil {
 		s.flusher.Flush()
 	}

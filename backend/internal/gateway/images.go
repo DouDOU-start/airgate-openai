@@ -1089,8 +1089,8 @@ func estimateImageInputTokens(count int, size string) int {
 // 的 image_generation tool 调用，跑 OAuth WS 通道，最后把生成的 base64 图像
 // 重新包装成 Images REST 响应返回给客户端。
 //
-// 只在 OAuth 账号被调度到 /v1/images/generations 时使用；API Key 账号继续走
-// 原生 REST 通道（见 handleImagesResponse）。
+// 只在 OAuth 账号处理 /v1/images/generations 时使用；API Key 账号继续走原生
+// REST 通道（见 handleImagesResponse）。
 func (g *OpenAIGateway) forwardImagesViaResponsesTool(ctx context.Context, req *sdk.ForwardRequest) (sdk.ForwardOutcome, error) {
 	start := time.Now()
 	account := req.Account
@@ -1107,11 +1107,6 @@ func (g *OpenAIGateway) forwardImagesViaResponsesTool(ctx context.Context, req *
 	}
 	if err != nil {
 		body := jsonError(err.Error())
-		if req.Writer != nil {
-			req.Writer.Header().Set("Content-Type", "application/json")
-			req.Writer.WriteHeader(http.StatusBadRequest)
-			_, _ = req.Writer.Write(body)
-		}
 		return sdk.ForwardOutcome{
 			Kind: sdk.OutcomeClientError,
 			Upstream: sdk.UpstreamResponse{
@@ -1133,11 +1128,6 @@ func (g *OpenAIGateway) forwardImagesViaResponsesTool(ctx context.Context, req *
 	createMsg, n, promptTokens, err := buildImagesToolCreateMsg(req.Body, contentType, isEdit, session)
 	if err != nil {
 		body := jsonError(err.Error())
-		if req.Writer != nil {
-			req.Writer.Header().Set("Content-Type", "application/json")
-			req.Writer.WriteHeader(http.StatusBadRequest)
-			_, _ = req.Writer.Write(body)
-		}
 		return sdk.ForwardOutcome{
 			Kind: sdk.OutcomeClientError,
 			Upstream: sdk.UpstreamResponse{
@@ -1162,7 +1152,8 @@ func (g *OpenAIGateway) forwardImagesViaResponsesTool(ctx context.Context, req *
 	conn, wsResp, err := DialWebSocket(cfg)
 	if err != nil {
 		if wsResp != nil {
-			outcome := failureOutcome(wsResp.StatusCode, nil, wsResp.Header.Clone(), err.Error(), 0)
+			wsBody := openAIErrorJSON(openAIErrorTypeForStatus(wsResp.StatusCode), "", err.Error())
+			outcome := failureOutcome(wsResp.StatusCode, wsBody, wsResp.Header.Clone(), err.Error(), extractRetryAfterHeader(wsResp.Header))
 			outcome.Duration = time.Since(start)
 			return outcome, err
 		}
@@ -1206,7 +1197,7 @@ func (g *OpenAIGateway) forwardImagesViaResponsesTool(ctx context.Context, req *
 					if failure.StatusCode == http.StatusRequestEntityTooLarge {
 						clientMsg = imageTooLargeSSEErrorMessage
 					}
-					writeSSEError(req.Writer, clientMsg)
+					writeSSEErrorIfStarted(req.Writer, sseKA, clientMsg)
 				}
 				return sdk.ForwardOutcome{
 					Kind: sdk.OutcomeClientError,
@@ -1227,11 +1218,12 @@ func (g *OpenAIGateway) forwardImagesViaResponsesTool(ctx context.Context, req *
 				g.logger.Warn("Images OAuth 流式请求失败，已脱敏响应",
 					"path", reqPath, "model", imgReq.Model, "status_code", failure.StatusCode,
 					"kind", failure.Kind, "retry_after", failure.RetryAfter, "error", wsResult.Err)
-				writeSSEError(req.Writer, sanitizedImageSSEErrorMessage)
+				writeSSEErrorIfStarted(req.Writer, sseKA, sanitizedImageSSEErrorMessage)
 			}
+			errBody := openAIErrorJSON(openAIErrorTypeForStatus(failure.StatusCode), string(failure.Kind), failure.Message)
 			return sdk.ForwardOutcome{
 				Kind:       failure.outcomeKind(),
-				Upstream:   sdk.UpstreamResponse{StatusCode: failure.StatusCode},
+				Upstream:   sdk.UpstreamResponse{StatusCode: failure.StatusCode, Headers: http.Header{"Content-Type": []string{"application/json"}}, Body: errBody},
 				Reason:     failure.Error(),
 				RetryAfter: failure.RetryAfter,
 				Duration:   elapsed,
@@ -1242,7 +1234,7 @@ func (g *OpenAIGateway) forwardImagesViaResponsesTool(ctx context.Context, req *
 			sseKA.Stop()
 			g.logger.Warn("Images OAuth 流式请求失败，已脱敏响应",
 				"path", reqPath, "model", imgReq.Model, "error", wsResult.Err)
-			writeSSEError(req.Writer, sanitizedImageSSEErrorMessage)
+			writeSSEErrorIfStarted(req.Writer, sseKA, sanitizedImageSSEErrorMessage)
 		}
 		return sdk.ForwardOutcome{
 			Kind:     sdk.OutcomeUpstreamTransient,
@@ -1262,7 +1254,7 @@ func (g *OpenAIGateway) forwardImagesViaResponsesTool(ctx context.Context, req *
 			sseKA.Stop()
 			g.logger.Warn("Images OAuth 未返回图像结果，已脱敏响应",
 				"path", reqPath, "model", imgReq.Model, "reason", reason)
-			writeSSEError(req.Writer, sanitizedImageSSEErrorMessage)
+			writeSSEErrorIfStarted(req.Writer, sseKA, sanitizedImageSSEErrorMessage)
 		}
 		return sdk.ForwardOutcome{
 			Kind: sdk.OutcomeUpstreamTransient,
@@ -1284,7 +1276,7 @@ func (g *OpenAIGateway) forwardImagesViaResponsesTool(ctx context.Context, req *
 				sseKA.Stop()
 				g.logger.Warn("Images OAuth 编辑结果合成失败，已脱敏响应",
 					"path", reqPath, "model", imgReq.Model, "error", err)
-				writeSSEError(req.Writer, sanitizedImageSSEErrorMessage)
+				writeSSEErrorIfStarted(req.Writer, sseKA, sanitizedImageSSEErrorMessage)
 			}
 			return sdk.ForwardOutcome{
 				Kind: sdk.OutcomeUpstreamTransient,
@@ -1438,7 +1430,7 @@ func handleImagesResponseWithLogger(logger *slog.Logger, resp *http.Response, w 
 			if logger != nil {
 				logger.Warn("Images APIKey 响应读取失败，已脱敏响应", "model", fallbackModel, "error", err)
 			}
-			writeSSEError(w, sanitizedImageSSEErrorMessage)
+			writeSSEErrorIfStarted(w, sseKA, sanitizedImageSSEErrorMessage)
 		}
 		return transientOutcome(reason), fmt.Errorf("%s", reason)
 	}

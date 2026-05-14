@@ -24,13 +24,17 @@ import (
 //	400 + 消息含限流关键词 → AccountRateLimited（部分上游用 400 返回 usage_limit_reached）
 //	400 + 消息含 disabled/deactivated → AccountDead
 //	5xx → UpstreamTransient
+//	4xx + 消息含模型不支持 / 不存在 → AccountModelUnsupported（当前账号或通道不支持，Core 可换号）
 //	其它 4xx → ClientError（客户端请求自己的问题，账号无辜）
 func classifyHTTPFailure(statusCode int, message string) sdk.OutcomeKind {
-	if isTemporaryRateLimitText(message) && (statusCode == 400 || statusCode == 403 || statusCode == 429) {
+	if isTemporaryRateLimitText(message) && (statusCode == 403 || statusCode == 429) {
 		return sdk.OutcomeAccountRateLimited
 	}
-	if isDisabledAccountText(message) && (statusCode == 400 || statusCode == 403) {
+	if isDisabledAccountText(message) && statusCode == 403 {
 		return sdk.OutcomeAccountDead
+	}
+	if statusCode > 400 && statusCode != 429 && isModelUnsupportedText(message) {
+		return sdk.OutcomeAccountModelUnsupported
 	}
 	switch statusCode {
 	case 429:
@@ -86,6 +90,35 @@ func isDisabledAccountText(parts ...string) bool {
 		strings.Contains(combined, "suspended")
 }
 
+func isModelUnsupportedText(parts ...string) bool {
+	combined := strings.ToLower(strings.Join(parts, " "))
+	if combined == "" {
+		return false
+	}
+	directSignals := []string{
+		"model_not_found",
+		"model_not_supported",
+		"invalid_model",
+		"unsupported_model",
+		"no such model",
+	}
+	for _, signal := range directSignals {
+		if strings.Contains(combined, signal) {
+			return true
+		}
+	}
+	if !strings.Contains(combined, "model") {
+		return false
+	}
+	return strings.Contains(combined, "not supported") ||
+		strings.Contains(combined, "unsupported") ||
+		strings.Contains(combined, "does not support") ||
+		strings.Contains(combined, "does not exist") ||
+		strings.Contains(combined, "not found") ||
+		strings.Contains(combined, "not available") ||
+		strings.Contains(combined, "invalid model")
+}
+
 // anthropicErrorType 根据 HTTP 状态码返回 Anthropic 错误类型。
 func anthropicErrorType(statusCode int) string {
 	switch statusCode {
@@ -108,14 +141,30 @@ func anthropicErrorType(statusCode int) string {
 	}
 }
 
-// writeAnthropicErrorJSON 纯 sjson 构建并写入 Anthropic 格式错误响应。
-func writeAnthropicErrorJSON(w http.ResponseWriter, statusCode int, errType, message string) {
+func anthropicErrorJSON(errType, message string) []byte {
 	out := `{"type":"error","error":{"type":"","message":""}}`
 	out, _ = sjson.Set(out, "error.type", errType)
 	out, _ = sjson.Set(out, "error.message", message)
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(statusCode)
-	_, _ = w.Write([]byte(out))
+	return []byte(out)
+}
+
+func openAIErrorJSON(errType, code, message string) []byte {
+	out := `{"error":{"message":"","type":"","code":""}}`
+	out, _ = sjson.Set(out, "error.message", message)
+	out, _ = sjson.Set(out, "error.type", errType)
+	out, _ = sjson.Set(out, "error.code", code)
+	return []byte(out)
+}
+
+func openAIErrorTypeForStatus(statusCode int) string {
+	switch {
+	case statusCode == http.StatusTooManyRequests:
+		return "rate_limit_error"
+	case statusCode >= 500:
+		return "server_error"
+	default:
+		return "invalid_request_error"
+	}
 }
 
 // extractRetryAfterHeader 从响应头提取 Retry-After。
