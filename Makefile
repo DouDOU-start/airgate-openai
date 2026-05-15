@@ -2,7 +2,7 @@
 
 GO := GOTOOLCHAIN=local go
 
-.PHONY: help install build build-web build-backend build-at release dev ensure-webdist ci pre-commit lint fmt test vet clean setup-hooks
+.PHONY: help install build build-web build-backend release dev ensure-webdist ci pre-commit lint fmt test vet clean setup-hooks
 
 help: ## 显示帮助信息
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-18s\033[0m %s\n", $$1, $$2}'
@@ -23,9 +23,6 @@ build-backend: ## 构建后端（自动复制前端产物）
 	rm -rf backend/internal/gateway/webdist
 	cp -r web/dist backend/internal/gateway/webdist
 	cd backend && $(GO) build -o ../bin/gateway-openai .
-
-build-at: ## 构建 at 终端 CLI
-	cd backend && $(GO) build -o ../bin/at ./cmd/at
 
 release: build-web ## 编译 Linux 版本（用于上传到 Docker 部署）
 	rm -rf backend/internal/gateway/webdist
