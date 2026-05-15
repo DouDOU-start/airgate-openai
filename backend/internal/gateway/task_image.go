@@ -128,6 +128,14 @@ func executeImageTask(ctx context.Context, g *OpenAIGateway, task sdk.HostTask, 
 	headers.Set("Content-Type", "application/json")
 	headers.Set("Accept", "application/json")
 	headers.Set(taskExecHeader, "true")
+	headers.Set(taskIDHeader, strconv.FormatInt(task.ID, 10))
+
+	if task.Execution != nil {
+		if uid, ok := task.Execution["upstream_task_id"].(string); ok && uid != "" {
+			headers.Set(upstreamTaskIDHeader, uid)
+			rt.logger.Info("task_retry_with_upstream_id", "upstream_task_id", uid)
+		}
+	}
 
 	if err := rt.SetProgress(ctx, 30); err != nil {
 		return err

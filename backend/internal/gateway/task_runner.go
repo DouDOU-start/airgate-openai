@@ -16,6 +16,10 @@ const (
 	// taskExecHeader 递归守卫：ProcessTask 通过 host.Forward 回调本网关时携带此头，
 	// forwardHTTP 看到后走原始同步转发，不再创建新任务。
 	taskExecHeader = "X-Airgate-Task-Execution"
+	// taskIDHeader 携带 core task ID，forward 层用它保存上游异步 task_id 到 execution。
+	taskIDHeader = "X-Airgate-Task-ID"
+	// upstreamTaskIDHeader 携带上次保存的上游异步 task_id，forward 层看到后直接 poll 恢复。
+	upstreamTaskIDHeader = "X-Airgate-Upstream-Task-ID"
 )
 
 // TaskError 结构化任务错误。Core 可按 Type 决定是否重试。
@@ -38,6 +42,10 @@ type TaskRuntime struct {
 
 func (rt *TaskRuntime) SetProgress(ctx context.Context, progress int) error {
 	return rt.g.updateHostTask(ctx, rt.taskID, "", progress, nil, "")
+}
+
+func (rt *TaskRuntime) SaveExecution(ctx context.Context, execution map[string]any) error {
+	return rt.g.updateHostTask(ctx, rt.taskID, "", 0, nil, "", WithExecution(execution))
 }
 
 func (rt *TaskRuntime) Complete(ctx context.Context, output map[string]any) error {
@@ -66,6 +74,14 @@ func (g *OpenAIGateway) ProcessTask(ctx context.Context, task sdk.HostTask) erro
 	}
 
 	logger := g.logger.With("task_id", task.ID, "task_type", task.TaskType)
+
+	// Fetch full task from core to get Execution and Attempts (gRPC only sends minimal fields).
+	full, err := g.getHostTask(ctx, 0, task.ID)
+	if err == nil && full != nil {
+		task.Attempts = full.Attempts
+		task.Execution = full.Execution
+	}
+
 	if task.Attempts > 1 {
 		logger.Info("task_redispatch", "attempts", task.Attempts)
 	} else {

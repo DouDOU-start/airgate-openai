@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -360,6 +361,24 @@ func (g *OpenAIGateway) forwardAPIKey(ctx context.Context, req *sdk.ForwardReque
 
 	// Images API 响应体无 model 字段，另走专用处理器回填后再 fillCost
 	if isImagesRequest(reqPath) {
+		// 重试恢复路径：如果 header 带了上次保存的上游 task_id，直接 poll 跳过重复请求
+		if recoveryID := req.Headers.Get(upstreamTaskIDHeader); recoveryID != "" {
+			logger.Info("images_async_task_recovery",
+				sdk.LogFieldAccountID, account.ID,
+				"upstream_task_id", recoveryID,
+			)
+			finalBody, pollErr := g.pollAsyncImageTask(ctx, account, recoveryID, logger)
+			if pollErr != nil {
+				logger.Warn("images_async_task_recovery_failed",
+					"upstream_task_id", recoveryID,
+					sdk.LogFieldError, pollErr,
+				)
+				// 恢复失败，不 return — 继续走正常响应处理（本次请求已经发出去了，用它的结果）
+			} else {
+				resp.Body = io.NopCloser(bytes.NewReader(finalBody))
+			}
+		}
+
 		// 检测异步任务模式（如 apimart.ai gpt-image-2 返回 task_id）
 		body, readErr := io.ReadAll(resp.Body)
 		_ = resp.Body.Close()
@@ -378,6 +397,15 @@ func (g *OpenAIGateway) forwardAPIKey(ctx context.Context, req *sdk.ForwardReque
 				sdk.LogFieldModel, req.Model,
 				"task_id", taskID,
 			)
+			// 保存上游 task_id 到 core task 的 execution，服务重启后可恢复
+			if coreTaskID := req.Headers.Get(taskIDHeader); coreTaskID != "" {
+				cid, _ := strconv.ParseInt(coreTaskID, 10, 64)
+				if cid > 0 {
+					_ = g.updateHostTask(ctx, cid, "", 0, nil, "",
+						WithExecution(map[string]any{"upstream_task_id": taskID}))
+				}
+			}
+
 			finalBody, pollErr := g.pollAsyncImageTask(ctx, account, taskID, logger)
 			if pollErr != nil {
 				reason := fmt.Sprintf("异步图片任务轮询失败: %v", pollErr)

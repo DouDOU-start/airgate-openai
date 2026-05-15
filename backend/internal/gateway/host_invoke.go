@@ -78,7 +78,21 @@ func (g *OpenAIGateway) createHostTask(ctx context.Context, taskType string, use
 	return hostTaskFromPayload(firstPayloadValue(payload, "task", "data", "result", ""))
 }
 
-func (g *OpenAIGateway) updateHostTask(ctx context.Context, taskID int64, status sdk.TaskStatus, progress int, output map[string]interface{}, errorMessage string) error {
+type updateTaskOptions struct {
+	Execution map[string]any
+}
+
+type UpdateTaskOption func(*updateTaskOptions)
+
+func WithExecution(exec map[string]any) UpdateTaskOption {
+	return func(o *updateTaskOptions) { o.Execution = exec }
+}
+
+func (g *OpenAIGateway) updateHostTask(ctx context.Context, taskID int64, status sdk.TaskStatus, progress int, output map[string]interface{}, errorMessage string, opts ...UpdateTaskOption) error {
+	var o updateTaskOptions
+	for _, fn := range opts {
+		fn(&o)
+	}
 	payload := map[string]interface{}{
 		"task_id": taskID,
 	}
@@ -93,6 +107,9 @@ func (g *OpenAIGateway) updateHostTask(ctx context.Context, taskID int64, status
 	}
 	if errorMessage != "" {
 		payload["error_message"] = errorMessage
+	}
+	if o.Execution != nil {
+		payload["execution"] = o.Execution
 	}
 	_, err := g.hostInvoke(ctx, hostMethodTasksUpdate, payload)
 	return err
@@ -210,6 +227,7 @@ func hostTaskFromPayload(value interface{}) (*sdk.HostTask, error) {
 		UserID:       int64FromAny(firstPayloadValue(m, "user_id")),
 		Input:        mapValueFromAny(firstPayloadValue(m, "input")),
 		Output:       mapValueFromAny(firstPayloadValue(m, "output")),
+		Execution:    mapValueFromAny(firstPayloadValue(m, "execution")),
 		ErrorMessage: stringFromAny(firstPayloadValue(m, "error_message", "error")),
 		Progress:     intFromAny(firstPayloadValue(m, "progress")),
 		Attempts:     intFromAny(firstPayloadValue(m, "attempts")),
