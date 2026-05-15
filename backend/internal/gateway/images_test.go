@@ -73,6 +73,31 @@ func TestIsImagesRequest(t *testing.T) {
 	}
 }
 
+func TestPrefersAsyncResponse(t *testing.T) {
+	if prefersAsyncResponse(http.Header{"Content-Type": []string{"application/json"}}) {
+		t.Fatal("plain Images API request should keep the standard synchronous response")
+	}
+
+	for _, headers := range []http.Header{
+		{"Prefer": []string{"respond-async"}},
+		{"Prefer": []string{"wait=60, respond-async"}},
+		{"Prefer": []string{"respond-async; handling=lenient"}},
+	} {
+		if !prefersAsyncResponse(headers) {
+			t.Fatalf("Prefer header should opt into async response: %+v", headers)
+		}
+	}
+}
+
+func TestImageTaskLocation(t *testing.T) {
+	if got := imageTaskLocation("/v1/images/generations", 123); got != "/v1/images/tasks?task_id=123" {
+		t.Fatalf("v1 location = %q", got)
+	}
+	if got := imageTaskLocation("/images/generations", 123); got != "/images/tasks?task_id=123" {
+		t.Fatalf("non-v1 location = %q", got)
+	}
+}
+
 func TestShouldUseImagesWebReverse(t *testing.T) {
 	cases := []struct {
 		name    string

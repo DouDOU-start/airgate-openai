@@ -107,9 +107,9 @@ func (g *OpenAIGateway) forwardHTTP(ctx context.Context, req *sdk.ForwardRequest
 		}, nil
 	}
 
-	// 任务路径：host 可用、是 images 请求、非 ProcessTask 回调时，
-	// 通过 TaskRegistry 找到 handler，创建 Core Task 并立即返回 task_id。
-	if g.host != nil && isImagesRequest(reqPath) && !isTaskExecution(req.Headers) {
+	// Images API 默认保持 OpenAI 标准同步响应，避免 SDK 把 task_id 响应解析成 data=nil。
+	// 客户端显式发送 Prefer: respond-async 时，才创建 Core Task 并立即返回 202。
+	if g.host != nil && isImagesRequest(reqPath) && !isTaskExecution(req.Headers) && prefersAsyncResponse(req.Headers) {
 		taskType := taskTypeImageGenerate
 		if isImagesEditRequest(reqPath) {
 			taskType = taskTypeImageEdit
@@ -148,6 +148,21 @@ func isImageTaskListRequest(reqPath string) bool {
 // isImageTaskQuery 判断是否为 GET /v1/images/tasks 任务状态查询。
 func isImageTaskQuery(reqPath string) bool {
 	return strings.HasSuffix(reqPath, "/images/tasks")
+}
+
+func prefersAsyncResponse(headers http.Header) bool {
+	for _, value := range headers.Values("Prefer") {
+		for _, token := range strings.Split(value, ",") {
+			preference := strings.ToLower(strings.TrimSpace(token))
+			if i := strings.IndexByte(preference, ';'); i >= 0 {
+				preference = strings.TrimSpace(preference[:i])
+			}
+			if preference == "respond-async" {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // isModelsListingRequest 判断当前请求是否为 GET /v1/models。

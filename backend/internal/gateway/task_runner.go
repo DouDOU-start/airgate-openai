@@ -176,11 +176,24 @@ func (g *OpenAIGateway) forwardTask(ctx context.Context, req *sdk.ForwardRequest
 
 	logger.Info("task_created", "task_id", task.ID, "task_type", handler.Type())
 
-	resp := map[string]any{"task_id": task.ID, "status": "pending"}
+	location := imageTaskLocation(reqPath, task.ID)
+	resp := map[string]any{
+		"object":     "image.task",
+		"task_id":    task.ID,
+		"status":     "pending",
+		"status_url": location,
+	}
 	respBody, _ := json.Marshal(resp)
+	headers := http.Header{"Content-Type": []string{"application/json"}}
+	headers.Set("Preference-Applied", "respond-async")
+	headers.Set("Location", location)
 
 	if req.Writer != nil {
-		req.Writer.Header().Set("Content-Type", "application/json")
+		for key, values := range headers {
+			for _, value := range values {
+				req.Writer.Header().Add(key, value)
+			}
+		}
 		req.Writer.WriteHeader(http.StatusAccepted)
 		_, _ = req.Writer.Write(respBody)
 	}
@@ -188,10 +201,17 @@ func (g *OpenAIGateway) forwardTask(ctx context.Context, req *sdk.ForwardRequest
 		Kind: sdk.OutcomeSuccess,
 		Upstream: sdk.UpstreamResponse{
 			StatusCode: http.StatusAccepted,
-			Headers:    http.Header{"Content-Type": []string{"application/json"}},
+			Headers:    headers,
 			Body:       respBody,
 		},
 	}, nil
+}
+
+func imageTaskLocation(reqPath string, taskID int64) string {
+	if strings.HasPrefix(reqPath, "/images/") {
+		return fmt.Sprintf("/images/tasks?task_id=%d", taskID)
+	}
+	return fmt.Sprintf("/v1/images/tasks?task_id=%d", taskID)
 }
 
 // isTaskExecution 检测当前请求是否由 ProcessTask 通过 host.Forward 发起（递归守卫）。
