@@ -166,9 +166,12 @@ plugins:
 ```bash
 cd backend && go run ./cmd/devserver   # 启动本地 devserver（模拟 core）
 cd backend && go run ./cmd/chat        # 启动交互式测试客户端（SSE / WS 双协议）
+cd backend && go run ./cmd/at          # 查询 OpenAI 账号用量窗口并进入交互式对话
 ```
 
 更多命令见 `make help`。
+
+`cmd/at` 面向已运行的 AirGate Core：用 `AIRGATE_ADMIN_TOKEN` 查询 `/api/v1/admin/accounts/usage?platform=openai`，用 `AIRGATE_API_KEY` 通过 `/v1/responses` 进入交互式对话。也可以单独运行 `at usage` 或 `at chat`。
 
 ## 🔄 Anthropic 协议翻译
 
