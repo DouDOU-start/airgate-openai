@@ -272,6 +272,31 @@ func (g *OpenAIGateway) forwardAPIKey(ctx context.Context, req *sdk.ForwardReque
 	}
 	passHeadersForAccount(req.Headers, upstreamReq.Header, account)
 
+	// 重启恢复：有上游异步 task_id 的 images 请求直接 poll，不再重复发起上游请求
+	if isImagesRequest(reqPath) {
+		if recoveryID := req.Headers.Get(upstreamTaskIDHeader); recoveryID != "" {
+			logger.Info("images_async_task_recovery_before_request",
+				sdk.LogFieldAccountID, account.ID,
+				"upstream_task_id", recoveryID,
+			)
+			finalBody, pollErr := g.pollAsyncImageTask(ctx, account, recoveryID, logger)
+			if pollErr == nil {
+				mockResp := &http.Response{
+					StatusCode: http.StatusOK,
+					Header:     http.Header{"Content-Type": []string{"application/json"}},
+					Body:       io.NopCloser(bytes.NewReader(finalBody)),
+				}
+				return g.handleImagesResponse(mockResp, req.Writer, nil, start, req.Model, imagesBillingSize)
+			}
+			reason := fmt.Sprintf("上游异步任务恢复失败: %v", pollErr)
+			logger.Warn("images_async_task_recovery_failed",
+				"upstream_task_id", recoveryID,
+				sdk.LogFieldError, pollErr,
+			)
+			return transientOutcome(reason), fmt.Errorf("%s", reason)
+		}
+	}
+
 	var sseKA *ssePingKeepAlive
 	if isImagesRequest(reqPath) && req.Stream {
 		sseKA = startSSEPingKeepAlive(req.Writer)
@@ -361,24 +386,6 @@ func (g *OpenAIGateway) forwardAPIKey(ctx context.Context, req *sdk.ForwardReque
 
 	// Images API 响应体无 model 字段，另走专用处理器回填后再 fillCost
 	if isImagesRequest(reqPath) {
-		// 重试恢复路径：如果 header 带了上次保存的上游 task_id，直接 poll 跳过重复请求
-		if recoveryID := req.Headers.Get(upstreamTaskIDHeader); recoveryID != "" {
-			logger.Info("images_async_task_recovery",
-				sdk.LogFieldAccountID, account.ID,
-				"upstream_task_id", recoveryID,
-			)
-			finalBody, pollErr := g.pollAsyncImageTask(ctx, account, recoveryID, logger)
-			if pollErr != nil {
-				logger.Warn("images_async_task_recovery_failed",
-					"upstream_task_id", recoveryID,
-					sdk.LogFieldError, pollErr,
-				)
-				// 恢复失败，不 return — 继续走正常响应处理（本次请求已经发出去了，用它的结果）
-			} else {
-				resp.Body = io.NopCloser(bytes.NewReader(finalBody))
-			}
-		}
-
 		// 检测异步任务模式（如 apimart.ai gpt-image-2 返回 task_id）
 		body, readErr := io.ReadAll(resp.Body)
 		_ = resp.Body.Close()

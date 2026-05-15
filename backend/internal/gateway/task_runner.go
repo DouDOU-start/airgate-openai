@@ -58,7 +58,41 @@ func (rt *TaskRuntime) Fail(ctx context.Context, taskErr *TaskError) error {
 		msg = fmt.Sprintf("[%s] %s", taskErr.Type, msg)
 	}
 	rt.logger.Warn("task_failed", "task_id", rt.taskID, "error_type", taskErr.Type, "error", msg)
-	return rt.g.updateHostTask(ctx, rt.taskID, sdk.TaskStatusFailed, 0, nil, msg)
+	userMsg := sanitizeTaskMessage(taskErr)
+	return rt.g.updateHostTask(ctx, rt.taskID, sdk.TaskStatusFailed, 0, nil, userMsg)
+}
+
+func sanitizeTaskMessage(taskErr *TaskError) string {
+	msg := taskErr.Message
+	if strings.Contains(msg, "rpc error:") {
+		if desc := extractGRPCDesc(msg); desc != "" {
+			return desc
+		}
+		return userFriendlyFallback(taskErr.Type)
+	}
+	if strings.Contains(msg, "upstream 转发失败") {
+		return userFriendlyFallback(taskErr.Type)
+	}
+	return msg
+}
+
+func userFriendlyFallback(errType string) string {
+	switch errType {
+	case "rate_limited":
+		return "当前请求过多，请稍后重试"
+	case "auth_error":
+		return "账号认证失败，请联系管理员"
+	default:
+		return "请求暂时无法完成，请稍后重试"
+	}
+}
+
+func extractGRPCDesc(s string) string {
+	const prefix = "desc = "
+	if i := strings.Index(s, prefix); i >= 0 {
+		return strings.TrimSpace(s[i+len(prefix):])
+	}
+	return ""
 }
 
 // ── ProcessTask 分发入口 ──

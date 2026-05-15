@@ -1460,10 +1460,7 @@ func handleImagesResponseWithLogger(logger *slog.Logger, resp *http.Response, w 
 		modelName = fallbackModel
 	}
 
-	numImages := int(gjson.GetBytes(body, "data.#").Int())
-	if numImages <= 0 {
-		numImages = 1
-	}
+	numImages := countUsableImages(body)
 	if logger == nil {
 		logger = slog.Default()
 	}
@@ -1510,6 +1507,24 @@ func handleImagesResponseWithLogger(logger *slog.Logger, resp *http.Response, w 
 		outcome.Upstream.Body = body
 	}
 	return outcome, nil
+}
+
+// countUsableImages 统计响应体中实际携带图片数据（b64_json 或 url）的条目数。
+// 不含可用图片时返回 0，避免空响应被错误计费。
+func countUsableImages(body []byte) int {
+	dataArr := gjson.GetBytes(body, "data")
+	if !dataArr.Exists() || !dataArr.IsArray() {
+		return 0
+	}
+	n := 0
+	for _, item := range dataArr.Array() {
+		if item.Get("b64_json").String() != "" {
+			n++
+		} else if u := item.Get("url").String(); strings.HasPrefix(u, "http://") || strings.HasPrefix(u, "https://") {
+			n++
+		}
+	}
+	return n
 }
 
 // ──────────────────────────────────────────────────────

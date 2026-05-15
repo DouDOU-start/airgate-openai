@@ -151,6 +151,22 @@ function fallbackDetails(record: UsageRecordLike): UsageCostDetailItem[] {
 
 export function UsageCostDetail({ context }: UsageRecordSurfaceProps) {
   const record = recordFromContext(context);
+  const isAdmin = context?.adminView !== false;
+
+  if (!isAdmin) {
+    return (
+      <div style={panelStyle}>
+        <div style={headerStyle}>
+          <div style={titleStyle}>费用</div>
+          {record.model ? <div style={subtitleStyle}>{record.model}</div> : null}
+        </div>
+        <div style={bodyStyle}>
+          <Row label="本次消费" value={money(record.actual_cost)} tone="var(--ag-warning)" />
+        </div>
+      </div>
+    );
+  }
+
   const details = contextArray<UsageCostDetailItem>(context, 'usageCostDetails', 'usage_cost_details');
   const rows = details.length > 0 ? details : fallbackDetails(record);
 

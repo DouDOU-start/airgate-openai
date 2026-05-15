@@ -100,6 +100,10 @@ func buildImageTaskInput(req *sdk.ForwardRequest, reqPath string, isEdit bool) (
 	if groupID > 0 {
 		input["group_id"] = groupID
 	}
+	apiKeyID, _ := strconv.ParseInt(req.Headers.Get("X-Airgate-API-Key-ID"), 10, 64)
+	if apiKeyID > 0 {
+		input["api_key_id"] = apiKeyID
+	}
 
 	// attributes 是少量展示/筛选维度
 	attributes := map[string]string{
@@ -114,6 +118,7 @@ func buildImageTaskInput(req *sdk.ForwardRequest, reqPath string, isEdit bool) (
 
 func executeImageTask(ctx context.Context, g *OpenAIGateway, task sdk.HostTask, rt *TaskRuntime, defaultPath string) error {
 	groupID, _ := intFromInput(task.Input, "group_id")
+	apiKeyID, _ := intFromInput(task.Input, "api_key_id")
 	model, _ := task.Input["model"].(string)
 
 	isRedispatch := task.Attempts > 1
@@ -160,7 +165,7 @@ func executeImageTask(ctx context.Context, g *OpenAIGateway, task sdk.HostTask, 
 		return err
 	}
 
-	resp, err := g.forwardViaHost(ctx, task.UserID, groupID, model, http.MethodPost, defaultPath, headers, reqBody, false)
+	resp, err := g.forwardViaHost(ctx, task.UserID, groupID, apiKeyID, model, http.MethodPost, defaultPath, headers, reqBody, false)
 	if err != nil {
 		return rt.Fail(ctx, &TaskError{
 			Type:      "upstream_error",
@@ -180,13 +185,17 @@ func executeImageTask(ctx context.Context, g *OpenAIGateway, task sdk.HostTask, 
 
 	content, err := storeImageAssetsFromResponse(ctx, g, task.UserID, resp.Body)
 	if err != nil {
-		rt.logger.Warn("store_image_assets_failed", "error", err)
-		content = ""
-	}
-	if content == "" {
+		rt.logger.Warn("store_image_assets_failed", "error", err, "body_len", len(resp.Body))
 		return rt.Fail(ctx, &TaskError{
 			Type:    "upstream_error",
-			Message: "上游响应中未包含可用图片",
+			Message: "上游响应中未包含可用图片: " + err.Error(),
+		})
+	}
+	if content == "" {
+		rt.logger.Warn("store_image_assets_empty", "body_len", len(resp.Body))
+		return rt.Fail(ctx, &TaskError{
+			Type:    "upstream_error",
+			Message: "图片存储失败，所有图片均未能保存",
 		})
 	}
 
@@ -251,22 +260,35 @@ func storeImageAssetsFromResponse(ctx context.Context, g *OpenAIGateway, userID 
 	if err := json.Unmarshal(body, &resp); err != nil {
 		return "", fmt.Errorf("parse images response: %w", err)
 	}
+	if len(resp.Data) == 0 {
+		return "", fmt.Errorf("response data array is empty (body length=%d)", len(body))
+	}
 
+	logger := sdk.LoggerFromContext(ctx)
 	scope := fmt.Sprintf("openai/images/user-%d", userID)
 	var sb strings.Builder
-	for _, item := range resp.Data {
+	for i, item := range resp.Data {
 		var localURL string
 		var err error
 		switch {
 		case item.B64JSON != "":
 			data, decErr := base64.StdEncoding.DecodeString(item.B64JSON)
 			if decErr != nil {
+				logger.Warn("store_image_b64_decode_failed", "index", i, "error", decErr)
 				continue
 			}
 			localURL, err = g.storeAsset(ctx, userID, scope, "image/png", ".png", data)
+			if err != nil {
+				logger.Warn("store_image_asset_failed", "index", i, "b64_len", len(item.B64JSON), "error", err)
+			}
 		case item.URL != "" && (strings.HasPrefix(item.URL, "http://") || strings.HasPrefix(item.URL, "https://")):
 			localURL, err = g.storeAssetFromURL(ctx, userID, scope, item.URL)
+			if err != nil {
+				logger.Warn("store_image_from_url_failed", "index", i, "error", err)
+			}
 		default:
+			logger.Warn("store_image_no_data", "index", i,
+				"has_b64", item.B64JSON != "", "has_url", item.URL != "")
 			continue
 		}
 		if err != nil || localURL == "" {

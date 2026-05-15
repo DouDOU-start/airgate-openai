@@ -150,8 +150,8 @@ func (g *OpenAIGateway) listHostTasks(ctx context.Context, userID int64, taskTyp
 	return out, nil
 }
 
-func (g *OpenAIGateway) forwardViaHost(ctx context.Context, userID, groupID int64, modelID, method, path string, headers http.Header, body []byte, stream bool) (*hostForwardResponse, error) {
-	payload, err := g.hostInvoke(ctx, hostMethodGatewayForward, map[string]interface{}{
+func (g *OpenAIGateway) forwardViaHost(ctx context.Context, userID, groupID, apiKeyID int64, modelID, method, path string, headers http.Header, body []byte, stream bool) (*hostForwardResponse, error) {
+	req := map[string]interface{}{
 		"user_id":  userID,
 		"group_id": groupID,
 		"model":    modelID,
@@ -160,7 +160,11 @@ func (g *OpenAIGateway) forwardViaHost(ctx context.Context, userID, groupID int6
 		"headers":  headerPayload(headers),
 		"body":     string(body),
 		"stream":   stream,
-	})
+	}
+	if apiKeyID > 0 {
+		req["api_key_id"] = apiKeyID
+	}
+	payload, err := g.hostInvoke(ctx, hostMethodGatewayForward, req)
 	if err != nil {
 		return nil, err
 	}
