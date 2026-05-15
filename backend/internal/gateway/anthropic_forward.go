@@ -268,15 +268,7 @@ func explicitAnthropicRequestServiceTier(req *sdk.ForwardRequest) string {
 	return firstNonEmptyTier(headerTier, gjson.GetBytes(req.Body, "service_tier").String())
 }
 
-func defaultAnthropicUsageServiceTier(req *sdk.ForwardRequest) string {
-	if req == nil {
-		return ""
-	}
-	// ChatGPT Codex OAuth 翻译路径默认是前端语义里的 fast，
-	// 后端按 OpenAI service_tier=priority 记录。
-	if resolveAnthropicUpstreamStrategy(req.Account) == anthropicStrategyOAuth {
-		return "priority"
-	}
+func defaultAnthropicUsageServiceTier(_ *sdk.ForwardRequest) string {
 	return ""
 }
 

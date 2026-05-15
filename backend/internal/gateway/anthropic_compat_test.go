@@ -167,12 +167,12 @@ func TestExplicitAnthropicRequestServiceTier(t *testing.T) {
 	}
 }
 
-func TestDefaultAnthropicUsageServiceTierUsesPriorityForOAuth(t *testing.T) {
+func TestDefaultAnthropicUsageServiceTierAlwaysEmpty(t *testing.T) {
 	oauthReq := &sdk.ForwardRequest{
 		Account: &sdk.Account{Credentials: map[string]string{"access_token": "token"}},
 	}
-	if got := defaultAnthropicUsageServiceTier(oauthReq); got != "priority" {
-		t.Fatalf("OAuth 默认服务档位 = %q，期望 priority", got)
+	if got := defaultAnthropicUsageServiceTier(oauthReq); got != "" {
+		t.Fatalf("OAuth 默认服务档位 = %q，期望空值", got)
 	}
 
 	apiKeyReq := &sdk.ForwardRequest{
