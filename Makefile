@@ -10,14 +10,14 @@ help: ## 显示帮助信息
 # ===================== 构建 =====================
 
 install: ## 安装前后端依赖
-	cd web && npm install
+	cd web && pnpm install
 	cd backend && $(GO) mod download
 	@echo "依赖安装完成"
 
 build: build-web build-backend ## 完整构建：前端 → 复制 → 后端
 
 build-web: ## 构建前端
-	cd web && npm run build
+	cd web && pnpm build
 
 build-backend: ## 构建后端（自动复制前端产物）
 	rm -rf backend/internal/gateway/webdist
@@ -36,11 +36,11 @@ release: build-web ## 编译 Linux 版本（用于上传到 Docker 部署）
 dev: ## 启动开发服务器（自动安装依赖、构建前端）
 	@if [ ! -d web/node_modules ]; then \
 		echo "检测到前端依赖未安装，正在安装..."; \
-		cd web && npm install; \
+		cd web && pnpm install; \
 	fi
 	@if [ ! -d web/dist ]; then \
 		echo "检测到前端未构建，正在构建..."; \
-		cd web && npm run build; \
+		cd web && pnpm build; \
 	fi
 	cd backend && $(GO) run ./cmd/devserver
 
@@ -65,8 +65,8 @@ lint: ## 代码检查（需要安装 golangci-lint）
 		exit 1; \
 	fi
 	@cd backend && golangci-lint run ./...
-	@cd web && npx tsc --noEmit
-	@cd web && npm run lint
+	@cd web && pnpm exec tsc --noEmit
+	@cd web && pnpm lint
 	@echo "代码检查通过"
 
 fmt: ## 格式化代码

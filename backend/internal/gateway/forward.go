@@ -740,13 +740,20 @@ func (g *OpenAIGateway) forwardOAuth(ctx context.Context, req *sdk.ForwardReques
 			sdk.LogFieldReason, message,
 			"phase", "ws_response",
 		)
-		return sdk.ForwardOutcome{
+		outcome := sdk.ForwardOutcome{
 			Kind:       kind,
 			Upstream:   sdk.UpstreamResponse{StatusCode: statusCode, Headers: http.Header{"Content-Type": []string{"application/json"}}, Body: errBody},
 			Reason:     message,
 			RetryAfter: retryAfter,
 			Duration:   elapsed,
-		}, result.Err
+		}
+		// 即使请求失败，上游可能已消耗 token（如 response.failed / response.incomplete），
+		// 仍需计费避免漏洞。
+		if result.InputTokens > 0 || result.OutputTokens > 0 || result.CachedInputTokens > 0 {
+			fillUsageCostWithImageTool(usage, numImages, imageToolSize)
+			outcome.Usage = usage
+		}
+		return outcome, result.Err
 	}
 
 	// 结束标记 / 响应体写回。必须在 result.Err 判定之后执行，避免把上游错误补成

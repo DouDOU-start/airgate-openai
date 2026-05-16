@@ -241,7 +241,7 @@ func (g *OpenAIGateway) handleTaskQuery(ctx context.Context, req *sdk.ForwardReq
 		}
 		task, err = g.getHostTask(ctx, userID, taskID)
 	} else {
-		task, err = g.getHostTaskByPublicID(ctx, userID, taskIDStr)
+		task, err = g.getHostTaskByPublicTaskID(ctx, userID, taskIDStr)
 	}
 	if err != nil {
 		return writeJSONOutcome(req.Writer, http.StatusInternalServerError, sdk.OutcomeUpstreamTransient, jsonError("查询任务失败: "+err.Error())), nil
@@ -343,8 +343,8 @@ func externalTaskID(task *sdk.HostTask) string {
 	if task == nil {
 		return ""
 	}
-	if task.PublicID != "" {
-		return task.PublicID
+	if task.PublicTaskID != "" {
+		return task.PublicTaskID
 	}
 	return strconv.FormatInt(task.ID, 10)
 }

@@ -62,7 +62,7 @@ func (g *OpenAIGateway) hostInvoke(ctx context.Context, method string, payload m
 }
 
 func (g *OpenAIGateway) createHostTask(ctx context.Context, taskType string, userID int64, input map[string]interface{}, attributes map[string]string, priority, maxAttempts int) (*sdk.HostTask, error) {
-	publicID, err := uuid.NewV7()
+	publicTaskID, err := uuid.NewV7()
 	if err != nil {
 		return nil, fmt.Errorf("生成任务 UUIDv7 失败: %w", err)
 	}
@@ -73,7 +73,7 @@ func (g *OpenAIGateway) createHostTask(ctx context.Context, taskType string, use
 		"input":           input,
 		"priority":        priority,
 		"max_attempts":    maxAttempts,
-		"idempotency_key": publicID.String(),
+		"idempotency_key": publicTaskID.String(),
 	}
 	if len(attributes) > 0 {
 		payload["attributes"] = attributes
@@ -130,7 +130,7 @@ func (g *OpenAIGateway) getHostTask(ctx context.Context, userID, taskID int64) (
 	return hostTaskFromPayload(firstPayloadValue(payload, "task", "data", "result", ""))
 }
 
-func (g *OpenAIGateway) getHostTaskByPublicID(ctx context.Context, userID int64, publicTaskID string) (*sdk.HostTask, error) {
+func (g *OpenAIGateway) getHostTaskByPublicTaskID(ctx context.Context, userID int64, publicTaskID string) (*sdk.HostTask, error) {
 	payload, err := g.hostInvoke(ctx, hostMethodTasksGet, map[string]interface{}{
 		"plugin_id":      PluginID,
 		"public_task_id": publicTaskID,
@@ -244,7 +244,7 @@ func hostTaskFromPayload(value interface{}) (*sdk.HostTask, error) {
 	}
 	task := &sdk.HostTask{
 		ID:           int64FromAny(firstPayloadValue(m, "id", "task_id")),
-		PublicID:     publicTaskIDFromPayload(m),
+		PublicTaskID: publicTaskIDFromPayload(m),
 		PluginID:     stringFromAny(firstPayloadValue(m, "plugin_id")),
 		TaskType:     stringFromAny(firstPayloadValue(m, "task_type", "type")),
 		Status:       sdk.TaskStatus(stringFromAny(firstPayloadValue(m, "status"))),
@@ -265,8 +265,8 @@ func hostTaskFromPayload(value interface{}) (*sdk.HostTask, error) {
 }
 
 func publicTaskIDFromPayload(m map[string]interface{}) string {
-	if publicID := stringFromAny(firstPayloadValue(m, "public_task_id", "idempotency_key")); publicID != "" {
-		return publicID
+	if publicTaskID := stringFromAny(firstPayloadValue(m, "public_task_id", "idempotency_key")); publicTaskID != "" {
+		return publicTaskID
 	}
 	if taskID, ok := firstPayloadValue(m, "task_id").(string); ok {
 		return taskID

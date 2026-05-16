@@ -475,6 +475,10 @@ func ParseSSEStream(reader io.Reader, handler WSEventHandler) WSResult {
 
 		case "response.failed":
 			result.FailedEventRaw = append([]byte(nil), []byte(data)...)
+			if resp, ok := ev["response"].(map[string]any); ok {
+				extractUsageFromResponseMap(&result, resp)
+				mergeResponseMetadata(&result, resp)
+			}
 			if failure := classifyResponsesFailure([]byte(data)); failure != nil {
 				result.Err = failure
 			} else {
@@ -486,13 +490,20 @@ func ParseSSEStream(reader io.Reader, handler WSEventHandler) WSResult {
 		case "response.incomplete":
 			reason := "unknown"
 			if resp, ok := ev["response"].(map[string]any); ok {
+				extractUsageFromResponseMap(&result, resp)
+				mergeResponseMetadata(&result, resp)
 				if details, ok := resp["incomplete_details"].(map[string]any); ok {
 					if r, ok := details["reason"].(string); ok {
 						reason = r
 					}
 				}
 			}
-			result.Err = fmt.Errorf("响应不完整: %s", reason)
+			if reason == "max_output_tokens" {
+				result.CompletedEventRaw = append([]byte(nil), []byte(data)...)
+				result.StopReason = reason
+			} else {
+				result.Err = fmt.Errorf("响应不完整: %s", reason)
+			}
 			finalizeWSResult(&result, &textBuilder, &reasoningBuilder, start)
 			return result
 

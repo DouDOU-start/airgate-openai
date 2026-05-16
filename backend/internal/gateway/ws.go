@@ -299,6 +299,10 @@ func ReceiveWSResponse(ctx context.Context, conn *websocket.Conn, handler WSEven
 
 		case "response.failed":
 			result.FailedEventRaw = append([]byte(nil), msg...)
+			if resp, ok := ev["response"].(map[string]any); ok {
+				extractUsageFromResponseMap(&result, resp)
+				mergeResponseMetadata(&result, resp)
+			}
 			if failure := classifyResponsesFailure(msg); failure != nil {
 				result.Err = failure
 			} else {
@@ -310,13 +314,20 @@ func ReceiveWSResponse(ctx context.Context, conn *websocket.Conn, handler WSEven
 		case "response.incomplete":
 			reason := "unknown"
 			if resp, ok := ev["response"].(map[string]any); ok {
+				extractUsageFromResponseMap(&result, resp)
+				mergeResponseMetadata(&result, resp)
 				if details, ok := resp["incomplete_details"].(map[string]any); ok {
 					if r, ok := details["reason"].(string); ok {
 						reason = r
 					}
 				}
 			}
-			result.Err = fmt.Errorf("响应不完整: %s", reason)
+			if reason == "max_output_tokens" {
+				result.CompletedEventRaw = append([]byte(nil), msg...)
+				result.StopReason = reason
+			} else {
+				result.Err = fmt.Errorf("响应不完整: %s", reason)
+			}
 			finalizeWSResult(&result, &textBuilder, &reasoningBuilder, start)
 			return result
 

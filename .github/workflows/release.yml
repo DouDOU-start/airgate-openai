@@ -43,17 +43,21 @@ jobs:
           )
           EOF
 
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.1.1
+
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-          cache: npm
-          cache-dependency-path: web/package-lock.json
+          cache: pnpm
+          cache-dependency-path: web/pnpm-lock.yaml
 
       - name: Build @doudou-start/airgate-theme
-        run: cd ../airgate-sdk/theme && npm ci && npm run build
+        run: cd ../airgate-sdk/theme && pnpm install --frozen-lockfile && pnpm run build
 
       - name: Build frontend
-        run: cd web && npm ci && npm run build
+        run: cd web && pnpm install --frozen-lockfile && pnpm run build
 
       - name: Embed web dist
         run: |

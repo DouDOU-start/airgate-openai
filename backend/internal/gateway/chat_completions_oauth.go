@@ -44,6 +44,22 @@ func isChatCompletionsRequest(req *sdk.ForwardRequest) bool {
 	return true
 }
 
+// mapStopReasonToFinishReason 把 Responses API 的 stop_reason / incomplete reason
+// 映射为 Chat Completions 的 finish_reason。
+func mapStopReasonToFinishReason(stopReason string, hasToolCalls bool) string {
+	switch strings.ToLower(strings.TrimSpace(stopReason)) {
+	case "max_output_tokens":
+		return "length"
+	case "content_filter":
+		return "content_filter"
+	default:
+		if hasToolCalls {
+			return "tool_calls"
+		}
+		return "stop"
+	}
+}
+
 // generateChatCmplID 生成 Chat Completions 规定的 "chatcmpl-" 前缀 ID。
 func generateChatCmplID() string {
 	b := make([]byte, 12)
@@ -395,10 +411,7 @@ func buildNonStreamChatCompletion(result WSResult, model string) []byte {
 		message["tool_calls"] = toolCalls
 	}
 
-	finishReason := "stop"
-	if len(toolCalls) > 0 {
-		finishReason = "tool_calls"
-	}
+	finishReason := mapStopReasonToFinishReason(result.StopReason, len(toolCalls) > 0)
 
 	// ReceiveWSResponse 为了计费已经把 cached_tokens 从 InputTokens 里扣掉了，
 	// Chat Completions 的 prompt_tokens 应当是上游原始输入总量，所以这里加回去。
