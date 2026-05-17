@@ -212,6 +212,9 @@ const ReauthRequiredPrefix = "reauth_required: "
 func (g *OpenAIGateway) QueryQuota(ctx context.Context, credentials map[string]string) (*quotaInfo, error) {
 	refreshToken := credentials["refresh_token"]
 	if refreshToken == "" {
+		if access := credentials["access_token"]; access != "" {
+			return g.quotaInfoFromAccessToken(ctx, access, credentials, "")
+		}
 		return nil, sdk.ErrNotSupported
 	}
 
@@ -230,25 +233,7 @@ func (g *OpenAIGateway) QueryQuota(ctx context.Context, credentials map[string]s
 		// "需要重新授权"，其实账号还能正常服务请求。现在放宽：有 access_token
 		// 就成功返回，带上 refresh_warning 标记数据陈旧即可。
 		if access := credentials["access_token"]; access != "" {
-			info := g.enrichTokenInfo(ctx, parseIDToken(access), access, credentials["proxy_url"])
-			extra := map[string]string{
-				"refresh_warning":           "refresh_token_invalid: " + err.Error(),
-				"plan_type":                 info.PlanType,
-				"subscription_active_until": info.SubscriptionActiveUntil,
-			}
-			if info.AccountID != "" {
-				extra["chatgpt_account_id"] = info.AccountID
-			}
-			if info.AccountName != "" {
-				extra["account_name"] = info.AccountName
-			}
-			if info.Email != "" {
-				extra["email"] = info.Email
-			}
-			return &quotaInfo{
-				ExpiresAt: info.SubscriptionActiveUntil,
-				Extra:     extra,
-			}, nil
+			return g.quotaInfoFromAccessToken(ctx, access, credentials, "refresh_token_invalid: "+err.Error())
 		}
 		return nil, fmt.Errorf("%srefresh_token 已失效，请重新授权 OAuth (原因: %s)", ReauthRequiredPrefix, err.Error())
 	}
@@ -276,6 +261,30 @@ func (g *OpenAIGateway) QueryQuota(ctx context.Context, credentials map[string]s
 		extra["refresh_token"] = tokens.RefreshToken
 	}
 
+	return &quotaInfo{
+		ExpiresAt: info.SubscriptionActiveUntil,
+		Extra:     extra,
+	}, nil
+}
+
+func (g *OpenAIGateway) quotaInfoFromAccessToken(ctx context.Context, access string, credentials map[string]string, warning string) (*quotaInfo, error) {
+	info := g.enrichTokenInfo(ctx, parseIDToken(access), access, credentials["proxy_url"])
+	extra := map[string]string{
+		"plan_type":                 info.PlanType,
+		"subscription_active_until": info.SubscriptionActiveUntil,
+	}
+	if warning != "" {
+		extra["refresh_warning"] = warning
+	}
+	if info.AccountID != "" {
+		extra["chatgpt_account_id"] = info.AccountID
+	}
+	if info.AccountName != "" {
+		extra["account_name"] = info.AccountName
+	}
+	if info.Email != "" {
+		extra["email"] = info.Email
+	}
 	return &quotaInfo{
 		ExpiresAt: info.SubscriptionActiveUntil,
 		Extra:     extra,

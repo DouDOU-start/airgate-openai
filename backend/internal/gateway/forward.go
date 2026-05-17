@@ -445,7 +445,6 @@ func (g *OpenAIGateway) forwardAPIKey(ctx context.Context, req *sdk.ForwardReque
 			}
 			body = finalBody
 		}
-
 		resp.Body = io.NopCloser(bytes.NewReader(body))
 		return g.handleImagesResponse(resp, req.Writer, sseKA, start, req.Model, imagesBillingSize)
 	}
@@ -897,6 +896,11 @@ func (g *OpenAIGateway) requestTimeout() time.Duration {
 // buildHTTPClient 构建带代理支持的 HTTP 客户端
 // 使用 TransportPool 按账户+代理隔离连接，同一账户复用连接
 func (g *OpenAIGateway) buildHTTPClient(account *sdk.Account) *http.Client {
+	if g == nil || g.transportPool == nil {
+		return &http.Client{
+			Timeout: g.requestTimeout(),
+		}
+	}
 	transport := g.transportPool.GetTransport(account.ID, account.ProxyURL)
 
 	return &http.Client{
