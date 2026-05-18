@@ -108,19 +108,27 @@ func downloadImageRef(client *http.Client, ref string) (imgen.ImageInput, error)
 const imagesWebReverseModel = "gpt-image-2"
 
 // isImagesWebReverseModel 判断请求是否显式指定了 gpt-image-2。
+// 现已没有 call site（shouldUseImagesWebReverse 恒 false），保留供网页端方案
+// 再次启用时复用，避免重复实现 model 名归一化。
+//
+//nolint:unused
 func isImagesWebReverseModel(model string) bool {
 	return strings.EqualFold(strings.TrimSpace(model), imagesWebReverseModel)
 }
 
-// shouldUseImagesWebReverse 只允许 free OAuth 账号走网页端逆向生图。
+// shouldUseImagesWebReverse 历史上用于把 free OAuth 账号生图请求重定向到
+// chatgpt.com 网页端逆向通道。该通道协议结构与 /v1/images/edits 完全不一致，
+// 对图生图/局部图的支持度也低于 Responses API + image_generation tool 路径，
+// 容易在 studio 这类同时支持文生图/图生图/局部图的入口出现"链路看上去通了
+// 但参考图没生效"的退化。
+//
+// 现已统一回 forwardImagesViaResponsesTool —— free OAuth 账号也走 Responses
+// API。本函数保留并恒返回 false，对应的 forwardImagesViaWebReverse / imgen
+// 子包不删除，后续若网页端逆向方案再次成熟，只需把判定打开即可。
 func shouldUseImagesWebReverse(account *sdk.Account, model string) bool {
-	if account == nil || account.Credentials["access_token"] == "" {
-		return false
-	}
-	if !isImagesWebReverseModel(model) {
-		return false
-	}
-	return strings.EqualFold(strings.TrimSpace(account.Credentials["plan_type"]), "free")
+	_ = account
+	_ = model
+	return false
 }
 
 // forwardImagesViaWebReverse 把一个 OpenAI Images REST 请求翻译成 imgen
