@@ -1,4 +1,4 @@
-import type { CSSProperties } from 'react';
+import { useEffect, useState, type CSSProperties } from 'react';
 import type { AccountSurfaceProps } from '@doudou-start/airgate-theme/plugin';
 
 interface UsageWindowItem {
@@ -31,13 +31,25 @@ function getUsageWindows(context: AccountSurfaceProps['context']): UsageWindowIt
   return windows.filter(isUsageWindowItem);
 }
 
-function resolveResetSeconds(w: UsageWindowItem) {
+function useResetTick(enabled: boolean) {
+  const [now, setNow] = useState(() => Date.now());
+
+  useEffect(() => {
+    if (!enabled) return undefined;
+    const timer = window.setInterval(() => setNow(Date.now()), 30_000);
+    return () => window.clearInterval(timer);
+  }, [enabled]);
+
+  return now;
+}
+
+function resolveResetSeconds(w: UsageWindowItem, now: number) {
+  if (w.reset_at) {
+    const delta = Date.parse(w.reset_at) - now;
+    if (Number.isFinite(delta)) return Math.max(0, Math.floor(delta / 1000));
+  }
   if (typeof w.reset_seconds === 'number') return w.reset_seconds;
   if (typeof w.reset_after_seconds === 'number') return w.reset_after_seconds;
-  if (w.reset_at) {
-    const delta = Date.parse(w.reset_at) - Date.now();
-    if (Number.isFinite(delta) && delta > 0) return Math.floor(delta / 1000);
-  }
   return 0;
 }
 
@@ -180,11 +192,11 @@ const resetStyle: CSSProperties = {
   color: 'var(--ag-text-secondary)',
 };
 
-function renderWindowRow(w: UsageWindowItem, index: number) {
+function renderWindowRow(w: UsageWindowItem, index: number, now: number) {
   const percent = Math.round(w.used_percent);
   const barPercent = Math.max(0, Math.min(100, percent));
   const color = usageColor(w.used_percent);
-  const resetText = formatReset(resolveResetSeconds(w));
+  const resetText = formatReset(resolveResetSeconds(w, now));
 
   return (
     <div key={w.key || `${w.label}:${index}`} style={rowStyle}>
@@ -209,6 +221,7 @@ function renderWindowRow(w: UsageWindowItem, index: number) {
 
 export function UsageWindow({ context }: AccountSurfaceProps) {
   const groups = buildGroups(getUsageWindows(context));
+  const resetNow = useResetTick(groups.length > 0);
   if (groups.length === 0) return null;
 
   return (
@@ -219,10 +232,10 @@ export function UsageWindow({ context }: AccountSurfaceProps) {
           <div key={group.id || `group:${groupIndex}`} style={{ display: 'flex', minWidth: 0, flexDirection: 'column', gap: '0.25rem' }}>
             {pairedRows.length > 0 ? (
               <div style={pairedGroupStyle}>
-                {pairedRows.map((w, rowIndex) => renderWindowRow(w, rowIndex))}
+                {pairedRows.map((w, rowIndex) => renderWindowRow(w, rowIndex, resetNow))}
               </div>
             ) : null}
-            {group.others.map((w, rowIndex) => renderWindowRow(w, rowIndex))}
+            {group.others.map((w, rowIndex) => renderWindowRow(w, rowIndex, resetNow))}
           </div>
         );
       })}

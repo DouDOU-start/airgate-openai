@@ -1,6 +1,9 @@
 package gateway
 
-import "time"
+import (
+	"strings"
+	"time"
+)
 
 // quotaInfo 是 OpenAI 插件私有的账号订阅探测结果。
 //
@@ -15,6 +18,9 @@ type quotaInfo struct {
 type accountUsageWindow struct {
 	Key               string  `json:"key"`
 	Label             string  `json:"label"`
+	DisplayLabel      string  `json:"display_label,omitempty"`
+	Slot              string  `json:"slot,omitempty"`
+	Group             string  `json:"group,omitempty"`
 	UsedPercent       float64 `json:"used_percent"`
 	ResetAt           string  `json:"reset_at,omitempty"`
 	ResetAfterSeconds int     `json:"reset_after_seconds,omitempty"`
@@ -54,11 +60,15 @@ func resetAtFromBase(base time.Time, resetAfterSeconds int) *time.Time {
 }
 
 func newAccountUsageWindow(key, label string, usedPercent float64, resetAt *time.Time, now time.Time) accountUsageWindow {
+	slot := usageWindowSlot(key, label)
 	window := accountUsageWindow{
-		Key:         key,
-		Label:       label,
-		UsedPercent: usedPercent,
-		UpdatedAt:   now.UTC().Format(time.RFC3339),
+		Key:          key,
+		Label:        label,
+		DisplayLabel: slot,
+		Slot:         slot,
+		Group:        usageWindowGroup(key, label, slot),
+		UsedPercent:  usedPercent,
+		UpdatedAt:    now.UTC().Format(time.RFC3339),
 	}
 	if resetAt != nil {
 		window.ResetAt = resetAt.UTC().Format(time.RFC3339)
@@ -67,4 +77,28 @@ func newAccountUsageWindow(key, label string, usedPercent float64, resetAt *time
 		}
 	}
 	return window
+}
+
+func usageWindowSlot(key, label string) string {
+	switch {
+	case key == "7d" || strings.Contains(key, ":7d") || strings.HasPrefix(label, "7d"):
+		return "7d"
+	case key == "5h" || strings.Contains(key, ":5h") || strings.HasPrefix(label, "5h"):
+		return "5h"
+	default:
+		return key
+	}
+}
+
+func usageWindowGroup(key, label, slot string) string {
+	if strings.HasPrefix(key, "model:") {
+		return strings.Replace(key, "model:"+slot+":", "model:", 1)
+	}
+	if strings.HasPrefix(label, slot+" ") {
+		name := strings.TrimSpace(strings.TrimPrefix(label, slot+" "))
+		if name != "" {
+			return "model:" + strings.ToLower(strings.ReplaceAll(name, " ", "-"))
+		}
+	}
+	return "base"
 }
