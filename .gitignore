@@ -35,3 +35,6 @@ go.work
 go.work.sum
 backend/go.work
 backend/go.work.sum
+
+# Local git attributes
+.gitattributes

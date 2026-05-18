@@ -190,10 +190,25 @@ func codexWindowPointers(usedPercent float64, resetAfterSeconds int, windowMinut
 	return &used, &reset, &minutes
 }
 
-// Normalize 把 primary / secondary 字段归一化为 5h / 7d 窗口。
-// 策略与 sub2api 一致：
-//  1. 优先用 window_minutes 判断短窗口和长窗口。
-//  2. 缺少 window_minutes 时按历史头部语义处理：primary=7d，secondary=5h。
+func hasCodexPrimaryWindowData(s *CodexUsageSnapshot) bool {
+	return hasCodexWindowData(s.PrimaryUsedPercent, s.PrimaryResetAfterSeconds, s.PrimaryWindowMinutes)
+}
+
+func hasCodexSecondaryWindowData(s *CodexUsageSnapshot) bool {
+	return hasCodexWindowData(s.SecondaryUsedPercent, s.SecondaryResetAfterSeconds, s.SecondaryWindowMinutes)
+}
+
+func looksLikeShortCodexWindow(resetAfterSeconds int) bool {
+	const maxShortWindowSeconds = 6 * 60 * 60
+	return resetAfterSeconds > 0 && resetAfterSeconds <= maxShortWindowSeconds
+}
+
+// Normalize converts primary/secondary fields to canonical 5h/7d fields.
+// Strategy matches sub2api:
+//  1. Prefer window_minutes to determine which window is shorter.
+//  2. When window_minutes are missing, use reset_after_seconds as a hint.
+//  3. If reset hints are also missing, fall back to legacy assumption:
+//     primary=7d, secondary=5h.
 func (s *CodexUsageSnapshot) Normalize() *NormalizedCodexLimits {
 	if s == nil {
 		return nil
@@ -229,7 +244,22 @@ func (s *CodexUsageSnapshot) Normalize() *NormalizedCodexLimits {
 			use5hFromPrimary = true
 		}
 	default:
-		use7dFromPrimary = true
+		primaryHasData := hasCodexPrimaryWindowData(s)
+		secondaryHasData := hasCodexSecondaryWindowData(s)
+		switch {
+		case primaryHasData && secondaryHasData && s.PrimaryResetAfterSeconds > 0 && s.SecondaryResetAfterSeconds > 0:
+			if s.PrimaryResetAfterSeconds <= s.SecondaryResetAfterSeconds {
+				use5hFromPrimary = true
+			} else {
+				use7dFromPrimary = true
+			}
+		case primaryHasData && !secondaryHasData && looksLikeShortCodexWindow(s.PrimaryResetAfterSeconds):
+			use5hFromPrimary = true
+		case !primaryHasData && secondaryHasData && !looksLikeShortCodexWindow(s.SecondaryResetAfterSeconds):
+			use5hFromPrimary = true
+		default:
+			use7dFromPrimary = true
+		}
 	}
 
 	if use5hFromPrimary {
