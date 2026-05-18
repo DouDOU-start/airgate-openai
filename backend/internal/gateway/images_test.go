@@ -99,62 +99,40 @@ func TestImageTaskLocation(t *testing.T) {
 	}
 }
 
+// TestShouldUseImagesWebReverse pins WebReverse off across every previously
+// matching shape. WebReverse is deprecated — kept compiled, but never picked.
+// If someone re-enables it, this test will flag every legacy-positive case so
+// the rollout is deliberate.
 func TestShouldUseImagesWebReverse(t *testing.T) {
 	cases := []struct {
 		name    string
 		account *sdk.Account
 		model   string
-		want    bool
 	}{
-		{
-			name: "free oauth with gpt-image-2",
-			account: &sdk.Account{Credentials: map[string]string{
-				"access_token": "token",
-				"plan_type":    "free",
-			}},
-			model: "gpt-image-2",
-			want:  true,
-		},
-		{
-			name: "plus oauth with gpt-image-2",
-			account: &sdk.Account{Credentials: map[string]string{
-				"access_token": "token",
-				"plan_type":    "plus",
-			}},
-			model: "gpt-image-2",
-			want:  false,
-		},
-		{
-			name: "oauth without plan type",
-			account: &sdk.Account{Credentials: map[string]string{
-				"access_token": "token",
-			}},
-			model: "gpt-image-2",
-			want:  false,
-		},
-		{
-			name: "free oauth with other model",
-			account: &sdk.Account{Credentials: map[string]string{
-				"access_token": "token",
-				"plan_type":    "free",
-			}},
-			model: "gpt-image-1",
-			want:  false,
-		},
-		{
-			name: "apikey account",
-			account: &sdk.Account{Credentials: map[string]string{
-				"api_key": "sk-test",
-			}},
-			model: "gpt-image-2",
-			want:  false,
-		},
+		{"free oauth with gpt-image-2 (legacy positive)", &sdk.Account{Credentials: map[string]string{
+			"access_token": "token",
+			"plan_type":    "free",
+		}}, "gpt-image-2"},
+		{"plus oauth with gpt-image-2", &sdk.Account{Credentials: map[string]string{
+			"access_token": "token",
+			"plan_type":    "plus",
+		}}, "gpt-image-2"},
+		{"oauth without plan type", &sdk.Account{Credentials: map[string]string{
+			"access_token": "token",
+		}}, "gpt-image-2"},
+		{"free oauth with other model", &sdk.Account{Credentials: map[string]string{
+			"access_token": "token",
+			"plan_type":    "free",
+		}}, "gpt-image-1"},
+		{"apikey account", &sdk.Account{Credentials: map[string]string{
+			"api_key": "sk-test",
+		}}, "gpt-image-2"},
 	}
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := shouldUseImagesWebReverse(tc.account, tc.model); got != tc.want {
-				t.Fatalf("shouldUseImagesWebReverse() = %v, want %v", got, tc.want)
+			if got := shouldUseImagesWebReverse(tc.account, tc.model); got {
+				t.Fatalf("shouldUseImagesWebReverse() = true; WebReverse is deprecated, must be false")
 			}
 		})
 	}
@@ -896,6 +874,126 @@ func TestBuildImagesToolCreateMsg_Edit_MissingImage(t *testing.T) {
 	)
 	if err == nil {
 		t.Fatal("expected err for missing image, got nil")
+	}
+}
+
+// TestBuildImagesToolCreateMsg_Edit_Img2ImgNoMask 钉死 OAuth Responses-tool 路径
+// 上"纯图生图"（无 mask）的载荷形状：必须 1 张 input_image 而且不生成 region
+// annotation。这是 studio ComposerBar 图生图入口最常见的请求形态，是 OAuth
+// 路径上历史最容易"看上去通了但参考图没生效"的退化点。
+func TestBuildImagesToolCreateMsg_Edit_Img2ImgNoMask(t *testing.T) {
+	imageRef := testPNGDataURL(2, 2, func(x, y int) color.RGBA {
+		return color.RGBA{R: 120, G: 30, B: 30, A: 255}
+	})
+	body := []byte(fmt.Sprintf(`{
+		"model":"gpt-image-2",
+		"prompt":"make it cyberpunk",
+		"size":"1024x1024",
+		"image":%q
+	}`, imageRef))
+
+	msg, n, _, err := buildImagesToolCreateMsg(body, "application/json", true, openAISessionResolution{})
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	if n != 1 {
+		t.Errorf("n = %d, want 1", n)
+	}
+	content := gjson.GetBytes(msg, "input.0.content")
+	if !content.IsArray() || len(content.Array()) != 2 {
+		t.Fatalf("content len = %d, want 2 (text + 1 image, no region annotation); raw=%s",
+			len(content.Array()), content.Raw)
+	}
+	if content.Get("0.type").String() != "input_text" {
+		t.Errorf("content[0].type = %q, want input_text", content.Get("0.type").String())
+	}
+	if content.Get("1.type").String() != "input_image" {
+		t.Errorf("content[1].type = %q, want input_image", content.Get("1.type").String())
+	}
+	if got := content.Get("1.image_url").String(); got != imageRef {
+		t.Errorf("content[1].image_url not propagated verbatim; got len=%d", len(got))
+	}
+	// Region annotation 只在 mask 存在时生成。img2img 不应有第三个 input_image。
+	if content.Get("2").Exists() {
+		t.Errorf("img2img without mask must not append region annotation; raw=%s", content.Raw)
+	}
+}
+
+// TestBuildImagesToolCreateMsg_Edit_MultiImage 钉死多参考图场景：studio 在
+// ComposerBar 上传多张图时，buildImageRequestBody 会把 image 输出成数组。
+// OAuth Responses-tool 路径必须把每张都附为 input_image，且顺序与请求一致。
+func TestBuildImagesToolCreateMsg_Edit_MultiImage(t *testing.T) {
+	imageA := testPNGDataURL(2, 2, func(x, y int) color.RGBA {
+		return color.RGBA{R: 10, G: 20, B: 30, A: 255}
+	})
+	imageB := testPNGDataURL(2, 2, func(x, y int) color.RGBA {
+		return color.RGBA{R: 200, G: 210, B: 220, A: 255}
+	})
+	body := []byte(fmt.Sprintf(`{
+		"model":"gpt-image-2",
+		"prompt":"merge the two scenes",
+		"size":"1024x1024",
+		"image":[%q,%q]
+	}`, imageA, imageB))
+
+	msg, _, _, err := buildImagesToolCreateMsg(body, "application/json", true, openAISessionResolution{})
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	content := gjson.GetBytes(msg, "input.0.content")
+	if !content.IsArray() || len(content.Array()) != 3 {
+		t.Fatalf("content len = %d, want 3 (text + 2 images); raw=%s", len(content.Array()), content.Raw)
+	}
+	if got := content.Get("1.image_url").String(); got != imageA {
+		t.Errorf("content[1].image_url should be image A (verbatim); len=%d", len(got))
+	}
+	if got := content.Get("2.image_url").String(); got != imageB {
+		t.Errorf("content[2].image_url should be image B (verbatim); len=%d", len(got))
+	}
+}
+
+// TestBuildImagesToolCreateMsg_Edit_StudioShape 验证 gateway-openai 的 task
+// 执行链路在 OAuth 账号上的端到端形状：执行 buildImageRequestBody 后得到的
+// JSON 字节，直接喂给 buildImagesToolCreateMsg，必须解析出 input_image。
+// 守住"studio 任务路径 + OAuth 账号"这一组合，不再被静默降级成纯文生图。
+func TestBuildImagesToolCreateMsg_Edit_StudioShape(t *testing.T) {
+	imageRef := testPNGDataURL(2, 2, func(x, y int) color.RGBA {
+		return color.RGBA{R: 60, G: 60, B: 200, A: 255}
+	})
+	// 复刻 executeImageTask → buildImageRequestBody 在 studio img2img 任务上
+	// 真实写出的 input map（image 单元素时取字符串、size=auto 是 studio 默认）。
+	taskInput := map[string]any{
+		"prompt":             "replace the red ball with a blue cube",
+		"model":              "gpt-image-2",
+		"size":               "auto",
+		"images":             []string{imageRef},
+		"preserve_reference": true,
+	}
+	jsonBody, err := buildImageRequestBody(taskInput)
+	if err != nil {
+		t.Fatalf("buildImageRequestBody: %v", err)
+	}
+	// 必要前置：emitter 一定要在体内放上 image 字段。
+	if !gjson.GetBytes(jsonBody, "image").Exists() {
+		t.Fatalf("buildImageRequestBody dropped image field: %s", jsonBody)
+	}
+
+	msg, n, _, err := buildImagesToolCreateMsg(jsonBody, "application/json", true, openAISessionResolution{})
+	if err != nil {
+		t.Fatalf("buildImagesToolCreateMsg: %v", err)
+	}
+	if n != 1 {
+		t.Errorf("n = %d, want 1", n)
+	}
+	content := gjson.GetBytes(msg, "input.0.content")
+	if !content.IsArray() || len(content.Array()) < 2 {
+		t.Fatalf("studio shape must produce ≥2 content items (text + image); got %s", content.Raw)
+	}
+	if content.Get("1.type").String() != "input_image" {
+		t.Errorf("studio shape must surface input_image as second content item; raw=%s", content.Raw)
+	}
+	if got := content.Get("1.image_url").String(); got != imageRef {
+		t.Errorf("studio source image not propagated through Responses-tool path")
 	}
 }
 
