@@ -1,6 +1,6 @@
 # AirGate OpenAI 插件 Makefile
 
-GO := GOTOOLCHAIN=local GOPRIVATE=github.com/DouDOU-start/airgate-sdk GONOPROXY=github.com/DouDOU-start/airgate-sdk GONOSUMDB=github.com/DouDOU-start/airgate-sdk go
+GO := GOTOOLCHAIN=local GOPRIVATE=github.com/DouDOU-start/airgate-sdk GONOPROXY=github.com/DouDOU-start/airgate-sdk go
 
 .PHONY: help install build build-web build-backend release dev ensure-webdist ci pre-commit lint fmt test vet clean setup-hooks manifest
 
