@@ -4,6 +4,9 @@ import type { AccountSurfaceProps } from '@doudou-start/airgate-theme/plugin';
 interface UsageWindowItem {
   key?: string;
   label: string;
+  display_label?: string;
+  slot?: string;
+  group?: string;
   used_percent: number;
   reset_seconds?: number;
   reset_after_seconds?: number;
@@ -198,10 +201,14 @@ function renderWindowRow(w: UsageWindowItem, index: number, now: number) {
   const color = usageColor(w.used_percent);
   const resetText = formatReset(resolveResetSeconds(w, now));
 
+  // core normalizer 会下发 display_label（如 "5h" / "7d"）；插件 devserver
+  // 直读上游响应时该字段可能缺失，回退到 slot 或本地 shortLabel 截断。
+  const displayLabel = w.display_label?.trim() || w.slot?.trim() || shortLabel(w.label);
+
   return (
     <div key={w.key || `${w.label}:${index}`} style={rowStyle}>
       <span style={badgeStyle} title={w.label}>
-        {shortLabel(w.label)}
+        {displayLabel}
       </span>
       <div style={barStyle}>
         <div
