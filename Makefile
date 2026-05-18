@@ -2,7 +2,7 @@
 
 GO := GOTOOLCHAIN=local GOPRIVATE=github.com/DouDOU-start/airgate-sdk GONOPROXY=github.com/DouDOU-start/airgate-sdk GONOSUMDB=github.com/DouDOU-start/airgate-sdk go
 
-.PHONY: help install build build-web build-backend release dev ensure-webdist ci pre-commit lint fmt test vet clean setup-hooks
+.PHONY: help install build build-web build-backend release dev ensure-webdist ci pre-commit lint fmt test vet clean setup-hooks manifest
 
 help: ## 显示帮助信息
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-18s\033[0m %s\n", $$1, $$2}'
@@ -23,6 +23,9 @@ build-backend: ## 构建后端（自动复制前端产物）
 	rm -rf backend/internal/gateway/webdist
 	cp -r web/dist backend/internal/gateway/webdist
 	cd backend && $(GO) build -o ../bin/gateway-openai .
+
+manifest: ## 重新生成 plugin.yaml
+	cd backend && $(GO) run ./cmd/genmanifest
 
 release: build-web ## 编译 Linux 版本（用于上传到 Docker 部署）
 	rm -rf backend/internal/gateway/webdist
