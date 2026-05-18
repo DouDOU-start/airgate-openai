@@ -46,6 +46,13 @@ func BuildPluginInfo() sdk.PluginInfo {
 			sdk.CapabilityForHostMethod(hostMethodAssetsStore),
 			sdk.CapabilityForHostMethod(hostMethodAssetsStoreURL),
 		},
+		Metadata: map[string]string{
+			"account.oauth_plans": `[
+				{"key":"free","label":"Free","credential_key":"plan_type","matches":["free"]},
+				{"key":"plus","label":"Plus","credential_key":"plan_type","matches":["plus"]},
+				{"key":"pro","label":"Pro","credential_key":"plan_type","matches":["pro"]}
+			]`,
+		},
 		AccountTypes: []sdk.AccountType{
 			{
 				Key:         "apikey",
