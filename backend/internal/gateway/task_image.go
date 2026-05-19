@@ -112,6 +112,9 @@ func buildImageTaskInput(req *sdk.ForwardRequest, reqPath string, isEdit bool) (
 	if parsed.Size != "" {
 		attributes["size"] = parsed.Size
 	}
+	if parsed.Quality != "" {
+		attributes["quality"] = parsed.Quality
+	}
 
 	return input, attributes, nil
 }
@@ -364,6 +367,9 @@ func buildImageTaskResponse(task *sdk.HostTask) map[string]any {
 		}
 		if size, ok := task.Input["size"]; ok {
 			resp["image_size"] = size
+		}
+		if quality, ok := task.Input["quality"]; ok {
+			resp["quality"] = quality
 		}
 	}
 	if task.ErrorMessage != "" {

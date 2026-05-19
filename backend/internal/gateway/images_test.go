@@ -725,6 +725,35 @@ func TestClassifyUpstreamTaskErrorSafetyRejected(t *testing.T) {
 	}
 }
 
+func TestImageTaskQualityEcho(t *testing.T) {
+	input, attrs, err := imageGenerateHandler{}.BuildInput(&sdk.ForwardRequest{
+		Body:    []byte(`{"model":"gpt-image-2","prompt":"a shiba","size":"1024x1024","quality":"high"}`),
+		Headers: http.Header{},
+	}, "/v1/images/generations")
+	if err != nil {
+		t.Fatalf("BuildInput returned err: %v", err)
+	}
+	if got := input["quality"]; got != "high" {
+		t.Fatalf("input quality = %v, want high", got)
+	}
+	if got := attrs["quality"]; got != "high" {
+		t.Fatalf("attribute quality = %q, want high", got)
+	}
+
+	resp := buildImageTaskResponse(&sdk.HostTask{
+		ID:     123,
+		Status: sdk.TaskStatusCompleted,
+		Input: map[string]interface{}{
+			"prompt":  "a shiba",
+			"size":    "1024x1024",
+			"quality": "high",
+		},
+	})
+	if got := resp["quality"]; got != "high" {
+		t.Fatalf("response quality = %v, want high", got)
+	}
+}
+
 // TestBuildImagesToolCreateMsg 翻译 Images REST 请求体为 Responses API
 // response.create 消息，tool 配置保持 Codex 对齐的极简 schema。
 func TestBuildImagesToolCreateMsg(t *testing.T) {
