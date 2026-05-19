@@ -675,8 +675,53 @@ func TestCollectImageGenCall(t *testing.T) {
 	if len(ws.ImageGenCallDiagnostics) != 1 {
 		t.Fatalf("ImageGenCallDiagnostics len = %d, want 1", len(ws.ImageGenCallDiagnostics))
 	}
+	if len(ws.ImageGenCallFailures) != 1 {
+		t.Fatalf("ImageGenCallFailures len = %d, want 1", len(ws.ImageGenCallFailures))
+	}
+	if ws.ImageGenCallFailures[0].Message != "safety system rejected the prompt" {
+		t.Errorf("ImageGenCallFailures[0].Message = %q", ws.ImageGenCallFailures[0].Message)
+	}
 	if !strings.Contains(ws.ImageGenCallDiagnostics[0], "status=failed") || !strings.Contains(ws.ImageGenCallDiagnostics[0], "safety system rejected the prompt") {
 		t.Errorf("diagnostic missing upstream cause: %s", ws.ImageGenCallDiagnostics[0])
+	}
+}
+
+func TestClassifyImageGenCallFailuresSafetyRejected(t *testing.T) {
+	failures := []ImageGenCallFailure{{
+		Status:    "failed",
+		ErrorCode: "content_policy_violation",
+		Message:   "Your request was rejected by the safety system. If you believe this is an error, contact us at help.openai.com and include the request ID 916c6516-5f37-9121-b05a-a604888c0055.",
+	}}
+	failure := classifyImageGenCallFailures(failures, "")
+	if failure == nil {
+		t.Fatalf("expected failure")
+	}
+	if failure.Kind != responsesFailureKindClient {
+		t.Fatalf("Kind = %q, want client", failure.Kind)
+	}
+	if failure.StatusCode != http.StatusBadRequest {
+		t.Fatalf("StatusCode = %d, want 400", failure.StatusCode)
+	}
+	if failure.Code != "safety_rejected" {
+		t.Fatalf("Code = %q, want safety_rejected", failure.Code)
+	}
+	body := buildImagesErrorBodyWithCode(failure.StatusCode, failure.Code, failure.Message)
+	if got := gjson.GetBytes(body, "error.code").String(); got != "safety_rejected" {
+		t.Fatalf("error.code = %q, want safety_rejected; body=%s", got, body)
+	}
+}
+
+func TestClassifyUpstreamTaskErrorSafetyRejected(t *testing.T) {
+	body := []byte(`{"error":{"message":"Your request was rejected by the safety system.","type":"invalid_request_error","code":"content_policy_violation"}}`)
+	taskErr := classifyUpstreamTaskError(http.StatusBadGateway, body)
+	if taskErr.Type != "invalid_request" {
+		t.Fatalf("Type = %q, want invalid_request", taskErr.Type)
+	}
+	if taskErr.Code != "safety_rejected" {
+		t.Fatalf("Code = %q, want safety_rejected", taskErr.Code)
+	}
+	if taskErr.Retryable {
+		t.Fatalf("Retryable = true, want false")
 	}
 }
 

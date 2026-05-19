@@ -25,6 +25,7 @@ type responsesFailureError struct {
 	Kind               responsesFailureKind
 	StatusCode         int
 	AnthropicErrorType string
+	Code               string
 	Message            string
 	RetryAfter         time.Duration
 }
@@ -214,6 +215,14 @@ func classifyResponsesError(errType, errCode, msg string) *responsesFailureError
 			AnthropicErrorType: "invalid_model_error",
 			Message:            msg,
 		}
+	case isSafetyRejectionText(errType, errCode, msg):
+		return &responsesFailureError{
+			Kind:               responsesFailureKindClient,
+			StatusCode:         http.StatusBadRequest,
+			AnthropicErrorType: "invalid_request_error",
+			Code:               "safety_rejected",
+			Message:            msg,
+		}
 	case containsAny(errType, errCode, msg, "invalid_prompt", "invalid_request", "input_too_long", "is not supported", "unsupported", "model_not_found", "model not found", "invalid model", "invalid_model", "does not exist"):
 		return &responsesFailureError{
 			Kind:               responsesFailureKindClient,
@@ -237,4 +246,30 @@ func classifyResponsesError(errType, errCode, msg string) *responsesFailureError
 			Message:            msg,
 		}
 	}
+}
+
+func isSafetyRejectionText(values ...string) bool {
+	text := strings.ToLower(strings.Join(values, " "))
+	if text == "" {
+		return false
+	}
+	if strings.Contains(text, "safety") &&
+		(strings.Contains(text, "reject") ||
+			strings.Contains(text, "block") ||
+			strings.Contains(text, "policy")) {
+		return true
+	}
+	for _, kw := range []string{
+		"content_policy",
+		"content policy",
+		"policy_violation",
+		"blocked by policy",
+		"moderation_blocked",
+		"moderation blocked",
+	} {
+		if strings.Contains(text, kw) {
+			return true
+		}
+	}
+	return false
 }
