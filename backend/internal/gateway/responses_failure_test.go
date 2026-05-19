@@ -28,6 +28,23 @@ func TestClassifyResponsesFailureContextWindow(t *testing.T) {
 	}
 }
 
+func TestClassifyResponsesFailureSafetyRejected(t *testing.T) {
+	raw := []byte(`{"type":"response.failed","response":{"error":{"type":"invalid_request_error","code":"content_policy_violation","message":"Your request was rejected by the safety system. If you believe this is an error, contact us at help.openai.com and include the request ID 916c6516-5f37-9121-b05a-a604888c0055."}}}`)
+	failure := classifyResponsesFailure(raw)
+	if failure == nil {
+		t.Fatalf("expected failure")
+	}
+	if failure.Kind != responsesFailureKindClient {
+		t.Fatalf("unexpected kind %q", failure.Kind)
+	}
+	if failure.StatusCode != http.StatusBadRequest {
+		t.Fatalf("unexpected status %d", failure.StatusCode)
+	}
+	if failure.Code != "safety_rejected" {
+		t.Fatalf("unexpected code %q", failure.Code)
+	}
+}
+
 func TestClassifyResponsesFailureContinuationAnchor(t *testing.T) {
 	raw := []byte(`{"type":"response.failed","response":{"error":{"type":"invalid_request_error","code":"previous_response_not_found","message":"Previous response not found"}}}`)
 	failure := classifyResponsesFailure(raw)

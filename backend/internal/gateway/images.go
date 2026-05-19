@@ -970,6 +970,34 @@ func imageGenCallDiagnosticsDetail(wsResult WSResult) string {
 	return ""
 }
 
+func classifyImageGenCallFailures(failures []ImageGenCallFailure, fallbackDetail string) *responsesFailureError {
+	for _, failure := range failures {
+		if isSafetyRejectionText(failure.ErrorType, failure.ErrorCode, failure.Message, failure.IncompleteReason) {
+			msg := strings.TrimSpace(failure.Message)
+			if msg == "" {
+				msg = "Your request was rejected by the safety system."
+			}
+			return &responsesFailureError{
+				Kind:               responsesFailureKindClient,
+				StatusCode:         http.StatusBadRequest,
+				AnthropicErrorType: "invalid_request_error",
+				Code:               "safety_rejected",
+				Message:            msg,
+			}
+		}
+	}
+	if isSafetyRejectionText(fallbackDetail) {
+		return &responsesFailureError{
+			Kind:               responsesFailureKindClient,
+			StatusCode:         http.StatusBadRequest,
+			AnthropicErrorType: "invalid_request_error",
+			Code:               "safety_rejected",
+			Message:            "Your request was rejected by the safety system.",
+		}
+	}
+	return nil
+}
+
 // buildImagesToolCreateMsg 把 Images REST 请求体翻译成 Responses API 的
 // response.create 消息（tools 数组带一个 image_generation 项）。
 // 返回：上游消息 bytes；n（当前固定 1）；prompt 估算的 token 数（用于计费）。
@@ -1194,11 +1222,11 @@ func (g *OpenAIGateway) forwardImagesViaResponsesTool(ctx context.Context, req *
 		var failure *responsesFailureError
 		if errors.As(wsResult.Err, &failure) {
 			if failure.shouldReturnClientError() {
-				body := buildImagesErrorBody(failure.StatusCode, failure.Message)
+				body := buildImagesErrorBodyWithCode(failure.StatusCode, failure.Code, failure.Message)
 				if sseKA != nil {
 					sseKA.Stop()
 					g.logger.Warn("Images OAuth 上游返回客户端错误，已脱敏响应",
-						"path", reqPath, "model", imgReq.Model, "status_code", failure.StatusCode, "reason", failure.Message)
+						"path", reqPath, "model", imgReq.Model, "status_code", failure.StatusCode, "code", failure.Code, "reason", failure.Message)
 					clientMsg := sanitizedImageSSEErrorMessage
 					if failure.StatusCode == http.StatusRequestEntityTooLarge {
 						clientMsg = imageTooLargeSSEErrorMessage
@@ -1214,7 +1242,7 @@ func (g *OpenAIGateway) forwardImagesViaResponsesTool(ctx context.Context, req *
 					},
 					Reason:   failure.Message,
 					Duration: elapsed,
-				}, wsResult.Err
+				}, nil
 			}
 			// 用 *responsesFailureError 自带的分类驱动 Outcome：
 			// rate_limited 走 AccountRateLimited（带 RetryAfter），server 等仍归 UpstreamTransient。
@@ -1254,6 +1282,26 @@ func (g *OpenAIGateway) forwardImagesViaResponsesTool(ctx context.Context, req *
 		reason := fmt.Sprintf("image_generation_call 为空 (n=%d)", n)
 		if detail := imageGenCallDiagnosticsDetail(wsResult); detail != "" {
 			reason += ": " + detail
+		}
+		if failure := classifyImageGenCallFailures(wsResult.ImageGenCallFailures, reason); failure != nil && failure.shouldReturnClientError() {
+			body := buildImagesErrorBodyWithCode(failure.StatusCode, failure.Code, failure.Message)
+			if sseKA != nil {
+				sseKA.Stop()
+				g.logger.Warn("Images OAuth 图像工具返回客户端错误，已脱敏响应",
+					"path", reqPath, "model", imgReq.Model, "status_code", failure.StatusCode,
+					"code", failure.Code, "reason", reason)
+				writeSSEErrorIfStarted(req.Writer, sseKA, sanitizedImageSSEErrorMessage)
+			}
+			return sdk.ForwardOutcome{
+				Kind: sdk.OutcomeClientError,
+				Upstream: sdk.UpstreamResponse{
+					StatusCode: failure.StatusCode,
+					Headers:    http.Header{"Content-Type": []string{"application/json"}},
+					Body:       body,
+				},
+				Reason:   failure.Message,
+				Duration: elapsed,
+			}, nil
 		}
 		body := buildImagesErrorBody(http.StatusBadGateway, "上游未返回图像结果")
 		if sseKA != nil {
@@ -1395,15 +1443,22 @@ func buildImagesRESTResponse(wsResult WSResult, promptTokens, imageOutputTokens 
 
 // buildImagesErrorBody 返回 OpenAI 风格错误 body。
 func buildImagesErrorBody(status int, message string) []byte {
+	return buildImagesErrorBodyWithCode(status, "", message)
+}
+
+func buildImagesErrorBodyWithCode(status int, code, message string) []byte {
 	errType := "server_error"
 	if status >= 400 && status < 500 {
 		errType = "invalid_request_error"
+	}
+	if code == "" {
+		code = fmt.Sprintf("images_%d", status)
 	}
 	payload := map[string]any{
 		"error": map[string]any{
 			"message": message,
 			"type":    errType,
-			"code":    fmt.Sprintf("images_%d", status),
+			"code":    code,
 		},
 	}
 	b, _ := json.Marshal(payload)

@@ -60,6 +60,7 @@ type WSResult struct {
 	// ImageGenCalls 捕获 Responses API 返回的 image_generation_call output items，
 	// 供 REST→tools 翻译路径将 base64 结果打包回 OpenAI Images REST 响应。
 	ImageGenCalls           []ImageGenCall
+	ImageGenCallFailures    []ImageGenCallFailure
 	ImageGenCallDiagnostics []string
 	// ToolImageModel 是 response.tools[0].model —— 上游实际为 image_generation
 	// 工具选用的内部模型（客户端请求 gpt-image-2 时可能被静默降级为 gpt-image-1.5）。
@@ -79,6 +80,15 @@ type ImageGenCall struct {
 	Background    string
 	RevisedPrompt string
 	Model         string // 上游实际使用的图像模型（如 gpt-image-1.5）
+}
+
+type ImageGenCallFailure struct {
+	ID               string
+	Status           string
+	ErrorType        string
+	ErrorCode        string
+	Message          string
+	IncompleteReason string
 }
 
 // ToolUseBlock 表示从 Responses 流中聚合出的工具调用块。
@@ -537,10 +547,22 @@ func collectImageGenCall(result *WSResult, item map[string]any) {
 		Model:         jsonString(item["model"]),
 	}
 	if call.Result == "" {
+		result.ImageGenCallFailures = append(result.ImageGenCallFailures, imageGenCallFailureFromItem(item))
 		result.ImageGenCallDiagnostics = append(result.ImageGenCallDiagnostics, summarizeImageGenCallItem(item))
 		return
 	}
 	result.ImageGenCalls = append(result.ImageGenCalls, call)
+}
+
+func imageGenCallFailureFromItem(item map[string]any) ImageGenCallFailure {
+	return ImageGenCallFailure{
+		ID:               jsonString(item["id"]),
+		Status:           jsonString(item["status"]),
+		ErrorType:        nestedJSONString(item["error"], "type"),
+		ErrorCode:        nestedJSONString(item["error"], "code"),
+		Message:          nestedJSONString(item["error"], "message"),
+		IncompleteReason: nestedJSONString(item["incomplete_details"], "reason"),
+	}
 }
 
 func summarizeImageGenCallItem(item map[string]any) string {
@@ -550,6 +572,12 @@ func summarizeImageGenCallItem(item map[string]any) string {
 	}
 	if status := jsonString(item["status"]); status != "" {
 		parts = append(parts, "status="+status)
+	}
+	if typ := nestedJSONString(item["error"], "type"); typ != "" {
+		parts = append(parts, "error_type="+typ)
+	}
+	if code := nestedJSONString(item["error"], "code"); code != "" {
+		parts = append(parts, "error_code="+code)
 	}
 	if msg := nestedJSONString(item["error"], "message"); msg != "" {
 		parts = append(parts, "error="+truncate(msg, 200))

@@ -112,6 +112,9 @@ func buildImageTaskInput(req *sdk.ForwardRequest, reqPath string, isEdit bool) (
 	if parsed.Size != "" {
 		attributes["size"] = parsed.Size
 	}
+	if parsed.Quality != "" {
+		attributes["quality"] = parsed.Quality
+	}
 
 	return input, attributes, nil
 }
@@ -167,6 +170,13 @@ func executeImageTask(ctx context.Context, g *OpenAIGateway, task sdk.HostTask, 
 
 	resp, err := g.forwardViaHost(ctx, task.UserID, groupID, apiKeyID, model, http.MethodPost, defaultPath, headers, reqBody, false)
 	if err != nil {
+		if isSafetyRejectionText(err.Error()) {
+			return rt.Fail(ctx, &TaskError{
+				Type:    "invalid_request",
+				Code:    "safety_rejected",
+				Message: err.Error(),
+			})
+		}
 		return rt.Fail(ctx, &TaskError{
 			Type:      "upstream_error",
 			Message:   "upstream 转发失败: " + err.Error(),
@@ -223,14 +233,9 @@ func executeImageTask(ctx context.Context, g *OpenAIGateway, task sdk.HostTask, 
 
 // classifyUpstreamTaskError 把上游 HTTP 错误映射为结构化 TaskError。
 func classifyUpstreamTaskError(statusCode int, body []byte) *TaskError {
-	msg := fmt.Sprintf("upstream HTTP %d", statusCode)
-	var errResp struct {
-		Error struct {
-			Message string `json:"message"`
-		} `json:"error"`
-	}
-	if json.Unmarshal(body, &errResp) == nil && errResp.Error.Message != "" {
-		msg = errResp.Error.Message
+	msg, errType, errCode := parseUpstreamTaskErrorBody(statusCode, body)
+	if isSafetyRejectionText(errType, errCode, msg) {
+		return &TaskError{Type: "invalid_request", Code: "safety_rejected", Message: msg}
 	}
 
 	switch {
@@ -245,6 +250,36 @@ func classifyUpstreamTaskError(statusCode int, body []byte) *TaskError {
 	default:
 		return &TaskError{Type: "upstream_error", Code: fmt.Sprintf("http_%d", statusCode), Message: msg}
 	}
+}
+
+func parseUpstreamTaskErrorBody(statusCode int, body []byte) (message, errType, errCode string) {
+	message = fmt.Sprintf("upstream HTTP %d", statusCode)
+	if len(body) == 0 {
+		return message, "", ""
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(body, &payload); err != nil {
+		if text := strings.TrimSpace(string(body)); text != "" {
+			message = truncate(text, 500)
+		}
+		return message, "", ""
+	}
+	errValue, ok := payload["error"]
+	if !ok {
+		return message, "", ""
+	}
+	if errObj, ok := errValue.(map[string]any); ok {
+		if v := strings.TrimSpace(stringFromAny(errObj["message"])); v != "" {
+			message = v
+		}
+		errType = strings.TrimSpace(stringFromAny(errObj["type"]))
+		errCode = strings.TrimSpace(stringFromAny(errObj["code"]))
+		return message, errType, errCode
+	}
+	if v := strings.TrimSpace(stringFromAny(errValue)); v != "" {
+		message = v
+	}
+	return message, "", ""
 }
 
 // storeImageAssetsFromResponse 解析 OpenAI Images API 响应，把图片存到 Core 资产存储，
@@ -332,6 +367,9 @@ func buildImageTaskResponse(task *sdk.HostTask) map[string]any {
 		}
 		if size, ok := task.Input["size"]; ok {
 			resp["image_size"] = size
+		}
+		if quality, ok := task.Input["quality"]; ok {
+			resp["quality"] = quality
 		}
 	}
 	if task.ErrorMessage != "" {
