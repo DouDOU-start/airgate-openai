@@ -207,8 +207,8 @@ func looksLikeShortCodexWindow(resetAfterSeconds int) bool {
 // Strategy matches sub2api:
 //  1. Prefer window_minutes to determine which window is shorter.
 //  2. When window_minutes are missing, use reset_after_seconds as a hint.
-//  3. If reset hints are also missing, fall back to legacy assumption:
-//     primary=7d, secondary=5h.
+//  3. If reset hints are also missing, keep provider naming semantics:
+//     primary=5h, secondary=7d.
 func (s *CodexUsageSnapshot) Normalize() *NormalizedCodexLimits {
 	if s == nil {
 		return nil
@@ -247,18 +247,43 @@ func (s *CodexUsageSnapshot) Normalize() *NormalizedCodexLimits {
 		primaryHasData := hasCodexPrimaryWindowData(s)
 		secondaryHasData := hasCodexSecondaryWindowData(s)
 		switch {
-		case primaryHasData && secondaryHasData && s.PrimaryResetAfterSeconds > 0 && s.SecondaryResetAfterSeconds > 0:
-			if s.PrimaryResetAfterSeconds <= s.SecondaryResetAfterSeconds {
+		case primaryHasData && secondaryHasData:
+			switch {
+			case s.PrimaryResetAfterSeconds > 0 && s.SecondaryResetAfterSeconds > 0:
+				if s.PrimaryResetAfterSeconds <= s.SecondaryResetAfterSeconds {
+					use5hFromPrimary = true
+				} else {
+					use7dFromPrimary = true
+				}
+			case s.PrimaryResetAfterSeconds > 0:
+				if looksLikeShortCodexWindow(s.PrimaryResetAfterSeconds) {
+					use5hFromPrimary = true
+				} else {
+					use7dFromPrimary = true
+				}
+			case s.SecondaryResetAfterSeconds > 0:
+				if looksLikeShortCodexWindow(s.SecondaryResetAfterSeconds) {
+					use7dFromPrimary = true
+				} else {
+					use5hFromPrimary = true
+				}
+			default:
 				use5hFromPrimary = true
-			} else {
-				use7dFromPrimary = true
 			}
-		case primaryHasData && !secondaryHasData && looksLikeShortCodexWindow(s.PrimaryResetAfterSeconds):
-			use5hFromPrimary = true
-		case !primaryHasData && secondaryHasData && !looksLikeShortCodexWindow(s.SecondaryResetAfterSeconds):
-			use5hFromPrimary = true
+		case primaryHasData && !secondaryHasData:
+			if s.PrimaryResetAfterSeconds > 0 && !looksLikeShortCodexWindow(s.PrimaryResetAfterSeconds) {
+				use7dFromPrimary = true
+			} else {
+				use5hFromPrimary = true
+			}
+		case !primaryHasData && secondaryHasData:
+			if looksLikeShortCodexWindow(s.SecondaryResetAfterSeconds) {
+				use7dFromPrimary = true
+			} else {
+				use5hFromPrimary = true
+			}
 		default:
-			use7dFromPrimary = true
+			use5hFromPrimary = true
 		}
 	}
 
@@ -408,18 +433,100 @@ func mergeCodexUsageSnapshot(next, existing *CodexUsageSnapshot) {
 		next.CreditsUnlimited = existing.CreditsUnlimited
 		next.CreditsBalance = existing.CreditsBalance
 	}
-	if !hasCodexWindowData(next.BengalfoxPrimaryUsedPercent, next.BengalfoxPrimaryResetAfterSeconds, next.BengalfoxPrimaryWindowMinutes) &&
-		hasCodexWindowData(existing.BengalfoxPrimaryUsedPercent, existing.BengalfoxPrimaryResetAfterSeconds, existing.BengalfoxPrimaryWindowMinutes) {
-		next.BengalfoxPrimaryUsedPercent = existing.BengalfoxPrimaryUsedPercent
-		next.BengalfoxPrimaryResetAfterSeconds = existing.BengalfoxPrimaryResetAfterSeconds
-		next.BengalfoxPrimaryWindowMinutes = existing.BengalfoxPrimaryWindowMinutes
+	mergeCodexWindowFields(
+		&next.PrimaryUsedPercent,
+		&next.PrimaryResetAfterSeconds,
+		&next.PrimaryWindowMinutes,
+		next.CapturedAt,
+		existing.PrimaryUsedPercent,
+		existing.PrimaryResetAfterSeconds,
+		existing.PrimaryWindowMinutes,
+		existing.CapturedAt,
+	)
+	mergeCodexWindowFields(
+		&next.SecondaryUsedPercent,
+		&next.SecondaryResetAfterSeconds,
+		&next.SecondaryWindowMinutes,
+		next.CapturedAt,
+		existing.SecondaryUsedPercent,
+		existing.SecondaryResetAfterSeconds,
+		existing.SecondaryWindowMinutes,
+		existing.CapturedAt,
+	)
+	mergeCodexWindowFields(
+		&next.BengalfoxPrimaryUsedPercent,
+		&next.BengalfoxPrimaryResetAfterSeconds,
+		&next.BengalfoxPrimaryWindowMinutes,
+		next.CapturedAt,
+		existing.BengalfoxPrimaryUsedPercent,
+		existing.BengalfoxPrimaryResetAfterSeconds,
+		existing.BengalfoxPrimaryWindowMinutes,
+		existing.CapturedAt,
+	)
+	mergeCodexWindowFields(
+		&next.BengalfoxSecondaryUsedPercent,
+		&next.BengalfoxSecondaryResetAfterSeconds,
+		&next.BengalfoxSecondaryWindowMinutes,
+		next.CapturedAt,
+		existing.BengalfoxSecondaryUsedPercent,
+		existing.BengalfoxSecondaryResetAfterSeconds,
+		existing.BengalfoxSecondaryWindowMinutes,
+		existing.CapturedAt,
+	)
+}
+
+func mergeCodexWindowFields(
+	nextUsed *float64,
+	nextReset *int,
+	nextWindowMinutes *int,
+	nextCapturedAt time.Time,
+	existingUsed float64,
+	existingReset int,
+	existingWindowMinutes int,
+	existingCapturedAt time.Time,
+) {
+	if nextUsed == nil || nextReset == nil || nextWindowMinutes == nil {
+		return
 	}
-	if !hasCodexWindowData(next.BengalfoxSecondaryUsedPercent, next.BengalfoxSecondaryResetAfterSeconds, next.BengalfoxSecondaryWindowMinutes) &&
-		hasCodexWindowData(existing.BengalfoxSecondaryUsedPercent, existing.BengalfoxSecondaryResetAfterSeconds, existing.BengalfoxSecondaryWindowMinutes) {
-		next.BengalfoxSecondaryUsedPercent = existing.BengalfoxSecondaryUsedPercent
-		next.BengalfoxSecondaryResetAfterSeconds = existing.BengalfoxSecondaryResetAfterSeconds
-		next.BengalfoxSecondaryWindowMinutes = existing.BengalfoxSecondaryWindowMinutes
+	nextHasData := hasCodexWindowData(*nextUsed, *nextReset, *nextWindowMinutes)
+	existingHasData := hasCodexWindowData(existingUsed, existingReset, existingWindowMinutes)
+	if !nextHasData {
+		if !existingHasData {
+			return
+		}
+		remainingReset := remainingCodexResetSeconds(existingReset, existingCapturedAt, nextCapturedAt)
+		if existingReset > 0 && remainingReset <= 0 {
+			return
+		}
+		*nextUsed = existingUsed
+		*nextReset = remainingReset
+		*nextWindowMinutes = existingWindowMinutes
+		return
 	}
+	if nextWindowMinutes != nil && *nextWindowMinutes <= 0 && existingWindowMinutes > 0 {
+		*nextWindowMinutes = existingWindowMinutes
+	}
+	if *nextReset > 0 || existingReset <= 0 {
+		return
+	}
+	*nextReset = remainingCodexResetSeconds(existingReset, existingCapturedAt, nextCapturedAt)
+}
+
+func remainingCodexResetSeconds(existingReset int, existingCapturedAt, nextCapturedAt time.Time) int {
+	if existingReset <= 0 {
+		return 0
+	}
+	if nextCapturedAt.IsZero() {
+		nextCapturedAt = time.Now()
+	}
+	if existingCapturedAt.IsZero() {
+		return existingReset
+	}
+	resetAt := existingCapturedAt.Add(time.Duration(existingReset) * time.Second)
+	if resetAt.After(nextCapturedAt) {
+		return int(resetAt.Sub(nextCapturedAt).Seconds())
+	}
+	return 0
 }
 
 // GetCodexUsage 获取某个账号的最新用量快照

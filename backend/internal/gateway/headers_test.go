@@ -3,6 +3,7 @@ package gateway
 import (
 	"net/http"
 	"testing"
+	"time"
 
 	sdk "github.com/DouDOU-start/airgate-sdk/sdkgo"
 )
@@ -70,6 +71,136 @@ func TestCodexUsageSnapshotNormalize_PrimaryOnlyShortResetIs5h(t *testing.T) {
 	}
 	if normalized.Used7dPercent != nil {
 		t.Fatalf("expected 7d to be empty, got %#v", normalized.Used7dPercent)
+	}
+}
+
+func TestCodexUsageSnapshotNormalize_PrimaryOnlyWithoutResetIs5h(t *testing.T) {
+	snapshot := &CodexUsageSnapshot{
+		PrimaryUsedPercent: 42,
+	}
+
+	normalized := snapshot.Normalize()
+	if normalized == nil {
+		t.Fatal("expected normalized limits")
+	}
+	if normalized.Used5hPercent == nil || *normalized.Used5hPercent != 42 {
+		t.Fatalf("expected primary-only usage without reset to stay 5h, got %#v", normalized.Used5hPercent)
+	}
+	if normalized.Used7dPercent != nil {
+		t.Fatalf("expected 7d to be empty, got %#v", normalized.Used7dPercent)
+	}
+}
+
+func TestCodexUsageSnapshotNormalize_SecondaryOnlyShortResetIs5h(t *testing.T) {
+	snapshot := &CodexUsageSnapshot{
+		SecondaryUsedPercent:       42,
+		SecondaryResetAfterSeconds: 5 * 60 * 60,
+	}
+
+	normalized := snapshot.Normalize()
+	if normalized == nil {
+		t.Fatal("expected normalized limits")
+	}
+	if normalized.Used5hPercent == nil || *normalized.Used5hPercent != 42 {
+		t.Fatalf("expected secondary short reset usage to map to 5h, got %#v", normalized.Used5hPercent)
+	}
+	if normalized.Used7dPercent != nil {
+		t.Fatalf("expected 7d to be empty, got %#v", normalized.Used7dPercent)
+	}
+}
+
+func TestCodexUsageSnapshotNormalize_SecondaryResetOnlyKeepsProviderOrder(t *testing.T) {
+	snapshot := &CodexUsageSnapshot{
+		PrimaryUsedPercent:         42,
+		SecondaryUsedPercent:       55,
+		SecondaryResetAfterSeconds: 48 * 60 * 60,
+	}
+
+	normalized := snapshot.Normalize()
+	if normalized == nil {
+		t.Fatal("expected normalized limits")
+	}
+	if normalized.Used5hPercent == nil || *normalized.Used5hPercent != 42 {
+		t.Fatalf("expected primary usage to stay 5h, got %#v", normalized.Used5hPercent)
+	}
+	if normalized.Used7dPercent == nil || *normalized.Used7dPercent != 55 {
+		t.Fatalf("expected secondary usage to stay 7d, got %#v", normalized.Used7dPercent)
+	}
+}
+
+func TestStoreCodexUsagePreservesBaseWindowResetMetadata(t *testing.T) {
+	accountID := int64(91001)
+	usageStore.Delete(accountID)
+	defer usageStore.Delete(accountID)
+	base := time.Date(2026, 5, 20, 12, 0, 0, 0, time.UTC)
+	StoreCodexUsage(accountID, &CodexUsageSnapshot{
+		PrimaryUsedPercent:                  30,
+		PrimaryResetAfterSeconds:            2 * 60 * 60,
+		SecondaryUsedPercent:                50,
+		SecondaryResetAfterSeconds:          48 * 60 * 60,
+		BengalfoxPrimaryUsedPercent:         12,
+		BengalfoxPrimaryResetAfterSeconds:   90 * 60,
+		BengalfoxSecondaryUsedPercent:       18,
+		BengalfoxSecondaryResetAfterSeconds: 36 * 60 * 60,
+		BengalfoxSecondaryWindowMinutes:     7 * 24 * 60,
+		CapturedAt:                          base,
+	})
+	StoreCodexUsage(accountID, &CodexUsageSnapshot{
+		PrimaryUsedPercent: 40,
+		CapturedAt:         base.Add(30 * time.Minute),
+	})
+
+	snapshot := GetCodexUsage(accountID)
+	if snapshot == nil {
+		t.Fatal("expected stored snapshot")
+	}
+	if snapshot.PrimaryUsedPercent != 40 {
+		t.Fatalf("PrimaryUsedPercent = %v, want 40", snapshot.PrimaryUsedPercent)
+	}
+	if snapshot.PrimaryResetAfterSeconds <= 0 || snapshot.PrimaryResetAfterSeconds > 2*60*60 {
+		t.Fatalf("PrimaryResetAfterSeconds = %d, want remaining reset", snapshot.PrimaryResetAfterSeconds)
+	}
+	if snapshot.SecondaryUsedPercent != 50 || snapshot.SecondaryResetAfterSeconds <= 0 {
+		t.Fatalf("secondary window not preserved: %+v", snapshot)
+	}
+	if snapshot.BengalfoxPrimaryUsedPercent != 12 || snapshot.BengalfoxPrimaryResetAfterSeconds <= 0 {
+		t.Fatalf("bengalfox primary window not preserved: %+v", snapshot)
+	}
+	if snapshot.BengalfoxSecondaryUsedPercent != 18 || snapshot.BengalfoxSecondaryWindowMinutes != 7*24*60 {
+		t.Fatalf("bengalfox secondary window not preserved: %+v", snapshot)
+	}
+}
+
+func TestStoreCodexUsagePrimaryOnlyAfterShortResetKeeps5hOrder(t *testing.T) {
+	accountID := int64(91002)
+	usageStore.Delete(accountID)
+	defer usageStore.Delete(accountID)
+	base := time.Date(2026, 5, 20, 12, 0, 0, 0, time.UTC)
+	StoreCodexUsage(accountID, &CodexUsageSnapshot{
+		PrimaryUsedPercent:         30,
+		PrimaryResetAfterSeconds:   30 * 60,
+		SecondaryUsedPercent:       50,
+		SecondaryResetAfterSeconds: 48 * 60 * 60,
+		CapturedAt:                 base,
+	})
+	StoreCodexUsage(accountID, &CodexUsageSnapshot{
+		PrimaryUsedPercent: 40,
+		CapturedAt:         base.Add(31 * time.Minute),
+	})
+
+	snapshot := GetCodexUsage(accountID)
+	if snapshot == nil {
+		t.Fatal("expected stored snapshot")
+	}
+	normalized := snapshot.Normalize()
+	if normalized == nil {
+		t.Fatal("expected normalized limits")
+	}
+	if normalized.Used5hPercent == nil || *normalized.Used5hPercent != 40 {
+		t.Fatalf("expected fresh primary-only usage to stay 5h, got %#v", normalized.Used5hPercent)
+	}
+	if normalized.Used7dPercent == nil || *normalized.Used7dPercent != 50 {
+		t.Fatalf("expected preserved secondary usage to stay 7d, got %#v", normalized.Used7dPercent)
 	}
 }
 
