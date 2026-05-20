@@ -23,6 +23,7 @@ const (
 	hostMethodGatewayForward = "gateway.forward"
 	hostMethodAssetsStore    = "assets.store"
 	hostMethodAssetsStoreURL = "assets.store_url"
+	hostMethodAssetsGetBytes = "assets.get_bytes"
 )
 
 type hostForwardResponse struct {
@@ -208,6 +209,32 @@ func (g *OpenAIGateway) storeAsset(ctx context.Context, userID int64, scope, con
 		return "", err
 	}
 	return stringFromAny(firstPayloadValue(payload, "public_url")), nil
+}
+
+// fetchAssetBytes 通过 core 的 assets.get_bytes host method 按 objectKey 拉取
+// 已落盘 asset 的原始字节。core 把 []byte 走 json.Marshal 序列化成 base64 string，
+// 这里需要 decode 回来。
+func (g *OpenAIGateway) fetchAssetBytes(ctx context.Context, objectKey string) ([]byte, string, error) {
+	payload, err := g.hostInvoke(ctx, hostMethodAssetsGetBytes, map[string]interface{}{
+		"object_key": objectKey,
+	})
+	if err != nil {
+		return nil, "", err
+	}
+	contentType := stringFromAny(firstPayloadValue(payload, "content_type"))
+	raw := firstPayloadValue(payload, "data")
+	switch v := raw.(type) {
+	case []byte:
+		return v, contentType, nil
+	case string:
+		data, err := base64.StdEncoding.DecodeString(v)
+		if err != nil {
+			return nil, "", fmt.Errorf("decode asset bytes: %w", err)
+		}
+		return data, contentType, nil
+	default:
+		return nil, "", fmt.Errorf("assets.get_bytes 返回的 data 类型无效: %T", raw)
+	}
 }
 
 func (g *OpenAIGateway) storeAssetFromURL(ctx context.Context, userID int64, scope, sourceURL string) (string, error) {

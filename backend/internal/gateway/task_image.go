@@ -142,6 +142,17 @@ func executeImageTask(ctx context.Context, g *OpenAIGateway, task sdk.HostTask, 
 		})
 	}
 
+	// 把 input 里 /assets-runtime/... 形式的 URL 反查成 data URI，再交给
+	// 现有的 shrink + buildRequestBody 链路。core 在 tasks.create 时为了
+	// 不让 DB / dispatch RPC 击穿 64MB 上限把大图落盘换了 URL，这里负责
+	// 还原成 OpenAI 上游期望的 data URI 形式。
+	if err := g.resolveTaskInputAssets(ctx, task.Input); err != nil {
+		return rt.Fail(ctx, &TaskError{
+			Type:    "invalid_request",
+			Message: "解析输入资源失败: " + err.Error(),
+		})
+	}
+
 	shrinkTaskInputImages(task.Input)
 
 	reqBody, err := buildImageRequestBody(task.Input)
