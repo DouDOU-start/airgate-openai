@@ -23,13 +23,17 @@ const FAST_SERVICE_TIER_COLOR = 'rgb(168, 85, 247)';
 const FAST_INDICATOR_STYLE: CSSProperties = {
   position: 'absolute',
   left: '0.375rem',
-  top: '50%',
-  width: '0.45rem',
-  height: '0.65rem',
-  background: 'rgb(234, 179, 8)',
-  clipPath: 'polygon(55% 0, 10% 55%, 42% 55%, 30% 100%, 90% 38%, 56% 38%)',
+  top: 0,
+  bottom: 0,
+  display: 'inline-flex',
+  alignItems: 'center',
+  justifyContent: 'center',
+  width: 'var(--ag-usage-image-dot-size, 0.375rem)',
+  color: 'rgb(234, 179, 8)',
+  fontSize: '0.75rem',
+  height: '100%',
+  lineHeight: 1,
   pointerEvents: 'none',
-  transform: 'translateY(-50%)',
 };
 
 function imageSizeDotColor(imageSize: string): string {
@@ -102,7 +106,7 @@ export function UsageModelMeta(props: UsageRecordSurfaceProps) {
               style={{ backgroundColor: chip.dotColor }}
             />
           ) : null}
-          {chip.fastMark ? <span aria-hidden="true" style={FAST_INDICATOR_STYLE} /> : null}
+          {chip.fastMark ? <span aria-hidden="true" style={FAST_INDICATOR_STYLE}>⚡️</span> : null}
           {chip.label}
         </span>
       ))}
