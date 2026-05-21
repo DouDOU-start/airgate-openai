@@ -84,6 +84,27 @@ const labelStyle: CSSProperties = {
   whiteSpace: 'nowrap',
 };
 
+const inlineValueStyle: CSSProperties = {
+  display: 'inline-flex',
+  minWidth: 0,
+  maxWidth: '100%',
+  alignItems: 'baseline',
+  justifyContent: 'flex-end',
+  gap: '0.25rem',
+};
+
+const inlineValueMetaStyle: CSSProperties = {
+  minWidth: 0,
+  overflow: 'hidden',
+  color: 'var(--ag-text-tertiary)',
+  textOverflow: 'ellipsis',
+  whiteSpace: 'nowrap',
+};
+
+const inlineValueNumberStyle: CSSProperties = {
+  flexShrink: 0,
+};
+
 const valueStyle: CSSProperties = {
   minWidth: 0,
   maxWidth: '12rem',
@@ -157,6 +178,17 @@ function Row({ label, tone, value }: { label: ReactNode; tone?: string; value: R
   );
 }
 
+function outputTokenValue(reasoningTokens: number, outputTokens: number) {
+  return (
+    <span style={inlineValueStyle}>
+      {reasoningTokens > 0 ? (
+        <span style={inlineValueMetaStyle}>(推理 {formatNumber(reasoningTokens)})</span>
+      ) : null}
+      <span style={inlineValueNumberStyle}>{formatNumber(outputTokens)}</span>
+    </span>
+  );
+}
+
 export function UsageMetricDetail({ context }: UsageRecordSurfaceProps) {
   const record = recordFromContext(context);
   const attributes = contextArray<UsageAttribute>(context, 'usageAttributes', 'usage_attributes');
@@ -187,11 +219,10 @@ export function UsageMetricDetail({ context }: UsageRecordSurfaceProps) {
         </div>
       ) : null}
       <div style={bodyStyle}>
-        <Row label="输入 Token" value={formatNumber(inputTokens)} tone="var(--ag-info)" />
-        <Row label="输出 Token" value={formatNumber(outputTokens)} tone="var(--ag-primary)" />
-        {cachedInputTokens > 0 ? <Row label="缓存读取 Token" value={formatNumber(cachedInputTokens)} tone="var(--ag-success)" /> : null}
-        {reasoningTokens > 0 ? <Row label="推理 Token" value={formatNumber(reasoningTokens)} tone="var(--ag-warning)" /> : null}
         {images > 0 ? <Row label="图片数量" value={formatNumber(images)} tone="var(--ag-success)" /> : null}
+        <Row label="输入 Token" value={formatNumber(inputTokens)} tone="var(--ag-info)" />
+        <Row label="输出 Token" value={outputTokenValue(reasoningTokens, outputTokens)} tone="var(--ag-primary)" />
+        {cachedInputTokens > 0 ? <Row label="缓存读取 Token" value={formatNumber(cachedInputTokens)} tone="var(--ag-success)" /> : null}
         <Row label="总 Token" value={formatNumber(totalTokens)} tone="var(--ag-text)" />
       </div>
     </div>
