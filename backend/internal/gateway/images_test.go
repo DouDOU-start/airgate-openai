@@ -533,6 +533,49 @@ func TestParseUsage_ToolImageGen(t *testing.T) {
 	}
 }
 
+func TestParseUsage_ImageGenerationCallSummary(t *testing.T) {
+	b64 := strings.TrimPrefix(testPNGDataURL(1024, 1536, func(x, y int) color.RGBA {
+		return color.RGBA{R: 1, G: 2, B: 3, A: 255}
+	}), "data:image/png;base64,")
+	body := []byte(fmt.Sprintf(`{
+		"usage": {"input_tokens": 100, "output_tokens": 50},
+		"output": [{
+			"type": "image_generation_call",
+			"result": %q,
+			"size": "1024x1536",
+			"quality": "high"
+		}]
+	}`, b64))
+	got := parseUsage(body)
+	if got.imageGenCallCount != 1 {
+		t.Fatalf("imageGenCallCount = %d, want 1", got.imageGenCallCount)
+	}
+	if got.imageGenCallSize != "1024x1536" {
+		t.Fatalf("imageGenCallSize = %q, want 1024x1536", got.imageGenCallSize)
+	}
+}
+
+func TestCollectImageGenCallSummary(t *testing.T) {
+	b64 := strings.TrimPrefix(testPNGDataURL(1024, 1024, func(x, y int) color.RGBA {
+		return color.RGBA{R: 5, G: 6, B: 7, A: 255}
+	}), "data:image/png;base64,")
+	event := []byte(fmt.Sprintf(`{
+		"type":"response.output_item.done",
+		"item":{
+			"type":"image_generation_call",
+			"result":%q,
+			"size":"1024x1024"
+		}
+	}`, b64))
+	ok, size := collectImageGenCallSummary(event)
+	if !ok {
+		t.Fatal("expected image generation call summary")
+	}
+	if size != "1024x1024" {
+		t.Fatalf("size = %q, want 1024x1024", size)
+	}
+}
+
 // TestParseSSEUsage_ToolImageGen 验证 SSE response.completed 事件中
 // response.tool_usage.image_gen 被正确抽取到累加器指针。
 func TestParseSSEUsage_ToolImageGen(t *testing.T) {

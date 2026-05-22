@@ -1,8 +1,15 @@
 package gateway
 
 import (
+	"bytes"
+	"encoding/base64"
 	"encoding/json"
+	"fmt"
+	"image"
+	"image/color"
+	"image/png"
 	"net/http"
+	"strings"
 	"testing"
 
 	"github.com/tidwall/gjson"
@@ -171,6 +178,89 @@ func TestApplyOpenAIWireServiceTier_FastRemoved(t *testing.T) {
 	if _, ok := payload["service_tier"]; ok {
 		t.Fatalf("service_tier should be removed for fast, got %v", payload["service_tier"])
 	}
+}
+
+func TestPreprocessRequestBody_ShrinksConversationImageDataURLs(t *testing.T) {
+	imageRef := largeConversationImageDataURL(t)
+	cases := []struct {
+		name       string
+		path       string
+		body       []byte
+		resultPath string
+	}{
+		{
+			name:       "chat completions",
+			path:       "/v1/chat/completions",
+			body:       []byte(fmt.Sprintf(`{"model":"gpt-5.4","messages":[{"role":"user","content":[{"type":"text","text":"描述图片"},{"type":"image_url","image_url":{"url":%q}}]}]}`, imageRef)),
+			resultPath: "messages.0.content.1.image_url.url",
+		},
+		{
+			name:       "responses input",
+			path:       "/v1/responses",
+			body:       []byte(fmt.Sprintf(`{"model":"gpt-5.4","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"描述图片"},{"type":"input_image","image_url":%q}]}]}`, imageRef)),
+			resultPath: "input.0.content.1.image_url",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := preprocessRequestBody(tc.body, "gpt-5.4", tc.path)
+			shrunk := gjson.GetBytes(got, tc.resultPath).String()
+			if shrunk == "" {
+				t.Fatalf("压缩后的 image_url 为空，body=%s", got)
+			}
+			assertShrunkConversationImage(t, shrunk, imageRef)
+		})
+	}
+}
+
+func largeConversationImageDataURL(t *testing.T) string {
+	t.Helper()
+	img := image.NewRGBA(image.Rect(0, 0, 1024, 1024))
+	for y := 0; y < 1024; y++ {
+		for x := 0; x < 1024; x++ {
+			v := uint32(x)*1103515245 + uint32(y)*12345
+			img.SetRGBA(x, y, color.RGBA{R: uint8(v), G: uint8(v >> 8), B: uint8(v >> 16), A: 255})
+		}
+	}
+	var buf bytes.Buffer
+	if err := (&png.Encoder{CompressionLevel: png.NoCompression}).Encode(&buf, img); err != nil {
+		t.Fatalf("png encode failed: %v", err)
+	}
+	ref := "data:image/png;base64," + base64.StdEncoding.EncodeToString(buf.Bytes())
+	if n := len(decodeDataURLBytes(t, ref)); n <= maxResponsesInputImageBytes {
+		t.Fatalf("测试图片过小：%d <= %d", n, maxResponsesInputImageBytes)
+	}
+	return ref
+}
+
+func assertShrunkConversationImage(t *testing.T, got, original string) {
+	t.Helper()
+	if got == original {
+		t.Fatal("图片 data URL 未被压缩")
+	}
+	if !strings.HasPrefix(got, "data:image/jpeg;base64,") {
+		t.Fatalf("压缩后应转成 JPEG data URL，实际前缀 %.32q", got)
+	}
+	if n := len(decodeDataURLBytes(t, got)); n > maxResponsesInputImageBytes {
+		t.Fatalf("压缩后图片字节数 = %d，want <= %d", n, maxResponsesInputImageBytes)
+	}
+}
+
+func decodeDataURLBytes(t *testing.T, ref string) []byte {
+	t.Helper()
+	comma := strings.IndexByte(ref, ',')
+	if comma < 0 {
+		t.Fatalf("data URL 缺少逗号：%.32q", ref)
+	}
+	raw := ref[comma+1:]
+	data, err := base64.StdEncoding.DecodeString(raw)
+	if err != nil {
+		data, err = base64.RawStdEncoding.DecodeString(raw)
+		if err != nil {
+			t.Fatalf("base64 解码失败：%v", err)
+		}
+	}
+	return data
 }
 
 func TestWrapAsResponsesAPIPreservesChatImageURL(t *testing.T) {

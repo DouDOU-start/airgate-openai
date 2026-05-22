@@ -60,6 +60,8 @@ func handleStreamResponseWithLogger(logger *slog.Logger, resp *http.Response, w 
 	diagnostics := streamResponseDiagnostics{}
 	var pending strings.Builder
 	var toolImageIn, toolImageOut int // 接收 response.tool_usage.image_gen，用于图像工具计费。
+	var imageGenCount int
+	var imageGenSize string
 
 	for scanner.Scan() {
 		line := scanner.Text()
@@ -82,6 +84,12 @@ func handleStreamResponseWithLogger(logger *slog.Logger, resp *http.Response, w 
 						writeSanitizedSSEError(w)
 					}
 					break
+				}
+				if ok, size := collectImageGenCallSummary([]byte(data)); ok {
+					imageGenCount++
+					if imageGenSize == "" && size != "" {
+						imageGenSize = size
+					}
 				}
 				if isStreamCompletionEvent(data) {
 					completed = true
@@ -161,8 +169,11 @@ func handleStreamResponseWithLogger(logger *slog.Logger, resp *http.Response, w 
 		}, streamErr
 	}
 
-	numImages := estimateImageCountFromTokens(toolImageOut)
-	fillUsageCostWithImageTool(usage, numImages, "")
+	numImages := imageGenCount
+	if numImages <= 0 {
+		numImages = estimateImageCountFromTokens(toolImageOut)
+	}
+	fillUsageCostWithImageTool(usage, numImages, imageGenSize)
 	return sdk.ForwardOutcome{
 		Kind:     sdk.OutcomeSuccess,
 		Upstream: sdk.UpstreamResponse{StatusCode: resp.StatusCode},
@@ -389,7 +400,11 @@ func handleNonStreamResponse(resp *http.Response, w http.ResponseWriter, start t
 		parsed.reasoningOutputTokens,
 		elapsed.Milliseconds(),
 	)
-	fillUsageCostWithImageTool(usage, estimateImageCountFromTokens(parsed.toolImageOutputTokens), "")
+	numImages := parsed.imageGenCallCount
+	if numImages <= 0 {
+		numImages = estimateImageCountFromTokens(parsed.toolImageOutputTokens)
+	}
+	fillUsageCostWithImageTool(usage, numImages, parsed.imageGenCallSize)
 
 	outcome := sdk.ForwardOutcome{
 		Kind:     sdk.OutcomeSuccess,
@@ -788,6 +803,8 @@ type openaiUsage struct {
 	// 按 gpt-image-1.5 单价单独计费，与主 model 的单价隔离。
 	toolImageInputTokens  int
 	toolImageOutputTokens int
+	imageGenCallCount     int
+	imageGenCallSize      string
 }
 
 // parseUsage 从完整响应体解析 usage
@@ -840,8 +857,56 @@ func parseUsage(body []byte) openaiUsage {
 		usage.toolImageInputTokens = int(toolUsage.Get("input_tokens").Int())
 		usage.toolImageOutputTokens = int(toolUsage.Get("output_tokens").Int())
 	}
+	usage.imageGenCallCount, usage.imageGenCallSize = collectImageGenCallSummaryFromBody(body)
 
 	return usage
+}
+
+func collectImageGenCallSummary(data []byte) (bool, string) {
+	item := gjson.GetBytes(data, "item")
+	if !item.Exists() {
+		return false, ""
+	}
+	return collectImageGenCallSummaryFromItem(item)
+}
+
+func collectImageGenCallSummaryFromBody(body []byte) (int, string) {
+	count := 0
+	size := ""
+	for _, path := range []string{"output", "response.output"} {
+		output := gjson.GetBytes(body, path)
+		if !output.Exists() || !output.IsArray() {
+			continue
+		}
+		for _, item := range output.Array() {
+			ok, itemSize := collectImageGenCallSummaryFromItem(item)
+			if !ok {
+				continue
+			}
+			count++
+			if size == "" && itemSize != "" {
+				size = itemSize
+			}
+		}
+	}
+	return count, size
+}
+
+func collectImageGenCallSummaryFromItem(item gjson.Result) (bool, string) {
+	if item.Get("type").String() != "image_generation_call" {
+		return false, ""
+	}
+	result := item.Get("result").String()
+	if result == "" {
+		return false, ""
+	}
+	size := item.Get("size").String()
+	if size == "" {
+		if actualSize, ok := imageActualSizeFromBase64(result); ok {
+			size = actualSize
+		}
+	}
+	return true, size
 }
 
 // retryDelayPattern 匹配 "try again in Ns" / "try again in Nms" 格式

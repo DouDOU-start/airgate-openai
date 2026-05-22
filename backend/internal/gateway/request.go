@@ -195,9 +195,10 @@ func buildAPIKeyURL(account *sdk.Account, reqPath string) string {
 // 在 forwardHTTP 入口调用，保证 API Key / OAuth / Anthropic 等所有路径
 // 拿到的 body 格式一致。当前处理步骤：
 //  1. model 同步（body 中的 model 与 core 传入的 model 对齐）
-//  2. 剔除客户端 previous_response_id（跨账号接续不可靠，会话接续由网关内部管理）
-//  3. 上下文守卫（/v1/chat/completions 超长 messages 裁剪）
-//  4. input 规范化（/v1/responses 的 string input → list，messages → input 转换）
+//  2. data:image 输入瘦身（对话模型多图时避免上游 413）
+//  3. 剔除客户端 previous_response_id（跨账号接续不可靠，会话接续由网关内部管理）
+//  4. 上下文守卫（/v1/chat/completions 超长 messages 裁剪）
+//  5. input 规范化（/v1/responses 的 string input → list，messages → input 转换）
 func preprocessRequestBody(body []byte, model, reqPath string) []byte {
 	if len(body) == 0 {
 		return body
@@ -221,6 +222,8 @@ func preprocessRequestBody(body []byte, model, reqPath string) []byte {
 		}
 	}
 
+	result = shrinkOpenAIConversationImages(result)
+
 	// 剔除客户端传入的 previous_response_id。
 	// AirGate 在多个上游账号之间做负载均衡，客户端的 previous_response_id
 	// 可能指向另一个账号的 response，上游会返回 "not found"。
@@ -230,6 +233,58 @@ func preprocessRequestBody(body []byte, model, reqPath string) []byte {
 	result = applyContextGuard(result, reqPath)
 	result = normalizeResponsesInput(result, reqPath)
 	return result
+}
+
+func shrinkOpenAIConversationImages(body []byte) []byte {
+	shrunk, changed := shrinkDataImageURLsInJSON(body, maxResponsesInputImageBytes)
+	if !changed {
+		return body
+	}
+	return shrunk
+}
+
+func shrinkDataImageURLsInJSON(body []byte, limit int) ([]byte, bool) {
+	if len(body) == 0 || limit <= 0 {
+		return body, false
+	}
+	var root any
+	if err := json.Unmarshal(body, &root); err != nil {
+		return body, false
+	}
+	changed := false
+	root = shrinkDataImageURLsValue(root, limit, &changed)
+	if !changed {
+		return body, false
+	}
+	out, err := json.Marshal(root)
+	if err != nil {
+		return body, false
+	}
+	return out, true
+}
+
+func shrinkDataImageURLsValue(v any, limit int, changed *bool) any {
+	switch item := v.(type) {
+	case map[string]any:
+		for k, child := range item {
+			item[k] = shrinkDataImageURLsValue(child, limit, changed)
+		}
+		return item
+	case []any:
+		for i, child := range item {
+			item[i] = shrinkDataImageURLsValue(child, limit, changed)
+		}
+		return item
+	case string:
+		shrunk, err := shrinkDataImageURL(item, limit)
+		if err != nil || shrunk == item {
+			return item
+		}
+		*changed = true
+		return shrunk
+	default:
+		return v
+	}
 }
 
 // normalizeResponsesInput 对 Responses API 请求的 input 字段做格式规范化。
