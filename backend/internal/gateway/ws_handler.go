@@ -53,7 +53,7 @@ func (g *OpenAIGateway) HandleWebSocket(ctx context.Context, conn sdk.WebSocketC
 	if dialInfo != nil {
 		outcome := failureOutcome(dialInfo.statusCode, nil, nil, dialInfo.errorMessage, 0)
 		outcome.Duration = elapsed
-		return outcome, err
+		return outcome, forwardErrForOutcome(outcome, err)
 	}
 	// WS 桥接中途断开，视为流式中断
 	return sdk.ForwardOutcome{

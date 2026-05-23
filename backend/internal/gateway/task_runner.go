@@ -64,6 +64,9 @@ func (rt *TaskRuntime) Fail(ctx context.Context, taskErr *TaskError) error {
 }
 
 func sanitizeTaskMessage(taskErr *TaskError) string {
+	if taskErr == nil {
+		return ""
+	}
 	msg := taskErr.Message
 	if strings.Contains(msg, "rpc error:") {
 		if desc := extractGRPCDesc(msg); desc != "" {
@@ -74,7 +77,10 @@ func sanitizeTaskMessage(taskErr *TaskError) string {
 	if strings.Contains(msg, "upstream 转发失败") {
 		return userFriendlyFallback(taskErr.Type)
 	}
-	return msg
+	if taskErr.Type == "invalid_request" {
+		return msg
+	}
+	return userFriendlyFallback(taskErr.Type)
 }
 
 func userFriendlyFallback(errType string) string {

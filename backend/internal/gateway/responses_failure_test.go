@@ -96,8 +96,22 @@ func TestClassifyHTTPFailureTreatsUsageLimit403AsRateLimited(t *testing.T) {
 	}
 }
 
+func TestClassifyHTTPFailureTreatsUsageLimit400AsRateLimited(t *testing.T) {
+	got := classifyHTTPFailure(400, "The usage limit has been reached. Please try again later.")
+	if got != sdk.OutcomeAccountRateLimited {
+		t.Fatalf("expected AccountRateLimited, got %v", got)
+	}
+}
+
 func TestClassifyHTTPFailureKeepsDisabled403AsAccountDead(t *testing.T) {
 	got := classifyHTTPFailure(403, "Organization disabled due to policy violation")
+	if got != sdk.OutcomeAccountDead {
+		t.Fatalf("expected AccountDead, got %v", got)
+	}
+}
+
+func TestClassifyHTTPFailureTreatsDisabled400AsAccountDead(t *testing.T) {
+	got := classifyHTTPFailure(400, "Organization disabled due to policy violation")
 	if got != sdk.OutcomeAccountDead {
 		t.Fatalf("expected AccountDead, got %v", got)
 	}

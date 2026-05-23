@@ -89,6 +89,16 @@ func accountDeadOutcome(reason string) sdk.ForwardOutcome {
 	}
 }
 
+// forwardErrForOutcome 只在非 ClientError 时保留 err。
+// 这样 core 才会把客户端 4xx 的原始 body 直接透传回去；
+// 账号级 / 上游级失败则继续走统一脱敏和 failover。
+func forwardErrForOutcome(outcome sdk.ForwardOutcome, err error) error {
+	if outcome.Kind == sdk.OutcomeClientError {
+		return nil
+	}
+	return err
+}
+
 func newTokenUsage(modelID, serviceTier string, inputTokens, outputTokens, cachedInputTokens, reasoningOutputTokens int, firstTokenMs int64) *sdk.Usage {
 	usage := &sdk.Usage{
 		Model:        modelID,

@@ -43,6 +43,12 @@ func testPNGBase64(width, height int, pixel func(int, int) color.RGBA) string {
 	return strings.TrimPrefix(dataURL, "data:image/png;base64,")
 }
 
+func testPNGBytes(width, height int, pixel func(int, int) color.RGBA) []byte {
+	b64 := testPNGBase64(width, height, pixel)
+	data, _ := base64.StdEncoding.DecodeString(b64)
+	return data
+}
+
 func testPNGDataURLFromImage(img image.Image) string {
 	var buf bytes.Buffer
 	_ = png.Encode(&buf, img)
@@ -634,18 +640,28 @@ func TestFillUsageCostWithImageTool_NoToolUsage(t *testing.T) {
 }
 
 func TestCompositeMaskedImageGenCalls(t *testing.T) {
-	base := testPNGDataURL(2, 1, func(x, y int) color.RGBA {
+	baseBytes := testPNGBytes(2, 1, func(x, y int) color.RGBA {
 		if x == 0 {
 			return color.RGBA{R: 10, G: 20, B: 30, A: 255}
 		}
 		return color.RGBA{R: 40, G: 50, B: 60, A: 255}
 	})
-	mask := testPNGDataURL(2, 1, func(x, y int) color.RGBA {
+	maskBytes := testPNGBytes(2, 1, func(x, y int) color.RGBA {
 		if x == 0 {
 			return color.RGBA{A: 0}
 		}
 		return color.RGBA{A: 255}
 	})
+	baseSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "image/png")
+		_, _ = w.Write(baseBytes)
+	}))
+	defer baseSrv.Close()
+	maskSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "image/png")
+		_, _ = w.Write(maskBytes)
+	}))
+	defer maskSrv.Close()
 	generated := testPNGBase64(2, 1, func(x, y int) color.RGBA {
 		if x == 0 {
 			return color.RGBA{R: 200, G: 210, B: 220, A: 255}
@@ -654,8 +670,8 @@ func TestCompositeMaskedImageGenCalls(t *testing.T) {
 	})
 
 	calls, err := compositeMaskedImageGenCalls(&imagesRequest{
-		Images: []string{base},
-		Mask:   mask,
+		Images: []string{baseSrv.URL + "/base.png"},
+		Mask:   maskSrv.URL + "/mask.png",
 	}, []ImageGenCall{{Result: generated, RevisedPrompt: "internal prompt"}})
 	if err != nil {
 		t.Fatalf("compositeMaskedImageGenCalls returned err: %v", err)
@@ -912,12 +928,18 @@ func TestBuildImagesToolCreateMsg_Edit_JSON(t *testing.T) {
 	imageRef := testPNGDataURL(2, 2, func(x, y int) color.RGBA {
 		return color.RGBA{R: 80, G: 90, B: 100, A: 255}
 	})
-	maskRef := testPNGDataURL(2, 2, func(x, y int) color.RGBA {
+	maskBytes := testPNGBytes(2, 2, func(x, y int) color.RGBA {
 		if x == 1 && y == 1 {
 			return color.RGBA{A: 0}
 		}
 		return color.RGBA{R: 255, G: 255, B: 255, A: 255}
 	})
+	maskSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "image/png")
+		_, _ = w.Write(maskBytes)
+	}))
+	defer maskSrv.Close()
+	maskRef := maskSrv.URL + "/mask.png"
 	body := []byte(fmt.Sprintf(`{
 		"model":"gpt-image-1.5",
 		"prompt":"make it cyberpunk",
@@ -981,6 +1003,53 @@ func TestBuildImagesToolCreateMsg_Edit_JSON(t *testing.T) {
 		if tool.Get(forbidden).Exists() {
 			t.Errorf("tools[0].%s should not be present", forbidden)
 		}
+	}
+}
+
+func TestBuildAPIKeyImagesEditMultipartBody_RemoteRefs(t *testing.T) {
+	imageBytes := testPNGBytes(2, 2, func(x, y int) color.RGBA {
+		return color.RGBA{R: 90, G: 100, B: 110, A: 255}
+	})
+	maskBytes := testPNGBytes(2, 2, func(x, y int) color.RGBA {
+		if x == 0 && y == 0 {
+			return color.RGBA{A: 0}
+		}
+		return color.RGBA{A: 255}
+	})
+	imageSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "image/png")
+		_, _ = w.Write(imageBytes)
+	}))
+	defer imageSrv.Close()
+	maskSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "image/png")
+		_, _ = w.Write(maskBytes)
+	}))
+	defer maskSrv.Close()
+
+	body := []byte(fmt.Sprintf(`{
+		"prompt":"relight the scene",
+		"model":"gpt-image-2",
+		"size":"1024x1024",
+		"quality":"auto",
+		"n":1,
+		"image":%q,
+		"mask":%q
+	}`, imageSrv.URL+"/image.png", maskSrv.URL+"/mask.png"))
+
+	multipartBody, contentType, err := buildAPIKeyImagesEditMultipartBody(body, "application/json")
+	if err != nil {
+		t.Fatalf("buildAPIKeyImagesEditMultipartBody err: %v", err)
+	}
+	req, err := parseImagesRequest(multipartBody, contentType, true)
+	if err != nil {
+		t.Fatalf("parseImagesRequest err: %v", err)
+	}
+	if len(req.Images) != 1 || !strings.HasPrefix(req.Images[0], "data:image/png;base64,") {
+		t.Fatalf("remote image not normalized into multipart data URL: %+v", req.Images)
+	}
+	if !strings.HasPrefix(req.Mask, "data:image/png;base64,") {
+		t.Fatalf("remote mask not normalized into multipart data URL: %q", req.Mask)
 	}
 }
 

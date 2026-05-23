@@ -209,7 +209,7 @@ func (g *OpenAIGateway) forwardImagesViaWebReverse(ctx context.Context, req *sdk
 			if outcome.Usage == nil {
 				outcome.Usage = newTokenUsage(imagesWebReverseModel, "", 0, 0, 0, 0, 0)
 			}
-			return outcome, err
+			return outcome, forwardErrForOutcome(outcome, err)
 		}
 		// 有部分图片已下载：降级为成功响应继续下游流程
 		g.logger.Warn("imgen 生成部分失败，使用已下载图片", "err", err, "count", len(imgRes.Images))
@@ -293,21 +293,16 @@ func buildWebReverseImagesResponse(res *imgen.Result, promptTokens, outputTokens
 	return b
 }
 
-// webReverseImagesError 把一个客户端错误（请求不合法 / 凭证缺失）打包为 ClientError Outcome。
-// 调用方应在命中 401/403 等账号级错误前单独处理——这里不归类到账号状态。
+// webReverseImagesError 把 WebReverse 阶段的错误打包为 Outcome。
+// 400 类客户端错误直接透传；账号 / 上游类错误保留 err，让 core 继续脱敏和 failover。
 func webReverseImagesError(start time.Time, status int, _ http.ResponseWriter, msg string) (sdk.ForwardOutcome, error) {
 	body := buildImagesErrorBody(status, msg)
-	outcome := sdk.ForwardOutcome{
-		Kind: sdk.OutcomeClientError,
-		Upstream: sdk.UpstreamResponse{
-			StatusCode: status,
-			Headers:    http.Header{"Content-Type": []string{"application/json"}},
-			Body:       body,
-		},
-		Reason:   msg,
-		Duration: time.Since(start),
+	outcome := failureOutcome(status, body, http.Header{"Content-Type": []string{"application/json"}}, msg, parseRetryDelay(msg))
+	outcome.Duration = time.Since(start)
+	if outcome.Usage == nil {
+		outcome.Usage = newTokenUsage(imagesWebReverseModel, "", 0, 0, 0, 0, 0)
 	}
-	return outcome, fmt.Errorf("%s", msg)
+	return outcome, forwardErrForOutcome(outcome, fmt.Errorf("%s", msg))
 }
 
 const webReverseMaxImageEdge = 3840

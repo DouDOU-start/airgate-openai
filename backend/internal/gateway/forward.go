@@ -562,7 +562,7 @@ func (g *OpenAIGateway) forwardOAuth(ctx context.Context, req *sdk.ForwardReques
 			wsBody := openAIErrorJSON(openAIErrorTypeForStatus(wsResp.StatusCode), "", err.Error())
 			outcome := failureOutcome(wsResp.StatusCode, wsBody, wsResp.Header.Clone(), err.Error(), extractRetryAfterHeader(wsResp.Header))
 			outcome.Duration = time.Since(start)
-			return outcome, err
+			return outcome, forwardErrForOutcome(outcome, err)
 		}
 		logger.Warn("upstream_request_failed",
 			sdk.LogFieldAccountID, account.ID,
@@ -588,7 +588,17 @@ func (g *OpenAIGateway) forwardOAuth(ctx context.Context, req *sdk.ForwardReques
 			sdk.LogFieldModel, req.Model,
 			sdk.LogFieldError, err,
 		)
-		return transientOutcome(reason), fmt.Errorf("%s", reason)
+		outcome := sdk.ForwardOutcome{
+			Kind: sdk.OutcomeClientError,
+			Upstream: sdk.UpstreamResponse{
+				StatusCode: http.StatusBadRequest,
+				Headers:    http.Header{"Content-Type": []string{"application/json"}},
+				Body:       openAIErrorJSON("invalid_request_error", "invalid_request", reason),
+			},
+			Reason:   reason,
+			Duration: time.Since(start),
+		}
+		return outcome, forwardErrForOutcome(outcome, fmt.Errorf("%s", reason))
 	}
 
 	// 协议分叉：客户端如果走的是 /v1/chat/completions（而不是原生 /v1/responses），

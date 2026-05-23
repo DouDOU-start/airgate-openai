@@ -241,15 +241,9 @@ func buildAPIKeyImagesEditMultipartBody(body []byte, contentType string) ([]byte
 }
 
 func writeMultipartImageRef(mw *multipart.Writer, fieldName, baseName, ref string, shrinkLimit int) error {
-	mimeType, data, err := decodeDataImageURL(ref)
+	mimeType, data, err := readImageRefBytes(ref, shrinkLimit)
 	if err != nil {
 		return err
-	}
-	if shrinkLimit > 0 {
-		data, mimeType, err = shrinkImageBytes(data, mimeType, shrinkLimit)
-		if err != nil {
-			return err
-		}
 	}
 	ext := ".png"
 	switch mimeType {
@@ -269,6 +263,65 @@ func writeMultipartImageRef(mw *multipart.Writer, fieldName, baseName, ref strin
 	}
 	_, err = part.Write(data)
 	return err
+}
+
+func readImageRefBytes(ref string, shrinkLimit int) (string, []byte, error) {
+	switch {
+	case strings.HasPrefix(ref, "data:"):
+		mimeType, data, err := decodeDataImageURL(ref)
+		if err != nil {
+			return "", nil, err
+		}
+		if shrinkLimit > 0 {
+			data, mimeType, err = shrinkImageBytes(data, mimeType, shrinkLimit)
+			if err != nil {
+				return "", nil, err
+			}
+		}
+		return mimeType, data, nil
+	case strings.HasPrefix(ref, "http://") || strings.HasPrefix(ref, "https://"):
+		data, mimeType, err := downloadImageBytes(ref)
+		if err != nil {
+			return "", nil, err
+		}
+		if shrinkLimit > 0 {
+			data, mimeType, err = shrinkImageBytes(data, mimeType, shrinkLimit)
+			if err != nil {
+				return "", nil, err
+			}
+		}
+		return mimeType, data, nil
+	default:
+		return "", nil, fmt.Errorf("image 必须是 data URL 或 http(s) URL")
+	}
+}
+
+func downloadImageBytes(ref string) ([]byte, string, error) {
+	client := &http.Client{Timeout: 30 * time.Second}
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, ref, nil)
+	if err != nil {
+		return nil, "", fmt.Errorf("构建图片下载请求失败: %w", err)
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, "", fmt.Errorf("下载图片失败: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, "", fmt.Errorf("下载图片返回 HTTP %d", resp.StatusCode)
+	}
+	data, err := io.ReadAll(io.LimitReader(resp.Body, maxRemoteImageBytes+1))
+	if err != nil {
+		return nil, "", fmt.Errorf("读取图片失败: %w", err)
+	}
+	if len(data) > maxRemoteImageBytes {
+		return nil, "", fmt.Errorf("图片过大")
+	}
+	mimeType := strings.TrimSpace(strings.Split(resp.Header.Get("Content-Type"), ";")[0])
+	if mimeType == "" || !strings.HasPrefix(strings.ToLower(mimeType), "image/") {
+		return nil, "", fmt.Errorf("图片 Content-Type 不是 image/*: %s", mimeType)
+	}
+	return data, strings.ToLower(mimeType), nil
 }
 
 func decodeDataImageURL(ref string) (string, []byte, error) {
@@ -659,8 +712,11 @@ func buildEditRegionAnnotation(req *imagesRequest) (string, error) {
 	if req == nil || req.Mask == "" || len(req.Images) == 0 {
 		return "", nil
 	}
-	base, _ := decodeDataURLImage(req.Images[0])
-	mask, err := decodeDataURLImage(req.Mask)
+	base, err := decodeImageRefImage(req.Images[0])
+	if err != nil {
+		return "", fmt.Errorf("解码编辑目标图片失败: %w", err)
+	}
+	mask, err := decodeImageRefImage(req.Mask)
 	if err != nil {
 		return "", fmt.Errorf("解码编辑 mask 失败: %w", err)
 	}
@@ -751,11 +807,11 @@ func compositeMaskedImageGenCalls(req *imagesRequest, calls []ImageGenCall) ([]I
 	if req == nil || req.Mask == "" || len(req.Images) == 0 || len(calls) == 0 {
 		return calls, nil
 	}
-	base, err := decodeDataURLImage(req.Images[0])
+	base, err := decodeImageRefImage(req.Images[0])
 	if err != nil {
 		return nil, fmt.Errorf("解码编辑目标图片失败: %w", err)
 	}
-	mask, err := decodeDataURLImage(req.Mask)
+	mask, err := decodeImageRefImage(req.Mask)
 	if err != nil {
 		return nil, fmt.Errorf("解码编辑 mask 失败: %w", err)
 	}
@@ -777,6 +833,19 @@ func compositeMaskedImageGenCalls(req *imagesRequest, calls []ImageGenCall) ([]I
 		out[i].Result = encoded
 	}
 	return out, nil
+}
+
+func decodeImageRefImage(ref string) (image.Image, error) {
+	mimeType, data, err := readImageRefBytes(ref, 0)
+	if err != nil {
+		return nil, err
+	}
+	_ = mimeType
+	img, _, err := image.Decode(bytes.NewReader(data))
+	if err != nil {
+		return nil, err
+	}
+	return img, nil
 }
 
 func decodeBase64Image(b64 string) (image.Image, error) {
@@ -1189,7 +1258,7 @@ func (g *OpenAIGateway) forwardImagesViaResponsesTool(ctx context.Context, req *
 			wsBody := openAIErrorJSON(openAIErrorTypeForStatus(wsResp.StatusCode), "", err.Error())
 			outcome := failureOutcome(wsResp.StatusCode, wsBody, wsResp.Header.Clone(), err.Error(), extractRetryAfterHeader(wsResp.Header))
 			outcome.Duration = time.Since(start)
-			return outcome, err
+			return outcome, forwardErrForOutcome(outcome, err)
 		}
 		return transientOutcome(err.Error()), err
 	}

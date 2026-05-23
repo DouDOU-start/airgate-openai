@@ -26,10 +26,10 @@ import (
 //	5xx → UpstreamTransient
 //	其它 4xx → ClientError（客户端请求自己的问题，账号无辜）
 func classifyHTTPFailure(statusCode int, message string) sdk.OutcomeKind {
-	if isTemporaryRateLimitText(message) && (statusCode == 403 || statusCode == 429) {
+	if isTemporaryRateLimitText(message) && (statusCode == 400 || statusCode == 403 || statusCode == 429) {
 		return sdk.OutcomeAccountRateLimited
 	}
-	if isDisabledAccountText(message) && statusCode == 403 {
+	if isDisabledAccountText(message) && (statusCode == 400 || statusCode == 403) {
 		return sdk.OutcomeAccountDead
 	}
 	switch statusCode {
