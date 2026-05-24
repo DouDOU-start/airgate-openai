@@ -781,38 +781,6 @@ func blendRGBA(dst, src color.RGBA) color.RGBA {
 	}
 }
 
-func compositeMaskedImageGenCalls(req *imagesRequest, calls []ImageGenCall) ([]ImageGenCall, error) {
-	if req == nil || req.Mask == "" || len(req.Images) == 0 || len(calls) == 0 {
-		return calls, nil
-	}
-	base, err := decodeImageRefImage(req.Images[0])
-	if err != nil {
-		return nil, fmt.Errorf("解码编辑目标图片失败: %w", err)
-	}
-	mask, err := decodeImageRefImage(req.Mask)
-	if err != nil {
-		return nil, fmt.Errorf("解码编辑 mask 失败: %w", err)
-	}
-
-	out := append([]ImageGenCall(nil), calls...)
-	for i := range out {
-		if out[i].Result == "" {
-			continue
-		}
-		generated, err := decodeBase64Image(out[i].Result)
-		if err != nil {
-			return nil, fmt.Errorf("解码编辑结果图片失败: %w", err)
-		}
-		composited := compositeMaskedImage(base, mask, generated)
-		encoded, err := encodePNGBase64(composited)
-		if err != nil {
-			return nil, fmt.Errorf("编码编辑合成结果失败: %w", err)
-		}
-		out[i].Result = encoded
-	}
-	return out, nil
-}
-
 func decodeImageRefImage(ref string) (image.Image, error) {
 	mimeType, data, err := readImageRefBytes(ref, 0)
 	if err != nil {
@@ -824,41 +792,6 @@ func decodeImageRefImage(ref string) (image.Image, error) {
 		return nil, err
 	}
 	return img, nil
-}
-
-func decodeBase64Image(b64 string) (image.Image, error) {
-	data, err := base64.StdEncoding.DecodeString(strings.TrimSpace(b64))
-	if err != nil {
-		data, err = base64.RawStdEncoding.DecodeString(strings.TrimSpace(b64))
-		if err != nil {
-			return nil, err
-		}
-	}
-	img, _, err := image.Decode(bytes.NewReader(data))
-	if err != nil {
-		return nil, err
-	}
-	return img, nil
-}
-
-func compositeMaskedImage(base, mask, generated image.Image) *image.RGBA {
-	baseBounds := base.Bounds()
-	width, height := baseBounds.Dx(), baseBounds.Dy()
-	out := image.NewRGBA(image.Rect(0, 0, width, height))
-	maskBounds := mask.Bounds()
-	for y := 0; y < height; y++ {
-		my := maskBounds.Min.Y + y*maskBounds.Dy()/height
-		for x := 0; x < width; x++ {
-			mx := maskBounds.Min.X + x*maskBounds.Dx()/width
-			_, _, _, alpha := mask.At(mx, my).RGBA()
-			if alpha <= 0x7fff {
-				out.SetRGBA(x, y, sampleImageRGBA(generated, x, y, width, height))
-				continue
-			}
-			out.SetRGBA(x, y, sampleImageRGBA(base, x, y, width, height))
-		}
-	}
-	return out
 }
 
 func sampleImageRGBA(img image.Image, x, y, width, height int) color.RGBA {
@@ -1369,27 +1302,8 @@ func (g *OpenAIGateway) forwardImagesViaResponsesTool(ctx context.Context, req *
 		}, fmt.Errorf("%s", reason)
 	}
 	if isEdit {
-		var err error
-		wsResult.ImageGenCalls, err = compositeMaskedImageGenCalls(imgReq, wsResult.ImageGenCalls)
-		if err != nil {
-			body := buildImagesErrorBody(http.StatusBadGateway, err.Error())
-			if sseKA != nil {
-				sseKA.Stop()
-				g.logger.Warn("Images OAuth 编辑结果合成失败，已脱敏响应",
-					"path", reqPath, "model", imgReq.Model, "error", err)
-				writeSSEErrorIfStarted(req.Writer, sseKA, sanitizedImageSSEErrorMessage)
-			}
-			return sdk.ForwardOutcome{
-				Kind: sdk.OutcomeUpstreamTransient,
-				Upstream: sdk.UpstreamResponse{
-					StatusCode: http.StatusBadGateway,
-					Headers:    http.Header{"Content-Type": []string{"application/json"}},
-					Body:       body,
-				},
-				Reason:   err.Error(),
-				Duration: elapsed,
-			}, err
-		}
+		// 局部绘图只把 mask / 区域标注交给模型，不再把生成结果按 mask 回拼原图。
+		// 返回值保持为模型自己的整图输出，避免“拼贴感”。
 		stripImageRevisedPrompts(wsResult.ImageGenCalls)
 	}
 

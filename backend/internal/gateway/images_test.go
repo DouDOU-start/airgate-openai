@@ -661,62 +661,6 @@ func TestFillUsageCostWithImageTool_NoToolUsage(t *testing.T) {
 	}
 }
 
-func TestCompositeMaskedImageGenCalls(t *testing.T) {
-	baseBytes := testPNGBytes(2, 1, func(x, y int) color.RGBA {
-		if x == 0 {
-			return color.RGBA{R: 10, G: 20, B: 30, A: 255}
-		}
-		return color.RGBA{R: 40, G: 50, B: 60, A: 255}
-	})
-	maskBytes := testPNGBytes(2, 1, func(x, y int) color.RGBA {
-		if x == 0 {
-			return color.RGBA{A: 0}
-		}
-		return color.RGBA{A: 255}
-	})
-	baseSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "image/png")
-		_, _ = w.Write(baseBytes)
-	}))
-	defer baseSrv.Close()
-	maskSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "image/png")
-		_, _ = w.Write(maskBytes)
-	}))
-	defer maskSrv.Close()
-	generated := testPNGBase64(2, 1, func(x, y int) color.RGBA {
-		if x == 0 {
-			return color.RGBA{R: 200, G: 210, B: 220, A: 255}
-		}
-		return color.RGBA{R: 230, G: 240, B: 250, A: 255}
-	})
-
-	calls, err := compositeMaskedImageGenCalls(&imagesRequest{
-		Images: []string{baseSrv.URL + "/base.png"},
-		Mask:   maskSrv.URL + "/mask.png",
-	}, []ImageGenCall{{Result: generated, RevisedPrompt: "internal prompt"}})
-	if err != nil {
-		t.Fatalf("compositeMaskedImageGenCalls returned err: %v", err)
-	}
-	if len(calls) != 1 {
-		t.Fatalf("calls len = %d, want 1", len(calls))
-	}
-	img, err := decodeBase64Image(calls[0].Result)
-	if err != nil {
-		t.Fatalf("decode composited result: %v", err)
-	}
-	if got := sampleImageRGBA(img, 0, 0, 2, 1); got != (color.RGBA{R: 200, G: 210, B: 220, A: 255}) {
-		t.Errorf("masked pixel = %+v, want generated pixel", got)
-	}
-	if got := sampleImageRGBA(img, 1, 0, 2, 1); got != (color.RGBA{R: 40, G: 50, B: 60, A: 255}) {
-		t.Errorf("unmasked pixel = %+v, want original base pixel", got)
-	}
-	stripImageRevisedPrompts(calls)
-	if calls[0].RevisedPrompt != "" {
-		t.Errorf("RevisedPrompt = %q, want empty", calls[0].RevisedPrompt)
-	}
-}
-
 // TestCollectImageGenCall 抽取 output_item.done 里的 image_generation_call 条目。
 func TestCollectImageGenCall(t *testing.T) {
 	item := map[string]any{
