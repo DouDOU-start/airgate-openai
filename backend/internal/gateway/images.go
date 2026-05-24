@@ -1416,10 +1416,27 @@ func (g *OpenAIGateway) forwardImagesViaResponsesTool(ctx context.Context, req *
 	}
 
 	numImages := len(wsResult.ImageGenCalls)
-	// 计费按 OpenAI Images API 官方口径：prompt tokens + 图像输出 tokens。
-	// 上游 instructions / 工具调用包装产生的额外 chat tokens 由内层吸收（OAuth 订阅账号无逐 token 成本）。
+	// 对外响应仍沿用 Images API 的 usage 口径；
+	// 对内账单则拆成两段：
+	//   1. Responses 主模型的上下文 token；
+	//   2. 生图产出的按张费用。
 	billingModel := imageGenerationBillingModel(wsResult.ToolImageModel, imgReq.Model)
 	usage := newTokenUsage(billingModel, "", promptTokens, 0, 0, 0, handler.firstTokenMs)
+	contextModel := strings.TrimSpace(wsResult.Model)
+	if contextModel == "" {
+		contextModel = imagesOAuthChatModel
+	}
+	addUsageCostForModel(
+		usage,
+		contextModel,
+		"",
+		wsResult.InputTokens,
+		wsResult.OutputTokens,
+		wsResult.CachedInputTokens,
+		wsResult.ReasoningOutputTokens,
+		"responses_context",
+		"上下文",
+	)
 	g.logger.Debug("Images OAuth result",
 		"path", reqPath,
 		"request_model", imgReq.Model,

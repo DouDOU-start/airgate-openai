@@ -471,6 +471,37 @@ func fillUsageCostPerImageBySize(usage *sdk.Usage, numImages int, size string) {
 	addImageCost(usage, usageCostImage, "图片生成", numImages, price, size)
 }
 
+func addUsageCostForModel(
+	usage *sdk.Usage,
+	modelID, serviceTier string,
+	inputTokens, outputTokens, cachedInputTokens, reasoningOutputTokens int,
+	keyPrefix, labelPrefix string,
+) {
+	if usage == nil || modelID == "" {
+		return
+	}
+	source := newTokenUsage(modelID, serviceTier, inputTokens, outputTokens, cachedInputTokens, reasoningOutputTokens, 0)
+	fillUsageCost(source)
+	for _, detail := range source.CostDetails {
+		copied := detail
+		if keyPrefix != "" {
+			copied.Key = keyPrefix + "_" + copied.Key
+		}
+		if labelPrefix != "" {
+			copied.Label = labelPrefix + copied.Label
+		}
+		if copied.Metadata != nil {
+			metadata := make(map[string]string, len(copied.Metadata)+1)
+			for k, v := range copied.Metadata {
+				metadata[k] = v
+			}
+			metadata["source_model"] = modelID
+			copied.Metadata = metadata
+		}
+		setUsageCostDetail(usage, copied)
+	}
+}
+
 // fillUsageCostWithImageTool 先按主 model 定价算 token 成本，再按尺寸分档叠加图像费用。
 func fillUsageCostWithImageTool(usage *sdk.Usage, numImages int, size string) {
 	fillUsageCost(usage)

@@ -627,6 +627,28 @@ func TestFillUsageCostWithImageTool(t *testing.T) {
 	}
 }
 
+func TestAddUsageCostForModel_CombinesResponsesContextAndImageCost(t *testing.T) {
+	usage := newTokenUsage("gpt-image-2", "", 12, 0, 0, 0, 0)
+	addUsageCostForModel(usage, "gpt-5.4", "", 1000, 500, 0, 0, "responses_context", "上下文")
+	fillUsageCostPerImageBySize(usage, 1, "1024x1024")
+
+	if got := usageCostByKey(usage, "responses_context_"+usageCostInput); !almostEqual(got, 0.0025, 1e-9) {
+		t.Errorf("context input cost = %v, want 0.0025", got)
+	}
+	if got := usageCostByKey(usage, "responses_context_"+usageCostOutput); !almostEqual(got, 0.0075, 1e-9) {
+		t.Errorf("context output cost = %v, want 0.0075", got)
+	}
+	if got := usageCostByKey(usage, usageCostImage); !almostEqual(got, 0.10, 1e-9) {
+		t.Errorf("image cost = %v, want 0.10", got)
+	}
+	if !almostEqual(usage.AccountCost, 0.1100, 1e-9) {
+		t.Errorf("AccountCost = %v, want 0.1100", usage.AccountCost)
+	}
+	if usage.Model != "gpt-image-2" {
+		t.Errorf("Usage.Model = %q, want gpt-image-2", usage.Model)
+	}
+}
+
 // TestFillUsageCostWithImageTool_NoToolUsage 退化为 fillUsageCost 行为不变。
 func TestFillUsageCostWithImageTool_NoToolUsage(t *testing.T) {
 	usage := newTokenUsage("gpt-5.4", "", 1000, 500, 0, 0, 0)
