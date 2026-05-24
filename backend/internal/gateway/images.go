@@ -913,14 +913,6 @@ func encodeJPEGWithinLimit(img image.Image, limit int) ([]byte, string, error) {
 	return nil, "", fmt.Errorf("图片过大，请压缩到 %dMB 以内后重试", limit/(1024*1024))
 }
 
-func encodePNGBase64(img image.Image) (string, error) {
-	var buf bytes.Buffer
-	if err := png.Encode(&buf, img); err != nil {
-		return "", err
-	}
-	return base64.StdEncoding.EncodeToString(buf.Bytes()), nil
-}
-
 func stripImageRevisedPrompts(calls []ImageGenCall) {
 	for i := range calls {
 		calls[i].RevisedPrompt = ""
