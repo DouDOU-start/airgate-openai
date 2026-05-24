@@ -574,6 +574,9 @@ func (h *responsesSilentHandler) OnRawEvent(eventType string, data []byte) {
 func buildNonStreamResponses(result WSResult) []byte {
 	if len(result.CompletedEventRaw) > 0 {
 		if respNode := gjson.GetBytes(result.CompletedEventRaw, "response"); respNode.Exists() {
+			if patched := patchResponsesOutput(respNode.Raw, result); len(patched) > 0 {
+				return patched
+			}
 			return []byte(respNode.Raw)
 		}
 	}
@@ -588,6 +591,71 @@ func buildNonStreamResponses(result WSResult) []byte {
 	if result.Model != "" {
 		fallback["model"] = result.Model
 	}
+	if len(result.ImageGenCalls) > 0 {
+		fallback["output"] = synthesizeResponsesImageGenOutput(result)
+	}
 	b, _ := json.Marshal(fallback)
 	return b
+}
+
+func patchResponsesOutput(raw string, result WSResult) []byte {
+	if strings.TrimSpace(raw) == "" || len(result.ImageGenCalls) == 0 {
+		return nil
+	}
+	var response map[string]any
+	if err := json.Unmarshal([]byte(raw), &response); err != nil {
+		return nil
+	}
+	output, _ := response["output"].([]any)
+	if len(output) > 0 {
+		return nil
+	}
+	response["output"] = synthesizeResponsesImageGenOutput(result)
+	b, err := json.Marshal(response)
+	if err != nil {
+		return nil
+	}
+	return b
+}
+
+func synthesizeResponsesImageGenOutput(result WSResult) []map[string]any {
+	if len(result.ImageGenCalls) == 0 {
+		return nil
+	}
+	output := make([]map[string]any, 0, len(result.ImageGenCalls))
+	for _, call := range result.ImageGenCalls {
+		item := map[string]any{
+			"type":   "image_generation_call",
+			"status": firstNonEmptyString(call.Status, "completed"),
+		}
+		if call.ID != "" {
+			item["id"] = call.ID
+		}
+		if call.HasOutputIndex {
+			item["output_index"] = call.OutputIndex
+		}
+		if call.Result != "" {
+			item["result"] = call.Result
+		}
+		if call.Size != "" {
+			item["size"] = call.Size
+		}
+		if call.Quality != "" {
+			item["quality"] = call.Quality
+		}
+		if call.OutputFormat != "" {
+			item["output_format"] = call.OutputFormat
+		}
+		if call.Background != "" {
+			item["background"] = call.Background
+		}
+		if call.RevisedPrompt != "" {
+			item["revised_prompt"] = call.RevisedPrompt
+		}
+		if call.Model != "" {
+			item["model"] = call.Model
+		}
+		output = append(output, item)
+	}
+	return output
 }

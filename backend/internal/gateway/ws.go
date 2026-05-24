@@ -58,7 +58,8 @@ type WSResult struct {
 	ToolImageInputTokens  int
 	ToolImageOutputTokens int
 	// ImageGenCalls 捕获 Responses API 返回的 image_generation_call output items，
-	// 供 REST→tools 翻译路径将 base64 结果打包回 OpenAI Images REST 响应。
+	// 供 REST→tools 翻译路径将 base64 结果打包回 OpenAI Images REST 响应，
+	// 以及补齐 /v1/responses 非流式 response.output。
 	ImageGenCalls           []ImageGenCall
 	ImageGenCallFailures    []ImageGenCallFailure
 	ImageGenCallDiagnostics []string
@@ -69,17 +70,23 @@ type WSResult struct {
 	FailedEventRaw    []byte
 	Duration          time.Duration
 	Err               error
+
+	imageGenCallIndex map[string]int
 }
 
 // ImageGenCall 对应 Responses API 输出项中 type="image_generation_call" 的一条记录。
 type ImageGenCall struct {
-	Result        string // base64 编码的图像
-	Size          string
-	Quality       string
-	OutputFormat  string
-	Background    string
-	RevisedPrompt string
-	Model         string // 上游实际使用的图像模型（如 gpt-image-1.5）
+	ID             string
+	OutputIndex    int
+	HasOutputIndex bool
+	Status         string
+	Result         string // base64 编码的图像
+	Size           string
+	Quality        string
+	OutputFormat   string
+	Background     string
+	RevisedPrompt  string
+	Model          string // 上游实际使用的图像模型（如 gpt-image-1.5）
 }
 
 type ImageGenCallFailure struct {
@@ -296,6 +303,14 @@ func ReceiveWSResponse(ctx context.Context, conn *websocket.Conn, handler WSEven
 				appendToolUseBlock(&result, item)
 				collectImageGenCall(&result, item)
 			}
+
+		case "response.output_item.added":
+			if item, ok := ev["item"].(map[string]any); ok {
+				collectImageGenCallMetadata(&result, item)
+			}
+
+		case "response.image_generation_call.partial_image":
+			collectImageGenCallPartial(&result, ev)
 
 		case "response.completed", "response.done":
 			result.CompletedEventRaw = append([]byte(nil), msg...)
@@ -538,20 +553,154 @@ func collectImageGenCall(result *WSResult, item map[string]any) {
 		return
 	}
 	call := ImageGenCall{
-		Result:        jsonString(item["result"]),
-		Size:          jsonString(item["size"]),
-		Quality:       jsonString(item["quality"]),
-		OutputFormat:  jsonString(item["output_format"]),
-		Background:    jsonString(item["background"]),
-		RevisedPrompt: jsonString(item["revised_prompt"]),
-		Model:         jsonString(item["model"]),
+		ID:             firstNonEmptyString(jsonString(item["id"]), jsonString(item["call_id"])),
+		OutputIndex:    jsonInt(item["output_index"]),
+		HasOutputIndex: hasJSONKey(item, "output_index"),
+		Status:         jsonString(item["status"]),
+		Result:         jsonString(item["result"]),
+		Size:           jsonString(item["size"]),
+		Quality:        jsonString(item["quality"]),
+		OutputFormat:   jsonString(item["output_format"]),
+		Background:     jsonString(item["background"]),
+		RevisedPrompt:  jsonString(item["revised_prompt"]),
+		Model:          jsonString(item["model"]),
 	}
 	if call.Result == "" {
 		result.ImageGenCallFailures = append(result.ImageGenCallFailures, imageGenCallFailureFromItem(item))
 		result.ImageGenCallDiagnostics = append(result.ImageGenCallDiagnostics, summarizeImageGenCallItem(item))
 		return
 	}
+	upsertImageGenCall(result, call)
+}
+
+func collectImageGenCallMetadata(result *WSResult, item map[string]any) {
+	if jsonString(item["type"]) != "image_generation_call" {
+		return
+	}
+	call := ImageGenCall{
+		ID:             firstNonEmptyString(jsonString(item["id"]), jsonString(item["call_id"])),
+		OutputIndex:    jsonInt(item["output_index"]),
+		HasOutputIndex: hasJSONKey(item, "output_index"),
+		Status:         jsonString(item["status"]),
+		Size:           jsonString(item["size"]),
+		Quality:        jsonString(item["quality"]),
+		OutputFormat:   jsonString(item["output_format"]),
+		Background:     jsonString(item["background"]),
+		RevisedPrompt:  jsonString(item["revised_prompt"]),
+		Model:          jsonString(item["model"]),
+	}
+	if call.ID == "" && !call.HasOutputIndex {
+		return
+	}
+	upsertImageGenCall(result, call)
+}
+
+func collectImageGenCallPartial(result *WSResult, ev map[string]any) {
+	if jsonString(ev["type"]) != "response.image_generation_call.partial_image" {
+		return
+	}
+	call := ImageGenCall{
+		ID:             firstNonEmptyString(jsonString(ev["id"]), jsonString(ev["item_id"]), jsonString(ev["call_id"])),
+		OutputIndex:    jsonInt(ev["output_index"]),
+		HasOutputIndex: hasJSONKey(ev, "output_index"),
+		Status:         firstNonEmptyString(jsonString(ev["status"]), "in_progress"),
+		Result:         firstNonEmptyString(jsonString(ev["partial_image"]), jsonString(ev["result"])),
+		Size:           jsonString(ev["size"]),
+		Quality:        jsonString(ev["quality"]),
+		OutputFormat:   jsonString(ev["output_format"]),
+		Background:     jsonString(ev["background"]),
+		RevisedPrompt:  jsonString(ev["revised_prompt"]),
+		Model:          jsonString(ev["model"]),
+	}
+	if call.Result == "" {
+		return
+	}
+	upsertImageGenCall(result, call)
+}
+
+func upsertImageGenCall(result *WSResult, call ImageGenCall) {
+	if result == nil {
+		return
+	}
+	if result.imageGenCallIndex == nil {
+		result.imageGenCallIndex = map[string]int{}
+	}
+	if idx, ok := findImageGenCallIndex(result, call); ok {
+		mergeImageGenCall(&result.ImageGenCalls[idx], call)
+		registerImageGenCallKeys(result, result.ImageGenCalls[idx], idx)
+		return
+	}
 	result.ImageGenCalls = append(result.ImageGenCalls, call)
+	registerImageGenCallKeys(result, result.ImageGenCalls[len(result.ImageGenCalls)-1], len(result.ImageGenCalls)-1)
+}
+
+func findImageGenCallIndex(result *WSResult, call ImageGenCall) (int, bool) {
+	if result == nil {
+		return 0, false
+	}
+	for _, key := range imageGenCallKeys(call) {
+		if idx, ok := result.imageGenCallIndex[key]; ok {
+			return idx, true
+		}
+	}
+	return 0, false
+}
+
+func registerImageGenCallKeys(result *WSResult, call ImageGenCall, index int) {
+	for _, key := range imageGenCallKeys(call) {
+		result.imageGenCallIndex[key] = index
+	}
+}
+
+func imageGenCallKeys(call ImageGenCall) []string {
+	keys := make([]string, 0, 3)
+	if call.ID != "" {
+		keys = append(keys, "id:"+call.ID)
+	}
+	if call.HasOutputIndex {
+		keys = append(keys, fmt.Sprintf("output_index:%d", call.OutputIndex))
+	}
+	if call.ID != "" && call.HasOutputIndex {
+		keys = append(keys, fmt.Sprintf("id:%s|output_index:%d", call.ID, call.OutputIndex))
+	}
+	return keys
+}
+
+func mergeImageGenCall(dst *ImageGenCall, src ImageGenCall) {
+	if dst == nil {
+		return
+	}
+	if src.ID != "" {
+		dst.ID = src.ID
+	}
+	if src.HasOutputIndex {
+		dst.OutputIndex = src.OutputIndex
+		dst.HasOutputIndex = true
+	}
+	if src.Status != "" {
+		dst.Status = src.Status
+	}
+	if src.Result != "" {
+		dst.Result = src.Result
+	}
+	if src.Size != "" {
+		dst.Size = src.Size
+	}
+	if src.Quality != "" {
+		dst.Quality = src.Quality
+	}
+	if src.OutputFormat != "" {
+		dst.OutputFormat = src.OutputFormat
+	}
+	if src.Background != "" {
+		dst.Background = src.Background
+	}
+	if src.RevisedPrompt != "" {
+		dst.RevisedPrompt = src.RevisedPrompt
+	}
+	if src.Model != "" {
+		dst.Model = src.Model
+	}
 }
 
 func imageGenCallFailureFromItem(item map[string]any) ImageGenCallFailure {
@@ -600,4 +749,39 @@ func nestedJSONString(value any, key string) string {
 		return ""
 	}
 	return jsonString(obj[key])
+}
+
+func firstNonEmptyString(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return value
+		}
+	}
+	return ""
+}
+
+func jsonInt(value any) int {
+	switch v := value.(type) {
+	case float64:
+		return int(v)
+	case float32:
+		return int(v)
+	case int:
+		return v
+	case int64:
+		return int(v)
+	case json.Number:
+		if n, err := v.Int64(); err == nil {
+			return int(n)
+		}
+	}
+	return 0
+}
+
+func hasJSONKey(m map[string]any, key string) bool {
+	if m == nil {
+		return false
+	}
+	_, ok := m[key]
+	return ok
 }

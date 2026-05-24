@@ -666,6 +666,7 @@ func TestCollectImageGenCall(t *testing.T) {
 	item := map[string]any{
 		"type":           "image_generation_call",
 		"status":         "completed",
+		"id":             "ig_123",
 		"result":         "iVBORw0KGgoAAA",
 		"size":           "1024x1024",
 		"quality":        "high",
@@ -708,6 +709,43 @@ func TestCollectImageGenCall(t *testing.T) {
 	}
 	if !strings.Contains(ws.ImageGenCallDiagnostics[0], "status=failed") || !strings.Contains(ws.ImageGenCallDiagnostics[0], "safety system rejected the prompt") {
 		t.Errorf("diagnostic missing upstream cause: %s", ws.ImageGenCallDiagnostics[0])
+	}
+}
+
+func TestCollectImageGenCallPartialImageMergesMetadata(t *testing.T) {
+	var ws WSResult
+	collectImageGenCallMetadata(&ws, map[string]any{
+		"type":         "image_generation_call",
+		"id":           "ig_123",
+		"output_index": 0,
+		"status":       "in_progress",
+		"size":         "1024x1024",
+		"model":        "gpt-image-1.5",
+	})
+	collectImageGenCallPartial(&ws, map[string]any{
+		"type":          "response.image_generation_call.partial_image",
+		"output_index":  0,
+		"partial_image": "iVBORw0KGgoAAA",
+	})
+
+	if len(ws.ImageGenCalls) != 1 {
+		t.Fatalf("ImageGenCalls len = %d, want 1", len(ws.ImageGenCalls))
+	}
+	got := ws.ImageGenCalls[0]
+	if got.ID != "ig_123" {
+		t.Fatalf("ID = %q, want ig_123", got.ID)
+	}
+	if !got.HasOutputIndex || got.OutputIndex != 0 {
+		t.Fatalf("OutputIndex = %d / %v, want 0 / true", got.OutputIndex, got.HasOutputIndex)
+	}
+	if got.Result != "iVBORw0KGgoAAA" {
+		t.Fatalf("Result = %q, want partial image", got.Result)
+	}
+	if got.Size != "1024x1024" {
+		t.Fatalf("Size = %q, want 1024x1024", got.Size)
+	}
+	if got.Model != "gpt-image-1.5" {
+		t.Fatalf("Model = %q, want gpt-image-1.5", got.Model)
 	}
 }
 

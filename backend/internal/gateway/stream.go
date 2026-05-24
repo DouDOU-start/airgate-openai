@@ -478,6 +478,14 @@ func ParseSSEStream(reader io.Reader, handler WSEventHandler) WSResult {
 				collectImageGenCall(&result, item)
 			}
 
+		case "response.output_item.added":
+			if item, ok := ev["item"].(map[string]any); ok {
+				collectImageGenCallMetadata(&result, item)
+			}
+
+		case "response.image_generation_call.partial_image":
+			collectImageGenCallPartial(&result, ev)
+
 		case "response.completed", "response.done":
 			result.CompletedEventRaw = append([]byte(nil), []byte(data)...)
 			if resp, ok := ev["response"].(map[string]any); ok {

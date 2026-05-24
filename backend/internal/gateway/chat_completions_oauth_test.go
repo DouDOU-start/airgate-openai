@@ -328,6 +328,45 @@ func TestBuildNonStreamResponses_CompletedEvent(t *testing.T) {
 	}
 }
 
+func TestBuildNonStreamResponses_PatchesEmptyOutputFromImageCalls(t *testing.T) {
+	completedEvent := []byte(`{"type":"response.completed","response":{"id":"resp_img","object":"response","status":"completed","output":[],"usage":{"input_tokens":12,"output_tokens":34,"total_tokens":46}}}`)
+	result := WSResult{
+		CompletedEventRaw: completedEvent,
+		ImageGenCalls: []ImageGenCall{{
+			ID:           "ig_1",
+			Status:       "completed",
+			Result:       "iVBORw0KGgoAAA",
+			Size:         "1024x1024",
+			OutputFormat: "png",
+			Model:        "gpt-image-1.5",
+		}},
+	}
+
+	body := buildNonStreamResponses(result)
+	var got map[string]any
+	if err := json.Unmarshal(body, &got); err != nil {
+		t.Fatalf("body not valid JSON: %v", err)
+	}
+
+	output, ok := got["output"].([]any)
+	if !ok {
+		t.Fatalf("output missing or wrong type: %#v", got["output"])
+	}
+	if len(output) != 1 {
+		t.Fatalf("output len = %d, want 1", len(output))
+	}
+	item := output[0].(map[string]any)
+	if item["type"] != "image_generation_call" {
+		t.Fatalf("output[0].type = %v, want image_generation_call", item["type"])
+	}
+	if item["result"] != "iVBORw0KGgoAAA" {
+		t.Fatalf("output[0].result = %v, want image data", item["result"])
+	}
+	if item["status"] != "completed" {
+		t.Fatalf("output[0].status = %v, want completed", item["status"])
+	}
+}
+
 // 上游没给 response.completed 时用兜底占位
 func TestBuildNonStreamResponses_Fallback(t *testing.T) {
 	result := WSResult{ResponseID: "resp_xyz", Model: "gpt-5.4"}
