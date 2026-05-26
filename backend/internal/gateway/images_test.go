@@ -476,22 +476,22 @@ func TestHandleImagesResponse_GPTImage2AddsCalculatedOutputTokens(t *testing.T) 
 
 	outcome, err := handleImagesResponse(resp, nil, nil, time.Now(), "gpt-image-2", imagesResponseOptions{
 		BillingSize:    "3840x2160",
-		RequestQuality: "high",
+		RequestQuality: "low",
 	})
 	if err != nil {
 		t.Fatalf("handleImagesResponse returned err: %v", err)
 	}
-	if got := int(gjson.GetBytes(outcome.Upstream.Body, "usage.output_tokens").Int()); got != 13342 {
-		t.Fatalf("response usage.output_tokens = %d, want 13342", got)
+	if got := int(gjson.GetBytes(outcome.Upstream.Body, "usage.output_tokens").Int()); got != 371 {
+		t.Fatalf("response usage.output_tokens = %d, want 371", got)
 	}
-	if got := int(gjson.GetBytes(outcome.Upstream.Body, "usage.total_tokens").Int()); got != 13342 {
-		t.Fatalf("response usage.total_tokens = %d, want 13342", got)
+	if got := int(gjson.GetBytes(outcome.Upstream.Body, "usage.total_tokens").Int()); got != 371 {
+		t.Fatalf("response usage.total_tokens = %d, want 371", got)
 	}
-	if got := usageMetricInt(outcome.Usage, usageMetricOutputTokens); got != 13342 {
-		t.Fatalf("Outcome output_tokens = %d, want 13342", got)
+	if got := usageMetricInt(outcome.Usage, usageMetricOutputTokens); got != 371 {
+		t.Fatalf("Outcome output_tokens = %d, want 371", got)
 	}
-	if got := gjson.GetBytes(outcome.Upstream.Body, "quality").String(); got != "high" {
-		t.Fatalf("response quality = %q, want high", got)
+	if got := gjson.GetBytes(outcome.Upstream.Body, "quality").String(); got != "low" {
+		t.Fatalf("response quality = %q, want low", got)
 	}
 	if got := gjson.GetBytes(outcome.Upstream.Body, "size").String(); got != "3840x2160" {
 		t.Fatalf("response size = %q, want 3840x2160", got)

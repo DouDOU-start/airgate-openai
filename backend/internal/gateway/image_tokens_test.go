@@ -63,6 +63,26 @@ func TestGPTImage2TokenCalculatorRejectsUnparseableInput(t *testing.T) {
 	}
 }
 
+func TestGPTImage2TokenCalculatorDefaultQualityUsesHigh(t *testing.T) {
+	calc := NewGPTImage2TokenCalculator()
+
+	got, err := calc.CalculateDefaultQuality("3840x2160")
+	if err != nil {
+		t.Fatalf("CalculateDefaultQuality returned err: %v", err)
+	}
+	if got != 13342 {
+		t.Fatalf("CalculateDefaultQuality = %d, want high-quality 13342", got)
+	}
+
+	got, err = calc.CalculateDimensionsDefaultQuality(1024, 1024)
+	if err != nil {
+		t.Fatalf("CalculateDimensionsDefaultQuality returned err: %v", err)
+	}
+	if got != 7024 {
+		t.Fatalf("CalculateDimensionsDefaultQuality = %d, want high-quality 7024", got)
+	}
+}
+
 func TestGPTImage2TokenCalculatorDoesNotValidateSizeRules(t *testing.T) {
 	got, err := NewGPTImage2TokenCalculator().Calculate("512x512", "low")
 	if err != nil {

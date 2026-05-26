@@ -8,6 +8,7 @@ import (
 const (
 	gptImage2TokenFormulaBias  = int64(2_000_000)
 	gptImage2TokenFormulaScale = int64(4_000_000)
+	gptImage2DefaultQuality    = "high"
 )
 
 // GPTImage2TokenCalculator mirrors OpenAI's GPT Image 2 token calculator:
@@ -28,9 +29,19 @@ func (GPTImage2TokenCalculator) Calculate(size, quality string) (int, error) {
 	return calculateGPTImage2Tokens(width, height, quality)
 }
 
+// CalculateDefaultQuality parses size and calculates tokens with the default high quality.
+func (c GPTImage2TokenCalculator) CalculateDefaultQuality(size string) (int, error) {
+	return c.Calculate(size, gptImage2DefaultQuality)
+}
+
 // CalculateDimensions returns GPT Image 2 image tokens for one image.
 func (GPTImage2TokenCalculator) CalculateDimensions(width, height int, quality string) (int, error) {
 	return calculateGPTImage2Tokens(width, height, quality)
+}
+
+// CalculateDimensionsDefaultQuality calculates tokens with the default high quality.
+func (c GPTImage2TokenCalculator) CalculateDimensionsDefaultQuality(width, height int) (int, error) {
+	return c.CalculateDimensions(width, height, gptImage2DefaultQuality)
 }
 
 func calculateGPTImage2Tokens(width, height int, quality string) (int, error) {
