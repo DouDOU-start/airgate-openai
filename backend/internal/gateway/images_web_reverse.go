@@ -167,6 +167,11 @@ func (g *OpenAIGateway) forwardImagesViaWebReverse(ctx context.Context, req *sdk
 		"n", imgReq.N,
 	)
 
+	inputEstimate := imagesInputTokenEstimate{TextTokens: estimatePromptTokens(imgReq.Prompt)}
+	if isEdit {
+		inputEstimate.ImageTokens = estimateGPTImage2InputImageTokens(imgReq.Images, imgReq.Size)
+	}
+
 	var imageInputs []imgen.ImageInput
 	if isEdit && len(imgReq.Images) > 0 {
 		imageInputs, err = decodeImageRefs(imgReq.Images)
@@ -224,14 +229,14 @@ func (g *OpenAIGateway) forwardImagesViaWebReverse(ctx context.Context, req *sdk
 		"num_images", numImages,
 	)
 
-	respBody := buildWebReverseImagesResponse(imgRes, 0, 0)
+	respBody := buildWebReverseImagesResponse(imgRes, inputEstimate.TextTokens, inputEstimate.ImageTokens, 0)
 	if sseKA != nil {
 		sseKA.Stop()
 		writeImagesRESTSSE(req.Writer, respBody)
 	}
 
 	elapsed := time.Since(start)
-	usage := newTokenUsage(imagesWebReverseModel, "", 0, 0, 0, 0, elapsed.Milliseconds())
+	usage := newTokenUsage(imagesWebReverseModel, "", inputEstimate.Total(), 0, 0, 0, elapsed.Milliseconds())
 	// Web 逆向上游不返 size 字段，直接解码生成的 PNG header 拿真实宽高（O(1)）。
 	// 解码失败 fallback 到请求 size（auto/空时 imagePriceForSize 兜底 1K）。
 	billingSize := imgReq.Size
@@ -264,7 +269,7 @@ func (g *OpenAIGateway) forwardImagesViaWebReverse(ctx context.Context, req *sdk
 //   - b64_json：PNG 二进制的 base64
 //   - revised_prompt：网页端没有 revised_prompt 字段暴露给下游，这里留空
 //   - model："gpt-image-2"
-func buildWebReverseImagesResponse(res *imgen.Result, promptTokens, outputTokens int) []byte {
+func buildWebReverseImagesResponse(res *imgen.Result, textInputTokens, imageInputTokens, outputTokens int) []byte {
 	data := make([]map[string]any, 0, len(res.Images))
 	for _, img := range res.Images {
 		data = append(data, map[string]any{
@@ -278,14 +283,15 @@ func buildWebReverseImagesResponse(res *imgen.Result, promptTokens, outputTokens
 		// root 级 model 供 handleImagesResponse 或 Core 做费用查价
 		"model": imagesWebReverseModel,
 	}
-	if promptTokens+outputTokens > 0 {
+	inputTokens := textInputTokens + imageInputTokens
+	if inputTokens+outputTokens > 0 {
 		payload["usage"] = map[string]any{
-			"input_tokens":  promptTokens,
+			"input_tokens":  inputTokens,
 			"output_tokens": outputTokens,
-			"total_tokens":  promptTokens + outputTokens,
+			"total_tokens":  inputTokens + outputTokens,
 			"input_tokens_details": map[string]any{
-				"text_tokens":  promptTokens,
-				"image_tokens": 0,
+				"text_tokens":  textInputTokens,
+				"image_tokens": imageInputTokens,
 			},
 		}
 	}

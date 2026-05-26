@@ -113,6 +113,72 @@ func calculateGPTImage2OutputTokensForImages(modelName, size, quality string, nu
 	return tokens * numImages
 }
 
+func estimateGPTImage2InputImageTokens(refs []string, fallbackSize string) int {
+	if len(refs) == 0 {
+		return 0
+	}
+	calc := NewGPTImage2TokenCalculator()
+	fallbackTokens := -1
+	total := 0
+	for _, ref := range refs {
+		if width, height, ok := imageDimensionsFromRef(ref); ok {
+			if tokens, err := calc.CalculateDimensionsDefaultQuality(width, height); err == nil {
+				total += tokens
+				continue
+			}
+		}
+		if fallbackTokens < 0 {
+			fallbackTokens = gptImage2InputImageFallbackTokens(calc, fallbackSize)
+		}
+		total += fallbackTokens
+	}
+	return total
+}
+
+func imageDimensionsFromRef(ref string) (int, int, bool) {
+	if !strings.HasPrefix(ref, "data:") {
+		return 0, 0, false
+	}
+	return imageDimensionsFromDataURL(ref)
+}
+
+func imageDimensionsFromDataURL(ref string) (int, int, bool) {
+	comma := strings.IndexByte(ref, ',')
+	if comma < 0 || !strings.HasPrefix(strings.ToLower(ref[:comma]), "data:image/") {
+		return 0, 0, false
+	}
+	payload := ref[comma+1:]
+	if width, height, ok := imageDimensionsFromBase64Reader(base64.StdEncoding, payload); ok {
+		return width, height, true
+	}
+	return imageDimensionsFromBase64Reader(base64.RawStdEncoding, payload)
+}
+
+func imageDimensionsFromBase64Reader(enc *base64.Encoding, payload string) (int, int, bool) {
+	cfg, _, err := image.DecodeConfig(base64.NewDecoder(enc, strings.NewReader(payload)))
+	if err != nil || cfg.Width <= 0 || cfg.Height <= 0 {
+		return 0, 0, false
+	}
+	return cfg.Width, cfg.Height, true
+}
+
+func imageDimensionsFromBytes(data []byte) (int, int, bool) {
+	cfg, _, err := image.DecodeConfig(bytes.NewReader(data))
+	if err != nil || cfg.Width <= 0 || cfg.Height <= 0 {
+		return 0, 0, false
+	}
+	return cfg.Width, cfg.Height, true
+}
+
+func gptImage2InputImageFallbackTokens(calc GPTImage2TokenCalculator, fallbackSize string) int {
+	size := normalizeImagesResponseSize(fallbackSize)
+	if size == "" {
+		size = "1024x1024"
+	}
+	tokens, _ := calc.CalculateDefaultQuality(size)
+	return tokens
+}
+
 // estimateImageGenOutputTokens 汇总所有 image_generation_call 的估算 token 数。
 func estimateImageGenOutputTokens(calls []ImageGenCall) int {
 	total := 0
@@ -393,20 +459,106 @@ func imagesResponseOptionsFromRequestBody(body []byte, contentType string, isEdi
 		return imagesResponseOptions{}
 	}
 	if isEdit && isMultipartContentType(contentType) {
-		fields := extractMultipartScalarFields(body, contentType, "size", "quality", "output_format")
-		return imagesResponseOptions{
-			BillingSize:         strings.TrimSpace(fields["size"]),
-			RequestSize:         strings.TrimSpace(fields["size"]),
-			RequestQuality:      normalizeImageQualityDefaultMedium(fields["quality"]),
-			RequestOutputFormat: strings.TrimSpace(fields["output_format"]),
-		}
+		return imagesResponseOptionsFromMultipartBody(body, contentType)
 	}
 	size := strings.TrimSpace(gjson.GetBytes(body, "size").String())
-	return imagesResponseOptions{
+	opts := imagesResponseOptions{
 		BillingSize:         size,
 		RequestSize:         size,
 		RequestQuality:      normalizeImageQualityDefaultMedium(gjson.GetBytes(body, "quality").String()),
 		RequestOutputFormat: strings.TrimSpace(gjson.GetBytes(body, "output_format").String()),
+	}
+	if req, err := parseImagesRequest(body, contentType, isEdit); err == nil {
+		applyImagesRequestOptions(&opts, req)
+	} else if prompt := strings.TrimSpace(gjson.GetBytes(body, "prompt").String()); prompt != "" {
+		opts.RequestTextInputTokens = estimatePromptTokens(prompt)
+	}
+	return opts
+}
+
+func imagesResponseOptionsFromMultipartBody(body []byte, contentType string) imagesResponseOptions {
+	opts := imagesResponseOptions{}
+	_, params, err := mime.ParseMediaType(contentType)
+	if err != nil || params["boundary"] == "" {
+		return opts
+	}
+
+	calc := NewGPTImage2TokenCalculator()
+	unknownImageRefs := 0
+	fields := map[string]string{}
+	marker := []byte("--" + params["boundary"])
+	pos := 0
+	for {
+		startRel := bytes.Index(body[pos:], marker)
+		if startRel < 0 {
+			break
+		}
+		partStart := pos + startRel + len(marker)
+		if partStart+2 <= len(body) && body[partStart] == '-' && body[partStart+1] == '-' {
+			break
+		}
+		if partStart+2 <= len(body) && body[partStart] == '\r' && body[partStart+1] == '\n' {
+			partStart += 2
+		} else if partStart < len(body) && body[partStart] == '\n' {
+			partStart++
+		}
+
+		headerEndRel, sepLen := multipartHeaderEnd(body[partStart:])
+		if headerEndRel < 0 {
+			break
+		}
+		contentStart := partStart + headerEndRel + sepLen
+		nextRel := bytes.Index(body[contentStart:], marker)
+		if nextRel < 0 {
+			break
+		}
+		contentEnd := contentStart + nextRel
+		headers := body[partStart : partStart+headerEndRel]
+		content := body[contentStart:contentEnd]
+		name := multipartPartName(headers)
+		switch name {
+		case "prompt", "size", "quality", "output_format":
+			fields[name] = strings.TrimSpace(string(content))
+		case "image", "image[]":
+			contentType := strings.ToLower(strings.TrimSpace(strings.Split(multipartPartContentType(headers), ";")[0]))
+			switch {
+			case strings.HasPrefix(contentType, "image/"):
+				if width, height, ok := imageDimensionsFromBytes(content); ok {
+					if tokens, err := calc.CalculateDimensionsDefaultQuality(width, height); err == nil {
+						opts.RequestImageInputTokens += tokens
+					}
+				}
+			case multipartPartFilename(headers) == "" && len(bytes.TrimSpace(content)) > 0:
+				unknownImageRefs++
+			}
+		}
+		pos = contentEnd
+	}
+
+	size := strings.TrimSpace(fields["size"])
+	opts.BillingSize = size
+	opts.RequestSize = size
+	opts.RequestQuality = normalizeImageQualityDefaultMedium(fields["quality"])
+	opts.RequestOutputFormat = strings.TrimSpace(fields["output_format"])
+	opts.RequestTextInputTokens = estimatePromptTokens(fields["prompt"])
+	if unknownImageRefs > 0 {
+		opts.RequestImageInputTokens += unknownImageRefs * gptImage2InputImageFallbackTokens(calc, size)
+	}
+	return opts
+}
+
+func applyImagesRequestOptions(opts *imagesResponseOptions, req *imagesRequest) {
+	if opts == nil || req == nil {
+		return
+	}
+	size := strings.TrimSpace(req.Size)
+	opts.BillingSize = size
+	opts.RequestSize = size
+	opts.RequestQuality = normalizeImageQualityDefaultMedium(req.Quality)
+	opts.RequestOutputFormat = strings.TrimSpace(req.OutputFormat)
+	opts.RequestTextInputTokens = estimatePromptTokens(req.Prompt)
+	if req.IsEdit {
+		opts.RequestImageInputTokens = estimateGPTImage2InputImageTokens(req.Images, req.Size)
 	}
 }
 
@@ -468,6 +620,14 @@ func multipartHeaderEnd(body []byte) (int, int) {
 }
 
 func multipartPartName(headers []byte) string {
+	return multipartPartDispositionParam(headers, "name")
+}
+
+func multipartPartFilename(headers []byte) string {
+	return multipartPartDispositionParam(headers, "filename")
+}
+
+func multipartPartDispositionParam(headers []byte, paramName string) string {
 	for _, line := range strings.Split(string(headers), "\n") {
 		line = strings.TrimRight(line, "\r")
 		colon := strings.IndexByte(line, ':')
@@ -478,7 +638,19 @@ func multipartPartName(headers []byte) string {
 		if err != nil {
 			return ""
 		}
-		return strings.TrimSpace(params["name"])
+		return strings.TrimSpace(params[paramName])
+	}
+	return ""
+}
+
+func multipartPartContentType(headers []byte) string {
+	for _, line := range strings.Split(string(headers), "\n") {
+		line = strings.TrimRight(line, "\r")
+		colon := strings.IndexByte(line, ':')
+		if colon < 0 || !strings.EqualFold(strings.TrimSpace(line[:colon]), "Content-Type") {
+			continue
+		}
+		return strings.TrimSpace(line[colon+1:])
 	}
 	return ""
 }
@@ -1101,7 +1273,7 @@ func classifyImageGenCallFailures(failures []ImageGenCallFailure, fallbackDetail
 
 // buildImagesToolCreateMsg 把 Images REST 请求体翻译成 Responses API 的
 // response.create 消息（tools 数组带一个 image_generation 项）。
-// 返回：上游消息 bytes；n（当前固定 1）；prompt 估算的 token 数（用于计费）。
+// 返回：上游消息 bytes；n（当前固定 1）；input 估算的 token 数（用于计费）。
 //
 // contentType 仅在 isEdit=true 时需要（可能是 multipart/form-data）。
 func buildImagesToolCreateMsg(
@@ -1110,27 +1282,40 @@ func buildImagesToolCreateMsg(
 	isEdit bool,
 	session openAISessionResolution,
 ) ([]byte, int, int, error) {
-	req, err := parseImagesRequest(body, contentType, isEdit)
+	msg, n, estimate, err := buildImagesToolCreateMsgWithUsage(body, contentType, isEdit, session)
 	if err != nil {
 		return nil, 0, 0, err
+	}
+	return msg, n, estimate.Total(), nil
+}
+
+func buildImagesToolCreateMsgWithUsage(
+	body []byte,
+	contentType string,
+	isEdit bool,
+	session openAISessionResolution,
+) ([]byte, int, imagesInputTokenEstimate, error) {
+	req, err := parseImagesRequest(body, contentType, isEdit)
+	if err != nil {
+		return nil, 0, imagesInputTokenEstimate{}, err
 	}
 	req.Quality = normalizeImageQualityDefaultMedium(req.Quality)
 	// Responses API 的 image_generation tool 每次仅生成 1 张；n>1 在 REST 侧的语义
 	// 需要多轮工具调用才能模拟，暂不支持 —— V1 限定 n=1。
 	if req.N > 1 {
-		return nil, 0, 0, fmt.Errorf("OAuth 模式下 n 只能为 1（REST→tools 翻译路径暂不支持多图）")
+		return nil, 0, imagesInputTokenEstimate{}, fmt.Errorf("OAuth 模式下 n 只能为 1（REST→tools 翻译路径暂不支持多图）")
 	}
 	if err := shrinkResponsesInputImages(req); err != nil {
-		return nil, 0, 0, err
+		return nil, 0, imagesInputTokenEstimate{}, err
 	}
 	regionAnnotation, err := buildEditRegionAnnotation(req)
 	if err != nil {
-		return nil, 0, 0, err
+		return nil, 0, imagesInputTokenEstimate{}, err
 	}
 	if regionAnnotation != "" {
 		regionAnnotation, err = shrinkResponsesInputImageRef(regionAnnotation)
 		if err != nil {
-			return nil, 0, 0, err
+			return nil, 0, imagesInputTokenEstimate{}, err
 		}
 	}
 	outputFormat := normalizedImageOutputFormat(req.OutputFormat)
@@ -1196,27 +1381,26 @@ func buildImagesToolCreateMsg(
 	}
 	msg, err := wrapResponseCreate(payload, imagesOAuthChatModel, session)
 	if err != nil {
-		return nil, 0, 0, err
+		return nil, 0, imagesInputTokenEstimate{}, err
 	}
-	// input token 估算：文本 prompt + 每张参考图按 size 低质档估算（~272 tokens/1024²），
-	// 与 image_generation tool 输入图像的 token 级别一致。
-	imageInputCount := len(req.Images)
+	inputImageRefs := append([]string{}, req.Images...)
 	if regionAnnotation != "" {
-		imageInputCount++
+		inputImageRefs = append(inputImageRefs, regionAnnotation)
 	}
-	inputTokens := estimatePromptTokens(req.Prompt) + estimateImageInputTokens(imageInputCount, req.Size)
-	return msg, req.N, inputTokens, nil
+	estimate := imagesInputTokenEstimate{
+		TextTokens:  estimatePromptTokens(req.Prompt),
+		ImageTokens: estimateGPTImage2InputImageTokens(inputImageRefs, req.Size),
+	}
+	return msg, req.N, estimate, nil
 }
 
-// estimateImageInputTokens 估算参考图输入的 token 总数。
-// 策略：套用 OpenAI 的 size→low-quality output token 表，近似代表"单张参考图"的 token 体量。
-// OpenAI 对图像输入另有单价（gpt-image-1.5 约 $10/1M），但当前注册表里只记了文本 $5/1M，
-// 精度损失不到 2×，对总价（输出图像 token 主导）影响 < 5%，V1 可接受。
-func estimateImageInputTokens(count int, size string) int {
-	if count <= 0 {
-		return 0
-	}
-	return count * lookupImageGenOutputTokens(size, "low")
+type imagesInputTokenEstimate struct {
+	TextTokens  int
+	ImageTokens int
+}
+
+func (e imagesInputTokenEstimate) Total() int {
+	return e.TextTokens + e.ImageTokens
 }
 
 // forwardImagesViaResponsesTool 把 OpenAI Images REST 请求翻译成 Responses API
@@ -1259,7 +1443,7 @@ func (g *OpenAIGateway) forwardImagesViaResponsesTool(ctx context.Context, req *
 		"size", imgReq.Size,
 		"n", imgReq.N,
 	)
-	createMsg, n, promptTokens, err := buildImagesToolCreateMsg(req.Body, contentType, isEdit, session)
+	createMsg, n, inputEstimate, err := buildImagesToolCreateMsgWithUsage(req.Body, contentType, isEdit, session)
 	if err != nil {
 		body := jsonError(err.Error())
 		return sdk.ForwardOutcome{
@@ -1428,12 +1612,13 @@ func (g *OpenAIGateway) forwardImagesViaResponsesTool(ctx context.Context, req *
 	}
 
 	numImages := len(wsResult.ImageGenCalls)
+	inputTokens := inputEstimate.Total()
 	// 对外响应仍沿用 Images API 的 usage 口径；
 	// 对内账单则拆成两段：
 	//   1. Responses 主模型的上下文 token；
 	//   2. 生图产出的按张费用。
 	billingModel := imageGenerationBillingModel(wsResult.ToolImageModel, imgReq.Model)
-	usage := newTokenUsage(billingModel, "", promptTokens, 0, 0, 0, handler.firstTokenMs)
+	usage := newTokenUsage(billingModel, "", inputTokens, 0, 0, 0, handler.firstTokenMs)
 	contextModel := strings.TrimSpace(wsResult.Model)
 	if contextModel == "" {
 		contextModel = imagesOAuthChatModel
@@ -1476,11 +1661,12 @@ func (g *OpenAIGateway) forwardImagesViaResponsesTool(ctx context.Context, req *
 		}
 	}
 	imageOutputTokens := calculateGPTImage2OutputTokensForImages(billingModel, billingSize, imgReq.Quality, numImages)
-	respBody := buildImagesRESTResponse(wsResult, promptTokens, imageOutputTokens, billingModel, imagesResponseOptions{
-		BillingSize:         billingSize,
-		RequestSize:         imgReq.Size,
-		RequestQuality:      imgReq.Quality,
-		RequestOutputFormat: imgReq.OutputFormat,
+	respBody := buildImagesRESTResponse(wsResult, inputEstimate.TextTokens, imageOutputTokens, billingModel, imagesResponseOptions{
+		BillingSize:             billingSize,
+		RequestSize:             imgReq.Size,
+		RequestQuality:          imgReq.Quality,
+		RequestOutputFormat:     imgReq.OutputFormat,
+		RequestImageInputTokens: inputEstimate.ImageTokens,
 	})
 	outcome := sdk.ForwardOutcome{
 		Kind:     sdk.OutcomeSuccess,
@@ -1498,18 +1684,18 @@ func (g *OpenAIGateway) forwardImagesViaResponsesTool(ctx context.Context, req *
 	}
 
 	// 图片尺寸作为通用 UsageAttribute 入库，后台费用明细可用它解释 1K/2K/4K 分档。
-	setUsageTokens(usage, promptTokens, imageOutputTokens, 0, 0)
+	setUsageTokens(usage, inputTokens, imageOutputTokens, 0, 0)
 	fillUsageCostPerImageBySize(usage, numImages, billingSize)
 	return outcome, nil
 }
 
 // buildImagesRESTResponse 按 OpenAI Images API 官方契约打包响应。
-// 计费口径：prompt tokens + image output tokens，按实际响应的图像模型记录。
+// 计费口径：text input tokens + image input tokens + image output tokens，按实际响应的图像模型记录。
 // instructions / 工具调用包装产生的额外 chat tokens 由内层吸收，不出现在对外 usage。
 // 这样：
 //  1. 客户端拿到的 usage 数字语义与 OpenAI 原生 Images API 完全一致
 //  2. 外层再套一层 AirGate 时，两级按同一口径独立计算，金额零偏差
-func buildImagesRESTResponse(wsResult WSResult, promptTokens, imageOutputTokens int, responseModel string, options ...imagesResponseOptions) []byte {
+func buildImagesRESTResponse(wsResult WSResult, textInputTokens, imageOutputTokens int, responseModel string, options ...imagesResponseOptions) []byte {
 	if responseModel == "" {
 		responseModel = imageToolCostModel
 	}
@@ -1559,14 +1745,16 @@ func buildImagesRESTResponse(wsResult WSResult, promptTokens, imageOutputTokens 
 	if background != "" {
 		payload["background"] = background
 	}
-	if promptTokens+imageOutputTokens > 0 {
+	imageInputTokens := opts.RequestImageInputTokens
+	inputTokens := textInputTokens + imageInputTokens
+	if inputTokens+imageOutputTokens > 0 {
 		payload["usage"] = map[string]any{
-			"input_tokens":  promptTokens,
+			"input_tokens":  inputTokens,
 			"output_tokens": imageOutputTokens,
-			"total_tokens":  promptTokens + imageOutputTokens,
+			"total_tokens":  inputTokens + imageOutputTokens,
 			"input_tokens_details": map[string]any{
-				"text_tokens":  promptTokens,
-				"image_tokens": 0,
+				"text_tokens":  textInputTokens,
+				"image_tokens": imageInputTokens,
 			},
 		}
 	}
@@ -1711,20 +1899,49 @@ func applyImagesResponseMetadata(body []byte, opts imagesResponseOptions, summar
 	return updated
 }
 
-func applyImagesResponseOutputTokens(body []byte, outputTokens int) []byte {
-	if len(body) == 0 || outputTokens <= 0 {
+func applyImagesResponseUsage(body []byte, opts imagesResponseOptions, outputTokens int) []byte {
+	if len(body) == 0 {
 		return body
 	}
 	updated := body
-	inputTokens := int(gjson.GetBytes(updated, "usage.input_tokens").Int())
-	if !gjson.GetBytes(updated, "usage.input_tokens").Exists() {
-		var err error
-		updated, err = sjson.SetBytes(updated, "usage.input_tokens", inputTokens)
-		if err != nil {
-			return body
+	usageNode := gjson.GetBytes(updated, "usage")
+	existingInputNode := usageNode.Get("input_tokens")
+	existingOutputNode := usageNode.Get("output_tokens")
+	existingTextNode := usageNode.Get("input_tokens_details.text_tokens")
+	existingImageNode := usageNode.Get("input_tokens_details.image_tokens")
+
+	textTokens := 0
+	switch {
+	case existingTextNode.Exists():
+		textTokens = int(existingTextNode.Int())
+	case existingInputNode.Exists():
+		textTokens = int(existingInputNode.Int())
+		if existingImageNode.Exists() {
+			imageTokens := int(existingImageNode.Int())
+			if imageTokens > 0 && textTokens >= imageTokens {
+				textTokens -= imageTokens
+			}
 		}
+	case opts.RequestTextInputTokens > 0:
+		textTokens = opts.RequestTextInputTokens
+	}
+
+	imageInputTokens := int(existingImageNode.Int())
+	if opts.RequestImageInputTokens > 0 {
+		imageInputTokens = opts.RequestImageInputTokens
+	}
+	if outputTokens <= 0 && existingOutputNode.Exists() {
+		outputTokens = int(existingOutputNode.Int())
+	}
+	inputTokens := textTokens + imageInputTokens
+	if inputTokens+outputTokens == 0 && !usageNode.Exists() {
+		return body
 	}
 	var err error
+	updated, err = sjson.SetBytes(updated, "usage.input_tokens", inputTokens)
+	if err != nil {
+		return body
+	}
 	updated, err = sjson.SetBytes(updated, "usage.output_tokens", outputTokens)
 	if err != nil {
 		return body
@@ -1733,7 +1950,19 @@ func applyImagesResponseOutputTokens(body []byte, outputTokens int) []byte {
 	if err != nil {
 		return body
 	}
+	updated, err = sjson.SetBytes(updated, "usage.input_tokens_details.text_tokens", textTokens)
+	if err != nil {
+		return body
+	}
+	updated, err = sjson.SetBytes(updated, "usage.input_tokens_details.image_tokens", imageInputTokens)
+	if err != nil {
+		return body
+	}
 	return updated
+}
+
+func applyImagesResponseOutputTokens(body []byte, outputTokens int) []byte {
+	return applyImagesResponseUsage(body, imagesResponseOptions{}, outputTokens)
 }
 
 type imagesResponseSummary struct {
@@ -1811,10 +2040,12 @@ func buildImagesErrorBodyWithCode(status int, code, message string) []byte {
 // usage.input_tokens / usage.output_tokens / usage.input_tokens_details.cached_tokens
 // 与 Responses API 字段同构，parseUsage 已经处理了 cached token 扣减。
 type imagesResponseOptions struct {
-	BillingSize         string
-	RequestSize         string
-	RequestQuality      string
-	RequestOutputFormat string
+	BillingSize             string
+	RequestSize             string
+	RequestQuality          string
+	RequestOutputFormat     string
+	RequestTextInputTokens  int
+	RequestImageInputTokens int
 }
 
 func handleImagesResponse(resp *http.Response, w http.ResponseWriter, sseKA *ssePingKeepAlive, start time.Time, fallbackModel string, options ...imagesResponseOptions) (sdk.ForwardOutcome, error) {
@@ -1854,7 +2085,10 @@ func handleImagesResponseWithLogger(logger *slog.Logger, resp *http.Response, w 
 	summary := summarizeImagesResponseForBilling(body, opts.BillingSize)
 	body = applyImagesResponseMetadata(body, opts, summary)
 	imageOutputTokens := calculateGPTImage2OutputTokensForImages(modelName, summary.BillingSize, opts.RequestQuality, summary.NumImages)
-	body = applyImagesResponseOutputTokens(body, imageOutputTokens)
+	if !isGPTImage2Model(modelName) {
+		opts.RequestImageInputTokens = 0
+	}
+	body = applyImagesResponseUsage(body, opts, imageOutputTokens)
 
 	parsed := parseUsage(body)
 	headers := resp.Header.Clone()

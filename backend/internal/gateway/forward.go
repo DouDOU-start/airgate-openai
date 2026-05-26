@@ -237,7 +237,7 @@ func (g *OpenAIGateway) forwardAPIKey(ctx context.Context, req *sdk.ForwardReque
 		imagesRespOpts = imagesResponseOptionsFromRequestBody(req.Body, reqContentType, isImageEdit)
 	}
 	if isImageEdit && len(req.Body) > 0 && !isMultipart {
-		body, contentType, parsed, err := buildAPIKeyImagesEditMultipartBodyWithRequest(req.Body, reqContentType)
+		body, contentType, _, err := buildAPIKeyImagesEditMultipartBodyWithRequest(req.Body, reqContentType)
 		if err != nil {
 			errBody := jsonError(err.Error())
 			return sdk.ForwardOutcome{
@@ -253,12 +253,7 @@ func (g *OpenAIGateway) forwardAPIKey(ctx context.Context, req *sdk.ForwardReque
 		}
 		req.Body = body
 		req.Headers.Set("Content-Type", contentType)
-		if parsed != nil {
-			imagesRespOpts.BillingSize = parsed.Size
-			imagesRespOpts.RequestSize = parsed.Size
-			imagesRespOpts.RequestQuality = normalizeImageQualityDefaultMedium(parsed.Quality)
-			imagesRespOpts.RequestOutputFormat = parsed.OutputFormat
-		}
+		imagesRespOpts = imagesResponseOptionsFromRequestBody(body, contentType, true)
 	} else if isImageReq && len(req.Body) > 0 && !isMultipart {
 		if patched, err := sjson.DeleteBytes(req.Body, "stream"); err == nil {
 			req.Body = patched

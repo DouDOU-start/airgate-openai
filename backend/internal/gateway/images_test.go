@@ -498,6 +498,52 @@ func TestHandleImagesResponse_GPTImage2AddsCalculatedOutputTokens(t *testing.T) 
 	}
 }
 
+func TestHandleImagesResponse_GPTImage2AddsCalculatedInputImageTokens(t *testing.T) {
+	body := `{
+		"data": [],
+		"usage": {
+			"input_tokens": 5,
+			"input_tokens_details": {
+				"image_tokens": 0,
+				"text_tokens": 5
+			},
+			"output_tokens": 14272,
+			"total_tokens": 14277
+		}
+	}`
+	resp := &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": []string{"application/json"}},
+		Body:       ioNopCloserFromString(body),
+	}
+
+	outcome, err := handleImagesResponse(resp, nil, nil, time.Now(), "gpt-image-2", imagesResponseOptions{
+		RequestImageInputTokens: 7024,
+	})
+	if err != nil {
+		t.Fatalf("handleImagesResponse returned err: %v", err)
+	}
+
+	if got := int(gjson.GetBytes(outcome.Upstream.Body, "usage.input_tokens_details.text_tokens").Int()); got != 5 {
+		t.Fatalf("text_tokens = %d, want 5", got)
+	}
+	if got := int(gjson.GetBytes(outcome.Upstream.Body, "usage.input_tokens_details.image_tokens").Int()); got != 7024 {
+		t.Fatalf("image_tokens = %d, want 7024", got)
+	}
+	if got := int(gjson.GetBytes(outcome.Upstream.Body, "usage.input_tokens").Int()); got != 7029 {
+		t.Fatalf("input_tokens = %d, want 7029", got)
+	}
+	if got := int(gjson.GetBytes(outcome.Upstream.Body, "usage.total_tokens").Int()); got != 21301 {
+		t.Fatalf("total_tokens = %d, want 21301", got)
+	}
+	if got := usageMetricInt(outcome.Usage, usageMetricInputTokens); got != 7029 {
+		t.Fatalf("Outcome input_tokens = %d, want 7029", got)
+	}
+	if got := usageMetricInt(outcome.Usage, usageMetricOutputTokens); got != 14272 {
+		t.Fatalf("Outcome output_tokens = %d, want 14272", got)
+	}
+}
+
 // TestHandleImagesResponse_FallbackModelWhenBodyLacksModel 验证 Images 响应里
 // 没有 model 字段时，会回退到请求侧传入的 fallbackModel，避免 fillUsageCost 查不到定价。
 func TestHandleImagesResponse_FallbackModelWhenBodyLacksModel(t *testing.T) {
@@ -1099,9 +1145,11 @@ func TestBuildImagesToolCreateMsg_Edit_JSON(t *testing.T) {
 	if n != 1 {
 		t.Errorf("n = %d, want 1", n)
 	}
-	// text prompt "make it cyberpunk" = 17 runes → 6；reference image + region annotation = 2 * 272 → 550
-	if inputTokens != 6+272*2 {
-		t.Errorf("inputTokens = %d, want %d", inputTokens, 6+272*2)
+	// text prompt "make it cyberpunk" = 17 runes → 6；2×2 reference image + region annotation
+	// 都按 gpt-image-2 high fidelity 计算，单张 4609。
+	wantImageTokens := 4609 * 2
+	if inputTokens != 6+wantImageTokens {
+		t.Errorf("inputTokens = %d, want %d", inputTokens, 6+wantImageTokens)
 	}
 	content := gjson.GetBytes(msg, "input.0.content")
 	if !content.IsArray() || len(content.Array()) != 3 {
@@ -1493,6 +1541,63 @@ func TestImagesResponseOptionsFromMultipartDoesNotParseImagePart(t *testing.T) {
 		opts.RequestOutputFormat != "webp" {
 		t.Fatalf("options = %+v, want scalar response options", opts)
 	}
+	if opts.RequestImageInputTokens != 0 {
+		t.Fatalf("RequestImageInputTokens = %d, want 0 for unparsable image part", opts.RequestImageInputTokens)
+	}
+}
+
+func TestImagesResponseOptionsFromMultipartCalculatesImageInputTokens(t *testing.T) {
+	pngBytes := testPNGBytes(2, 2, func(x, y int) color.RGBA {
+		return color.RGBA{R: 10, G: 20, B: 30, A: 255}
+	})
+	var buf bytes.Buffer
+	mw := multipart.NewWriter(&buf)
+	h := textproto.MIMEHeader{}
+	h.Set("Content-Disposition", `form-data; name="image"; filename="input.png"`)
+	h.Set("Content-Type", "image/png")
+	w, _ := mw.CreatePart(h)
+	_, _ = w.Write(pngBytes)
+	_ = mw.WriteField("prompt", "edit it")
+	_ = mw.WriteField("size", "1024x1024")
+	_ = mw.WriteField("quality", "auto")
+	_ = mw.Close()
+
+	opts := imagesResponseOptionsFromRequestBody(buf.Bytes(), mw.FormDataContentType(), true)
+	if opts.RequestTextInputTokens != 3 {
+		t.Fatalf("RequestTextInputTokens = %d, want 3", opts.RequestTextInputTokens)
+	}
+	if opts.RequestImageInputTokens != 4609 {
+		t.Fatalf("RequestImageInputTokens = %d, want 4609", opts.RequestImageInputTokens)
+	}
+	if opts.RequestQuality != "medium" {
+		t.Fatalf("RequestQuality = %q, want medium", opts.RequestQuality)
+	}
+}
+
+func TestImagesResponseOptionsFromJSONRemoteImageDoesNotDownloadForTokenEstimate(t *testing.T) {
+	hits := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits++
+		w.Header().Set("Content-Type", "image/png")
+		_, _ = w.Write(testPNGBytes(2, 2, func(x, y int) color.RGBA {
+			return color.RGBA{R: 1, G: 2, B: 3, A: 255}
+		}))
+	}))
+	defer srv.Close()
+
+	body := []byte(fmt.Sprintf(`{
+		"prompt":"edit it",
+		"size":"1024x1024",
+		"image":%q
+	}`, srv.URL+"/input.png"))
+
+	opts := imagesResponseOptionsFromRequestBody(body, "application/json", true)
+	if hits != 0 {
+		t.Fatalf("remote image was downloaded %d times while estimating tokens", hits)
+	}
+	if opts.RequestImageInputTokens != 7024 {
+		t.Fatalf("RequestImageInputTokens = %d, want 7024 fallback high-quality 1024x1024", opts.RequestImageInputTokens)
+	}
 }
 
 func TestImagesResponseOptionsDefaultAndAutoQualityUseMedium(t *testing.T) {
@@ -1562,7 +1667,7 @@ func TestEstimatePromptTokens(t *testing.T) {
 }
 
 // TestBuildImagesRESTResponse 把 WSResult 打包回 OpenAI Images REST 响应格式。
-// 计费口径对齐 OpenAI 官方：usage.input_tokens = prompt tokens、output_tokens = 图像 tokens、
+// 计费口径对齐 OpenAI 官方：usage.input_tokens = text + image input tokens、output_tokens = 图像 tokens、
 // root 级 model 使用实际响应的图像模型。instructions / 工具包装的 chat tokens 不暴露。
 func TestBuildImagesRESTResponse(t *testing.T) {
 	ws := WSResult{
@@ -1633,6 +1738,26 @@ func TestBuildImagesRESTResponse(t *testing.T) {
 	}
 	if int(usage["total_tokens"].(float64)) != promptTokens+imageOut {
 		t.Errorf("usage.total_tokens wrong")
+	}
+}
+
+func TestBuildImagesRESTResponse_IncludesImageInputTokens(t *testing.T) {
+	ws := WSResult{ImageGenCalls: []ImageGenCall{{Result: "PNG_BASE64"}}}
+	body := buildImagesRESTResponse(ws, 5, 14272, "gpt-image-2", imagesResponseOptions{
+		RequestImageInputTokens: 7024,
+	})
+
+	if got := int(gjson.GetBytes(body, "usage.input_tokens_details.text_tokens").Int()); got != 5 {
+		t.Fatalf("text_tokens = %d, want 5", got)
+	}
+	if got := int(gjson.GetBytes(body, "usage.input_tokens_details.image_tokens").Int()); got != 7024 {
+		t.Fatalf("image_tokens = %d, want 7024", got)
+	}
+	if got := int(gjson.GetBytes(body, "usage.input_tokens").Int()); got != 7029 {
+		t.Fatalf("input_tokens = %d, want 7029", got)
+	}
+	if got := int(gjson.GetBytes(body, "usage.total_tokens").Int()); got != 21301 {
+		t.Fatalf("total_tokens = %d, want 21301", got)
 	}
 }
 
