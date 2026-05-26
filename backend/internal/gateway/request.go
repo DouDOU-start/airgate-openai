@@ -241,50 +241,6 @@ func preserveOpenAIConversationImages(body []byte) []byte {
 	return body
 }
 
-func shrinkDataImageURLsInJSON(body []byte, limit int) ([]byte, bool) {
-	if len(body) == 0 || limit <= 0 {
-		return body, false
-	}
-	var root any
-	if err := json.Unmarshal(body, &root); err != nil {
-		return body, false
-	}
-	changed := false
-	root = shrinkDataImageURLsValue(root, limit, &changed)
-	if !changed {
-		return body, false
-	}
-	out, err := json.Marshal(root)
-	if err != nil {
-		return body, false
-	}
-	return out, true
-}
-
-func shrinkDataImageURLsValue(v any, limit int, changed *bool) any {
-	switch item := v.(type) {
-	case map[string]any:
-		for k, child := range item {
-			item[k] = shrinkDataImageURLsValue(child, limit, changed)
-		}
-		return item
-	case []any:
-		for i, child := range item {
-			item[i] = shrinkDataImageURLsValue(child, limit, changed)
-		}
-		return item
-	case string:
-		shrunk, err := shrinkDataImageURL(item, limit)
-		if err != nil || shrunk == item {
-			return item
-		}
-		*changed = true
-		return shrunk
-	default:
-		return v
-	}
-}
-
 // normalizeResponsesInput 对 Responses API 请求的 input 字段做格式规范化。
 //
 // OpenAI 官方 Responses API 接受两种 input 形式：

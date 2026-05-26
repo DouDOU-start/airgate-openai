@@ -562,53 +562,6 @@ func applyImagesRequestOptions(opts *imagesResponseOptions, req *imagesRequest) 
 	}
 }
 
-func extractMultipartScalarFields(body []byte, contentType string, names ...string) map[string]string {
-	out := make(map[string]string, len(names))
-	wanted := make(map[string]struct{}, len(names))
-	for _, name := range names {
-		wanted[name] = struct{}{}
-	}
-
-	_, params, err := mime.ParseMediaType(contentType)
-	if err != nil || params["boundary"] == "" {
-		return out
-	}
-	marker := []byte("--" + params["boundary"])
-	pos := 0
-	for len(out) < len(wanted) {
-		startRel := bytes.Index(body[pos:], marker)
-		if startRel < 0 {
-			break
-		}
-		partStart := pos + startRel + len(marker)
-		if partStart+2 <= len(body) && body[partStart] == '-' && body[partStart+1] == '-' {
-			break
-		}
-		if partStart+2 <= len(body) && body[partStart] == '\r' && body[partStart+1] == '\n' {
-			partStart += 2
-		} else if partStart < len(body) && body[partStart] == '\n' {
-			partStart++
-		}
-
-		headerEndRel, sepLen := multipartHeaderEnd(body[partStart:])
-		if headerEndRel < 0 {
-			break
-		}
-		contentStart := partStart + headerEndRel + sepLen
-		nextRel := bytes.Index(body[contentStart:], marker)
-		if nextRel < 0 {
-			break
-		}
-		contentEnd := contentStart + nextRel
-		name := multipartPartName(body[partStart : partStart+headerEndRel])
-		if _, ok := wanted[name]; ok {
-			out[name] = strings.TrimSpace(string(body[contentStart:contentEnd]))
-		}
-		pos = contentEnd
-	}
-	return out
-}
-
 func multipartHeaderEnd(body []byte) (int, int) {
 	if idx := bytes.Index(body, []byte("\r\n\r\n")); idx >= 0 {
 		return idx, 4
@@ -908,24 +861,18 @@ func isGPTImageTwoModel(model string) bool {
 // 失败（base64 异常 / 非 PNG/JPEG / WebP 没注册解码器）返回 ok=false，
 // 调用方继续用 fallback 链。
 func imageActualSizeFromBase64(b64 string) (string, bool) {
-	if b64 == "" {
+	payload := strings.TrimSpace(b64)
+	if payload == "" {
 		return "", false
 	}
-	data, err := base64.StdEncoding.DecodeString(strings.TrimSpace(b64))
-	if err != nil {
-		data, err = base64.RawStdEncoding.DecodeString(strings.TrimSpace(b64))
-		if err != nil {
-			return "", false
-		}
+	width, height, ok := imageDimensionsFromBase64Reader(base64.StdEncoding, payload)
+	if !ok {
+		width, height, ok = imageDimensionsFromBase64Reader(base64.RawStdEncoding, payload)
 	}
-	cfg, _, err := image.DecodeConfig(bytes.NewReader(data))
-	if err != nil {
+	if !ok {
 		return "", false
 	}
-	if cfg.Width <= 0 || cfg.Height <= 0 {
-		return "", false
-	}
-	return fmt.Sprintf("%dx%d", cfg.Width, cfg.Height), true
+	return fmt.Sprintf("%dx%d", width, height), true
 }
 
 // imagePriceForSize 把生成的 size 映射成 USD 单价（1K/2K/4K 三档）。
@@ -1959,10 +1906,6 @@ func applyImagesResponseUsage(body []byte, opts imagesResponseOptions, outputTok
 	return updated
 }
 
-func applyImagesResponseOutputTokens(body []byte, outputTokens int) []byte {
-	return applyImagesResponseUsage(body, imagesResponseOptions{}, outputTokens)
-}
-
 type imagesResponseSummary struct {
 	NumImages   int
 	BillingSize string
@@ -2129,24 +2072,6 @@ func handleImagesResponseWithLogger(logger *slog.Logger, resp *http.Response, w 
 		outcome.Upstream.Body = body
 	}
 	return outcome, nil
-}
-
-// countUsableImages 统计响应体中实际携带图片数据（b64_json 或 url）的条目数。
-// 不含可用图片时返回 0，避免空响应被错误计费。
-func countUsableImages(body []byte) int {
-	dataArr := gjson.GetBytes(body, "data")
-	if !dataArr.Exists() || !dataArr.IsArray() {
-		return 0
-	}
-	n := 0
-	for _, item := range dataArr.Array() {
-		if item.Get("b64_json").String() != "" {
-			n++
-		} else if u := item.Get("url").String(); strings.HasPrefix(u, "http://") || strings.HasPrefix(u, "https://") {
-			n++
-		}
-	}
-	return n
 }
 
 // ──────────────────────────────────────────────────────

@@ -233,7 +233,7 @@ func (g *OpenAIGateway) forwardAPIKey(ctx context.Context, req *sdk.ForwardReque
 	reqContentType := req.Headers.Get("Content-Type")
 	isMultipart := isMultipartContentType(reqContentType)
 	imagesRespOpts := imagesResponseOptions{}
-	if isImageReq && len(req.Body) > 0 && !(isImageEdit && !isMultipart) {
+	if isImageReq && len(req.Body) > 0 && (!isImageEdit || isMultipart) {
 		imagesRespOpts = imagesResponseOptionsFromRequestBody(req.Body, reqContentType, isImageEdit)
 	}
 	if isImageEdit && len(req.Body) > 0 && !isMultipart {

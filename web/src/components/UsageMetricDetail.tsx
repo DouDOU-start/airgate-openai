@@ -193,7 +193,7 @@ function inputTokenValue(textInputTokens: number, imageInputTokens: number, inpu
   if (imageInputTokens <= 0) return formatNumber(inputTokens);
   return (
     <span style={inlineValueStyle}>
-      <span style={inlineValueMetaStyle}>(文字 {formatNumber(textInputTokens)})</span>
+      <span style={inlineValueMetaStyle}>(文本 {formatNumber(textInputTokens)})</span>
       <span style={inlineValueNumberStyle}>{formatNumber(inputTokens)}</span>
     </span>
   );
