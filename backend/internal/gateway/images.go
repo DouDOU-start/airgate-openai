@@ -25,6 +25,7 @@ import (
 	"unicode"
 
 	"github.com/tidwall/gjson"
+	"github.com/tidwall/sjson"
 
 	sdk "github.com/DouDOU-start/airgate-sdk/sdkgo"
 )
@@ -195,9 +196,14 @@ type imagesRequest struct {
 // /generations 只支持 application/json；/edits 同时支持 JSON（image 字段是 data URL/http(s) URL/数组）
 // 与 multipart/form-data（OpenAI SDK 标准）。
 func buildAPIKeyImagesEditMultipartBody(body []byte, contentType string) ([]byte, string, error) {
+	multipartBody, multipartContentType, _, err := buildAPIKeyImagesEditMultipartBodyWithRequest(body, contentType)
+	return multipartBody, multipartContentType, err
+}
+
+func buildAPIKeyImagesEditMultipartBodyWithRequest(body []byte, contentType string) ([]byte, string, *imagesRequest, error) {
 	req, err := parseImagesRequest(body, contentType, true)
 	if err != nil {
-		return nil, "", err
+		return nil, "", nil, err
 	}
 
 	var buf bytes.Buffer
@@ -226,20 +232,20 @@ func buildAPIKeyImagesEditMultipartBody(body []byte, contentType string) ([]byte
 		}
 		if err := writeMultipartImageRef(mw, fieldName, fmt.Sprintf("image-%d", i+1), ref, maxEditInputImageBytes); err != nil {
 			_ = mw.Close()
-			return nil, "", err
+			return nil, "", nil, err
 		}
 	}
 	if req.Mask != "" {
 		// mask 不压缩：透明度信息不能转 JPEG
 		if err := writeMultipartImageRef(mw, "mask", "mask", req.Mask, 0); err != nil {
 			_ = mw.Close()
-			return nil, "", err
+			return nil, "", nil, err
 		}
 	}
 	if err := mw.Close(); err != nil {
-		return nil, "", err
+		return nil, "", nil, err
 	}
-	return buf.Bytes(), mw.FormDataContentType(), nil
+	return buf.Bytes(), mw.FormDataContentType(), req, nil
 }
 
 func writeMultipartImageRef(mw *multipart.Writer, fieldName, baseName, ref string, shrinkLimit int) error {
@@ -354,6 +360,100 @@ func parseImagesRequest(body []byte, contentType string, isEdit bool) (*imagesRe
 		}
 	}
 	return parseImagesJSON(body, isEdit)
+}
+
+func isMultipartContentType(contentType string) bool {
+	return strings.HasPrefix(strings.ToLower(strings.TrimSpace(contentType)), "multipart/")
+}
+
+func imagesResponseOptionsFromRequestBody(body []byte, contentType string, isEdit bool) imagesResponseOptions {
+	if len(body) == 0 {
+		return imagesResponseOptions{}
+	}
+	if isEdit && isMultipartContentType(contentType) {
+		fields := extractMultipartScalarFields(body, contentType, "size", "quality")
+		return imagesResponseOptions{
+			BillingSize:    fields["size"],
+			RequestQuality: fields["quality"],
+		}
+	}
+	return imagesResponseOptions{
+		BillingSize:    strings.TrimSpace(gjson.GetBytes(body, "size").String()),
+		RequestQuality: strings.TrimSpace(gjson.GetBytes(body, "quality").String()),
+	}
+}
+
+func extractMultipartScalarFields(body []byte, contentType string, names ...string) map[string]string {
+	out := make(map[string]string, len(names))
+	wanted := make(map[string]struct{}, len(names))
+	for _, name := range names {
+		wanted[name] = struct{}{}
+	}
+
+	_, params, err := mime.ParseMediaType(contentType)
+	if err != nil || params["boundary"] == "" {
+		return out
+	}
+	marker := []byte("--" + params["boundary"])
+	pos := 0
+	for len(out) < len(wanted) {
+		startRel := bytes.Index(body[pos:], marker)
+		if startRel < 0 {
+			break
+		}
+		partStart := pos + startRel + len(marker)
+		if partStart+2 <= len(body) && body[partStart] == '-' && body[partStart+1] == '-' {
+			break
+		}
+		if partStart+2 <= len(body) && body[partStart] == '\r' && body[partStart+1] == '\n' {
+			partStart += 2
+		} else if partStart < len(body) && body[partStart] == '\n' {
+			partStart++
+		}
+
+		headerEndRel, sepLen := multipartHeaderEnd(body[partStart:])
+		if headerEndRel < 0 {
+			break
+		}
+		contentStart := partStart + headerEndRel + sepLen
+		nextRel := bytes.Index(body[contentStart:], marker)
+		if nextRel < 0 {
+			break
+		}
+		contentEnd := contentStart + nextRel
+		name := multipartPartName(body[partStart : partStart+headerEndRel])
+		if _, ok := wanted[name]; ok {
+			out[name] = strings.TrimSpace(string(body[contentStart:contentEnd]))
+		}
+		pos = contentEnd
+	}
+	return out
+}
+
+func multipartHeaderEnd(body []byte) (int, int) {
+	if idx := bytes.Index(body, []byte("\r\n\r\n")); idx >= 0 {
+		return idx, 4
+	}
+	if idx := bytes.Index(body, []byte("\n\n")); idx >= 0 {
+		return idx, 2
+	}
+	return -1, 0
+}
+
+func multipartPartName(headers []byte) string {
+	for _, line := range strings.Split(string(headers), "\n") {
+		line = strings.TrimRight(line, "\r")
+		colon := strings.IndexByte(line, ':')
+		if colon < 0 || !strings.EqualFold(strings.TrimSpace(line[:colon]), "Content-Disposition") {
+			continue
+		}
+		_, params, err := mime.ParseMediaType(strings.TrimSpace(line[colon+1:]))
+		if err != nil {
+			return ""
+		}
+		return strings.TrimSpace(params["name"])
+	}
+	return ""
 }
 
 func parseImagesJSON(body []byte, isEdit bool) (*imagesRequest, error) {
@@ -1332,7 +1432,7 @@ func (g *OpenAIGateway) forwardImagesViaResponsesTool(ctx context.Context, req *
 		"num_images", numImages,
 	)
 
-	respBody := buildImagesRESTResponse(wsResult, promptTokens, 0, billingModel)
+	respBody := buildImagesRESTResponse(wsResult, promptTokens, 0, billingModel, imgReq.Quality)
 	outcome := sdk.ForwardOutcome{
 		Kind:     sdk.OutcomeSuccess,
 		Upstream: sdk.UpstreamResponse{StatusCode: http.StatusOK},
@@ -1373,14 +1473,25 @@ func (g *OpenAIGateway) forwardImagesViaResponsesTool(ctx context.Context, req *
 // 这样：
 //  1. 客户端拿到的 usage 数字语义与 OpenAI 原生 Images API 完全一致
 //  2. 外层再套一层 AirGate 时，两级按同一口径独立计算，金额零偏差
-func buildImagesRESTResponse(wsResult WSResult, promptTokens, imageOutputTokens int, responseModel string) []byte {
+func buildImagesRESTResponse(wsResult WSResult, promptTokens, imageOutputTokens int, responseModel string, requestQuality ...string) []byte {
 	if responseModel == "" {
 		responseModel = imageToolCostModel
+	}
+	echoQuality := ""
+	if len(requestQuality) > 0 {
+		echoQuality = strings.TrimSpace(requestQuality[0])
 	}
 	data := make([]map[string]any, 0, len(wsResult.ImageGenCalls))
 	for _, call := range wsResult.ImageGenCalls {
 		item := map[string]any{
 			"b64_json": call.Result,
+		}
+		quality := strings.TrimSpace(call.Quality)
+		if echoQuality != "" {
+			quality = echoQuality
+		}
+		if quality != "" {
+			item["quality"] = quality
 		}
 		if call.RevisedPrompt != "" {
 			item["revised_prompt"] = call.RevisedPrompt
@@ -1411,6 +1522,47 @@ func buildImagesRESTResponse(wsResult WSResult, promptTokens, imageOutputTokens 
 	}
 	b, _ := json.Marshal(payload)
 	return b
+}
+
+func applyImagesResponseQualityEcho(body []byte, requestQuality string) []byte {
+	quality := strings.TrimSpace(requestQuality)
+	if quality == "" || len(body) == 0 {
+		return body
+	}
+
+	updated := body
+	changed := false
+	if gjson.GetBytes(updated, "quality").Exists() {
+		next, err := sjson.SetBytes(updated, "quality", quality)
+		if err != nil {
+			return body
+		}
+		updated = next
+		changed = true
+	}
+	data := gjson.GetBytes(updated, "data")
+	if data.Exists() && data.IsArray() {
+		for idx, item := range data.Array() {
+			if !item.IsObject() {
+				continue
+			}
+			next, err := sjson.SetBytes(updated, fmt.Sprintf("data.%d.quality", idx), quality)
+			if err != nil {
+				return body
+			}
+			updated = next
+			changed = true
+		}
+	}
+	if !changed {
+		next, err := sjson.SetBytes(updated, "quality", quality)
+		if err != nil {
+			return body
+		}
+		updated = next
+	}
+
+	return updated
 }
 
 // buildImagesErrorBody 返回 OpenAI 风格错误 body。
@@ -1446,15 +1598,20 @@ func buildImagesErrorBodyWithCode(status int, code, message string) []byte {
 // 计费字段复用 parseUsage：gpt-image-1 / gpt-image-1.5 返回的
 // usage.input_tokens / usage.output_tokens / usage.input_tokens_details.cached_tokens
 // 与 Responses API 字段同构，parseUsage 已经处理了 cached token 扣减。
-func handleImagesResponse(resp *http.Response, w http.ResponseWriter, sseKA *ssePingKeepAlive, start time.Time, fallbackModel string, billingSize ...string) (sdk.ForwardOutcome, error) {
-	return handleImagesResponseWithLogger(nil, resp, w, sseKA, start, fallbackModel, billingSize...)
+type imagesResponseOptions struct {
+	BillingSize    string
+	RequestQuality string
 }
 
-func (g *OpenAIGateway) handleImagesResponse(resp *http.Response, w http.ResponseWriter, sseKA *ssePingKeepAlive, start time.Time, fallbackModel string, billingSize ...string) (sdk.ForwardOutcome, error) {
-	return handleImagesResponseWithLogger(g.logger, resp, w, sseKA, start, fallbackModel, billingSize...)
+func handleImagesResponse(resp *http.Response, w http.ResponseWriter, sseKA *ssePingKeepAlive, start time.Time, fallbackModel string, options ...imagesResponseOptions) (sdk.ForwardOutcome, error) {
+	return handleImagesResponseWithLogger(nil, resp, w, sseKA, start, fallbackModel, options...)
 }
 
-func handleImagesResponseWithLogger(logger *slog.Logger, resp *http.Response, w http.ResponseWriter, sseKA *ssePingKeepAlive, start time.Time, fallbackModel string, billingSize ...string) (sdk.ForwardOutcome, error) {
+func (g *OpenAIGateway) handleImagesResponse(resp *http.Response, w http.ResponseWriter, sseKA *ssePingKeepAlive, start time.Time, fallbackModel string, options ...imagesResponseOptions) (sdk.ForwardOutcome, error) {
+	return handleImagesResponseWithLogger(g.logger, resp, w, sseKA, start, fallbackModel, options...)
+}
+
+func handleImagesResponseWithLogger(logger *slog.Logger, resp *http.Response, w http.ResponseWriter, sseKA *ssePingKeepAlive, start time.Time, fallbackModel string, options ...imagesResponseOptions) (sdk.ForwardOutcome, error) {
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		reason := fmt.Sprintf("读取 Images 响应失败: %v", err)
@@ -1468,8 +1625,17 @@ func handleImagesResponseWithLogger(logger *slog.Logger, resp *http.Response, w 
 		return transientOutcome(reason), fmt.Errorf("%s", reason)
 	}
 
+	opts := imagesResponseOptions{}
+	if len(options) > 0 {
+		opts = options[0]
+	}
+	body = applyImagesResponseQualityEcho(body, opts.RequestQuality)
+
 	parsed := parseUsage(body)
 	headers := resp.Header.Clone()
+	if headers.Get("Content-Length") != "" {
+		headers.Set("Content-Length", strconv.Itoa(len(body)))
+	}
 
 	if sseKA != nil {
 		sseKA.Stop()
@@ -1491,10 +1657,7 @@ func handleImagesResponseWithLogger(logger *slog.Logger, resp *http.Response, w 
 	if logger == nil {
 		logger = slog.Default()
 	}
-	billSize := ""
-	if len(billingSize) > 0 {
-		billSize = billingSize[0]
-	}
+	billSize := opts.BillingSize
 	// 与 OAuth 路径对齐：优先从响应体获取真实分辨率用于计费。
 	// 优先级：响应 data[0].size → 解码 base64 图片实际宽高 → 请求 size 兜底。
 	if dataArr := gjson.GetBytes(body, "data"); dataArr.Exists() && dataArr.IsArray() {

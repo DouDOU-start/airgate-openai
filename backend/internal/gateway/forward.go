@@ -228,14 +228,16 @@ func (g *OpenAIGateway) forwardAPIKey(ctx context.Context, req *sdk.ForwardReque
 
 	reqMethod, reqPath := resolveAPIKeyRoute(req)
 	targetURL := buildAPIKeyURL(account, reqPath)
-	imagesBillingSize := ""
-	if isImagesRequest(reqPath) && len(req.Body) > 0 {
-		if parsed, err := parseImagesRequest(req.Body, req.Headers.Get("Content-Type"), isImagesEditRequest(reqPath)); err == nil {
-			imagesBillingSize = parsed.Size
-		}
+	isImageReq := isImagesRequest(reqPath)
+	isImageEdit := isImagesEditRequest(reqPath)
+	reqContentType := req.Headers.Get("Content-Type")
+	isMultipart := isMultipartContentType(reqContentType)
+	imagesRespOpts := imagesResponseOptions{}
+	if isImageReq && len(req.Body) > 0 && !(isImageEdit && !isMultipart) {
+		imagesRespOpts = imagesResponseOptionsFromRequestBody(req.Body, reqContentType, isImageEdit)
 	}
-	if isImagesEditRequest(reqPath) && len(req.Body) > 0 && !strings.HasPrefix(strings.ToLower(req.Headers.Get("Content-Type")), "multipart/") {
-		body, contentType, err := buildAPIKeyImagesEditMultipartBody(req.Body, req.Headers.Get("Content-Type"))
+	if isImageEdit && len(req.Body) > 0 && !isMultipart {
+		body, contentType, parsed, err := buildAPIKeyImagesEditMultipartBodyWithRequest(req.Body, reqContentType)
 		if err != nil {
 			errBody := jsonError(err.Error())
 			return sdk.ForwardOutcome{
@@ -251,7 +253,11 @@ func (g *OpenAIGateway) forwardAPIKey(ctx context.Context, req *sdk.ForwardReque
 		}
 		req.Body = body
 		req.Headers.Set("Content-Type", contentType)
-	} else if isImagesRequest(reqPath) && len(req.Body) > 0 && !strings.HasPrefix(req.Headers.Get("Content-Type"), "multipart/") {
+		if parsed != nil {
+			imagesRespOpts.BillingSize = parsed.Size
+			imagesRespOpts.RequestQuality = parsed.Quality
+		}
+	} else if isImageReq && len(req.Body) > 0 && !isMultipart {
 		if patched, err := sjson.DeleteBytes(req.Body, "stream"); err == nil {
 			req.Body = patched
 		}
@@ -301,7 +307,7 @@ func (g *OpenAIGateway) forwardAPIKey(ctx context.Context, req *sdk.ForwardReque
 					Header:     http.Header{"Content-Type": []string{"application/json"}},
 					Body:       io.NopCloser(bytes.NewReader(finalBody)),
 				}
-				return g.handleImagesResponse(mockResp, req.Writer, nil, start, req.Model, imagesBillingSize)
+				return g.handleImagesResponse(mockResp, req.Writer, nil, start, req.Model, imagesRespOpts)
 			}
 			reason := fmt.Sprintf("上游异步任务恢复失败: %v", pollErr)
 			logger.Warn("images_async_task_recovery_failed",
@@ -446,7 +452,7 @@ func (g *OpenAIGateway) forwardAPIKey(ctx context.Context, req *sdk.ForwardReque
 			body = finalBody
 		}
 		resp.Body = io.NopCloser(bytes.NewReader(body))
-		return g.handleImagesResponse(resp, req.Writer, sseKA, start, req.Model, imagesBillingSize)
+		return g.handleImagesResponse(resp, req.Writer, sseKA, start, req.Model, imagesRespOpts)
 	}
 
 	if req.Stream && req.Writer != nil {

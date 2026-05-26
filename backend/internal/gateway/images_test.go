@@ -224,7 +224,7 @@ func TestHandleImagesResponse_TokenAttribution(t *testing.T) {
 	}
 	w := httptest.NewRecorder()
 
-	outcome, err := handleImagesResponse(resp, w, nil, time.Now(), "gpt-image-1.5", "2048x2048")
+	outcome, err := handleImagesResponse(resp, w, nil, time.Now(), "gpt-image-1.5", imagesResponseOptions{BillingSize: "2048x2048"})
 	if err != nil {
 		t.Fatalf("handleImagesResponse returned err: %v", err)
 	}
@@ -333,7 +333,7 @@ func TestHandleImagesResponse_APIKeyBillingUsesRequestSize(t *testing.T) {
 		Body:       ioNopCloserFromString(body),
 	}
 
-	outcome, err := handleImagesResponse(resp, nil, nil, time.Now(), "gpt-image-1.5", "3840x2160")
+	outcome, err := handleImagesResponse(resp, nil, nil, time.Now(), "gpt-image-1.5", imagesResponseOptions{BillingSize: "3840x2160"})
 	if err != nil {
 		t.Fatalf("handleImagesResponse returned err: %v", err)
 	}
@@ -362,6 +362,58 @@ func TestHandleImagesResponse_NonStreamReturnsBodyWithoutWriter(t *testing.T) {
 	}
 	if got := outcome.Upstream.Headers.Get("Content-Type"); got != "application/json" {
 		t.Fatalf("Content-Type = %q, want application/json", got)
+	}
+}
+
+func TestHandleImagesResponse_RequestQualityOverridesResponseEcho(t *testing.T) {
+	body := `{"quality":"low","data":[{"url":"https://example/a.png","quality":"low"},{"url":"https://example/b.png"}],"usage":{"input_tokens":10,"output_tokens":100}}`
+	resp := &http.Response{
+		StatusCode: http.StatusOK,
+		Header: http.Header{
+			"Content-Type":   []string{"application/json"},
+			"Content-Length": []string{fmt.Sprint(len(body))},
+		},
+		Body: ioNopCloserFromString(body),
+	}
+
+	outcome, err := handleImagesResponse(resp, nil, nil, time.Now(), "gpt-image-2", imagesResponseOptions{RequestQuality: "high"})
+	if err != nil {
+		t.Fatalf("handleImagesResponse returned err: %v", err)
+	}
+
+	var got map[string]any
+	if err := json.Unmarshal(outcome.Upstream.Body, &got); err != nil {
+		t.Fatalf("unmarshal response body: %v", err)
+	}
+	if got["quality"] != "high" {
+		t.Fatalf("root quality = %v, want high", got["quality"])
+	}
+	data := got["data"].([]any)
+	for i, item := range data {
+		obj := item.(map[string]any)
+		if obj["quality"] != "high" {
+			t.Fatalf("data[%d].quality = %v, want high", i, obj["quality"])
+		}
+	}
+	if got, want := outcome.Upstream.Headers.Get("Content-Length"), fmt.Sprint(len(outcome.Upstream.Body)); got != want {
+		t.Fatalf("Content-Length = %q, want rewritten length %q", got, want)
+	}
+}
+
+func TestHandleImagesResponse_NoRequestQualityPreservesResponseEcho(t *testing.T) {
+	body := `{"quality":"low","data":[{"url":"https://example/a.png","quality":"low"}],"usage":{"input_tokens":10,"output_tokens":100}}`
+	resp := &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": []string{"application/json"}},
+		Body:       ioNopCloserFromString(body),
+	}
+
+	outcome, err := handleImagesResponse(resp, nil, nil, time.Now(), "gpt-image-2")
+	if err != nil {
+		t.Fatalf("handleImagesResponse returned err: %v", err)
+	}
+	if got := string(outcome.Upstream.Body); got != body {
+		t.Fatalf("response body = %s, want original %s", got, body)
 	}
 }
 
@@ -1335,6 +1387,24 @@ func TestParseImagesEditMultipart(t *testing.T) {
 	}
 }
 
+func TestImagesResponseOptionsFromMultipartDoesNotParseImagePart(t *testing.T) {
+	var buf bytes.Buffer
+	mw := multipart.NewWriter(&buf)
+	h := textproto.MIMEHeader{}
+	h.Set("Content-Disposition", `form-data; name="image"; filename="bad.bin"`)
+	h.Set("Content-Type", "application/octet-stream")
+	w, _ := mw.CreatePart(h)
+	_, _ = w.Write(bytes.Repeat([]byte{0x01, 0x02, 0x03, 0x04}, 1024))
+	_ = mw.WriteField("quality", "high")
+	_ = mw.WriteField("size", "2048x2048")
+	_ = mw.Close()
+
+	opts := imagesResponseOptionsFromRequestBody(buf.Bytes(), mw.FormDataContentType(), true)
+	if opts.RequestQuality != "high" || opts.BillingSize != "2048x2048" {
+		t.Fatalf("options = %+v, want quality high and size 2048x2048", opts)
+	}
+}
+
 func TestNormalizeImageRef(t *testing.T) {
 	cases := map[string]string{
 		"data:image/png;base64,AAA=":     "data:image/png;base64,AAA=",
@@ -1432,6 +1502,21 @@ func TestBuildImagesRESTResponse(t *testing.T) {
 	}
 	if int(usage["total_tokens"].(float64)) != promptTokens+imageOut {
 		t.Errorf("usage.total_tokens wrong")
+	}
+}
+
+func TestBuildImagesRESTResponse_QualityEchoPrefersRequest(t *testing.T) {
+	ws := WSResult{ImageGenCalls: []ImageGenCall{{Result: "PNG_BASE64", Quality: "low"}}}
+	body := buildImagesRESTResponse(ws, 1, 2, "gpt-image-2", "high")
+
+	data := gjson.GetBytes(body, "data.0")
+	if got := data.Get("quality").String(); got != "high" {
+		t.Fatalf("data[0].quality = %q, want high", got)
+	}
+
+	body = buildImagesRESTResponse(ws, 1, 2, "gpt-image-2")
+	if got := gjson.GetBytes(body, "data.0.quality").String(); got != "low" {
+		t.Fatalf("data[0].quality without request = %q, want upstream low", got)
 	}
 }
 
