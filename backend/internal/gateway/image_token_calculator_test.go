@@ -5,8 +5,8 @@ import (
 	"testing"
 )
 
-func TestGPTImage2TokenCalculator(t *testing.T) {
-	calc := NewGPTImage2TokenCalculator()
+func TestGPTImageTokenCalculator(t *testing.T) {
+	calc := GPTImageTokenCalculator{}
 	cases := []struct {
 		size    string
 		quality string
@@ -36,8 +36,8 @@ func TestGPTImage2TokenCalculator(t *testing.T) {
 	}
 }
 
-func TestGPTImage2TokenCalculatorRejectsUnparseableInput(t *testing.T) {
-	calc := NewGPTImage2TokenCalculator()
+func TestGPTImageTokenCalculatorRejectsUnparseableInput(t *testing.T) {
+	calc := GPTImageTokenCalculator{}
 	cases := []struct {
 		name       string
 		size       string
@@ -63,8 +63,8 @@ func TestGPTImage2TokenCalculatorRejectsUnparseableInput(t *testing.T) {
 	}
 }
 
-func TestGPTImage2TokenCalculatorDefaultQualityUsesHigh(t *testing.T) {
-	calc := NewGPTImage2TokenCalculator()
+func TestGPTImageTokenCalculatorDefaultQualityUsesHigh(t *testing.T) {
+	calc := GPTImageTokenCalculator{}
 
 	got, err := calc.CalculateDefaultQuality("3840x2160")
 	if err != nil {
@@ -83,8 +83,8 @@ func TestGPTImage2TokenCalculatorDefaultQualityUsesHigh(t *testing.T) {
 	}
 }
 
-func TestGPTImage2TokenCalculatorDoesNotValidateSizeRules(t *testing.T) {
-	got, err := NewGPTImage2TokenCalculator().Calculate("512x512", "low")
+func TestGPTImageTokenCalculatorDoesNotValidateSizeRules(t *testing.T) {
+	got, err := GPTImageTokenCalculator{}.Calculate("512x512", "low")
 	if err != nil {
 		t.Fatalf("Calculate returned err: %v", err)
 	}
@@ -93,8 +93,8 @@ func TestGPTImage2TokenCalculatorDoesNotValidateSizeRules(t *testing.T) {
 	}
 }
 
-func TestGPTImage2TokenCalculatorDimensions(t *testing.T) {
-	got, err := NewGPTImage2TokenCalculator().CalculateDimensions(3840, 2160, "medium")
+func TestGPTImageTokenCalculatorDimensions(t *testing.T) {
+	got, err := GPTImageTokenCalculator{}.CalculateDimensions(3840, 2160, "medium")
 	if err != nil {
 		t.Fatalf("CalculateDimensions returned err: %v", err)
 	}

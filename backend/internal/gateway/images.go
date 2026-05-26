@@ -99,25 +99,25 @@ func normalizeImageQualityDefaultMedium(quality string) string {
 	return q
 }
 
-func calculateGPTImage2OutputTokensForImages(modelName, size, quality string, numImages int) int {
-	if numImages <= 0 || !isGPTImage2Model(modelName) {
+func calculateGPTImageOutputTokensForImages(modelName, size, quality string, numImages int) int {
+	if numImages <= 0 || !isGPTImageTwoModel(modelName) {
 		return 0
 	}
 	if _, _, ok := parseImageSize(size); !ok {
 		size = "1024x1024"
 	}
-	tokens, err := NewGPTImage2TokenCalculator().Calculate(size, normalizeImageQualityDefaultMedium(quality))
+	tokens, err := GPTImageTokenCalculator{}.Calculate(size, normalizeImageQualityDefaultMedium(quality))
 	if err != nil {
 		return 0
 	}
 	return tokens * numImages
 }
 
-func estimateGPTImage2InputImageTokens(refs []string, fallbackSize string) int {
+func estimateGPTImageInputTokensForImages(refs []string, fallbackSize string) int {
 	if len(refs) == 0 {
 		return 0
 	}
-	calc := NewGPTImage2TokenCalculator()
+	calc := GPTImageTokenCalculator{}
 	fallbackTokens := -1
 	total := 0
 	for _, ref := range refs {
@@ -128,7 +128,7 @@ func estimateGPTImage2InputImageTokens(refs []string, fallbackSize string) int {
 			}
 		}
 		if fallbackTokens < 0 {
-			fallbackTokens = gptImage2InputImageFallbackTokens(calc, fallbackSize)
+			fallbackTokens = gptImageInputFallbackTokens(calc, fallbackSize)
 		}
 		total += fallbackTokens
 	}
@@ -170,7 +170,7 @@ func imageDimensionsFromBytes(data []byte) (int, int, bool) {
 	return cfg.Width, cfg.Height, true
 }
 
-func gptImage2InputImageFallbackTokens(calc GPTImage2TokenCalculator, fallbackSize string) int {
+func gptImageInputFallbackTokens(calc GPTImageTokenCalculator, fallbackSize string) int {
 	size := normalizeImagesResponseSize(fallbackSize)
 	if size == "" {
 		size = "1024x1024"
@@ -483,7 +483,7 @@ func imagesResponseOptionsFromMultipartBody(body []byte, contentType string) ima
 		return opts
 	}
 
-	calc := NewGPTImage2TokenCalculator()
+	calc := GPTImageTokenCalculator{}
 	unknownImageRefs := 0
 	fields := map[string]string{}
 	marker := []byte("--" + params["boundary"])
@@ -542,7 +542,7 @@ func imagesResponseOptionsFromMultipartBody(body []byte, contentType string) ima
 	opts.RequestOutputFormat = strings.TrimSpace(fields["output_format"])
 	opts.RequestTextInputTokens = estimatePromptTokens(fields["prompt"])
 	if unknownImageRefs > 0 {
-		opts.RequestImageInputTokens += unknownImageRefs * gptImage2InputImageFallbackTokens(calc, size)
+		opts.RequestImageInputTokens += unknownImageRefs * gptImageInputFallbackTokens(calc, size)
 	}
 	return opts
 }
@@ -558,7 +558,7 @@ func applyImagesRequestOptions(opts *imagesResponseOptions, req *imagesRequest) 
 	opts.RequestOutputFormat = strings.TrimSpace(req.OutputFormat)
 	opts.RequestTextInputTokens = estimatePromptTokens(req.Prompt)
 	if req.IsEdit {
-		opts.RequestImageInputTokens = estimateGPTImage2InputImageTokens(req.Images, req.Size)
+		opts.RequestImageInputTokens = estimateGPTImageInputTokensForImages(req.Images, req.Size)
 	}
 }
 
@@ -877,7 +877,7 @@ func imageAPIConstraintLines(req *imagesRequest, isEdit, hasRegionAnnotation boo
 		// 写进 constraints 反而是噪声，可能让 chat 模型输出无效约束词。
 		// SKILL.md: "gpt-image-2 always uses high fidelity for image inputs;
 		// do not set input_fidelity with this model."
-		if !isGPTImage2Model(req.Model) {
+		if !isGPTImageTwoModel(req.Model) {
 			if fidelity := cleanImageConstraintValue(req.InputFidelity); fidelity != "" {
 				lines = append(lines, "Preserve the input image with "+fidelity+" fidelity.")
 			}
@@ -889,9 +889,9 @@ func imageAPIConstraintLines(req *imagesRequest, isEdit, hasRegionAnnotation boo
 	return lines
 }
 
-// isGPTImage2Model 判断 model 是否走 gpt-image-2 链路。
+// isGPTImageTwoModel 判断 model 是否走 gpt-image-2 链路。
 // 空 model 视为 gpt-image-2，因为客户端不指定时上游默认升到 gpt-image-2。
-func isGPTImage2Model(model string) bool {
+func isGPTImageTwoModel(model string) bool {
 	m := strings.ToLower(strings.TrimSpace(model))
 	if m == "" {
 		return true
@@ -975,7 +975,7 @@ func validateImageSize(size, model string) error {
 	if s == "" || s == "auto" {
 		return nil
 	}
-	if !isGPTImage2Model(model) {
+	if !isGPTImageTwoModel(model) {
 		return nil
 	}
 	width, height, ok := parseImageSize(s)
@@ -1389,7 +1389,7 @@ func buildImagesToolCreateMsgWithUsage(
 	}
 	estimate := imagesInputTokenEstimate{
 		TextTokens:  estimatePromptTokens(req.Prompt),
-		ImageTokens: estimateGPTImage2InputImageTokens(inputImageRefs, req.Size),
+		ImageTokens: estimateGPTImageInputTokensForImages(inputImageRefs, req.Size),
 	}
 	return msg, req.N, estimate, nil
 }
@@ -1660,7 +1660,7 @@ func (g *OpenAIGateway) forwardImagesViaResponsesTool(ctx context.Context, req *
 			billingSize = sz
 		}
 	}
-	imageOutputTokens := calculateGPTImage2OutputTokensForImages(billingModel, billingSize, imgReq.Quality, numImages)
+	imageOutputTokens := calculateGPTImageOutputTokensForImages(billingModel, billingSize, imgReq.Quality, numImages)
 	respBody := buildImagesRESTResponse(wsResult, inputEstimate.TextTokens, imageOutputTokens, billingModel, imagesResponseOptions{
 		BillingSize:             billingSize,
 		RequestSize:             imgReq.Size,
@@ -1708,9 +1708,6 @@ func buildImagesRESTResponse(wsResult WSResult, textInputTokens, imageOutputToke
 	for _, call := range wsResult.ImageGenCalls {
 		item := map[string]any{
 			"b64_json": call.Result,
-		}
-		if call.RevisedPrompt != "" {
-			item["revised_prompt"] = call.RevisedPrompt
 		}
 		data = append(data, item)
 	}
@@ -2085,8 +2082,8 @@ func handleImagesResponseWithLogger(logger *slog.Logger, resp *http.Response, w 
 	}
 	summary := summarizeImagesResponseForBilling(body, opts.BillingSize)
 	body = applyImagesResponseMetadata(body, opts, summary)
-	imageOutputTokens := calculateGPTImage2OutputTokensForImages(modelName, summary.BillingSize, opts.RequestQuality, summary.NumImages)
-	if !isGPTImage2Model(modelName) {
+	imageOutputTokens := calculateGPTImageOutputTokensForImages(modelName, summary.BillingSize, opts.RequestQuality, summary.NumImages)
+	if !isGPTImageTwoModel(modelName) {
 		opts.RequestImageInputTokens = 0
 	}
 	body = applyImagesResponseUsage(body, opts, imageOutputTokens)

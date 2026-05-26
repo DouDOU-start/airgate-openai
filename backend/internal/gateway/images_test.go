@@ -466,7 +466,7 @@ func TestHandleImagesResponse_AutoQualityEchoesMedium(t *testing.T) {
 	}
 }
 
-func TestHandleImagesResponse_GPTImage2AddsCalculatedOutputTokens(t *testing.T) {
+func TestHandleImagesResponse_GPTImageAddsCalculatedOutputTokens(t *testing.T) {
 	body := `{"data":[{"url":"https://example/a.png"}]}`
 	resp := &http.Response{
 		StatusCode: http.StatusOK,
@@ -498,7 +498,7 @@ func TestHandleImagesResponse_GPTImage2AddsCalculatedOutputTokens(t *testing.T) 
 	}
 }
 
-func TestHandleImagesResponse_GPTImage2AddsCalculatedInputImageTokens(t *testing.T) {
+func TestHandleImagesResponse_GPTImageAddsCalculatedInputImageTokens(t *testing.T) {
 	body := `{
 		"data": [],
 		"usage": {
@@ -1283,11 +1283,11 @@ func TestBuildImagesToolCreateMsg_Edit_MissingImage(t *testing.T) {
 	}
 }
 
-// TestBuildImagesToolCreateMsg_Edit_Img2ImgNoMask 钉死 OAuth Responses-tool 路径
+// TestBuildImagesToolCreateMsg_Edit_ImageToImageNoMask 钉死 OAuth Responses-tool 路径
 // 上"纯图生图"（无 mask）的载荷形状：必须 1 张 input_image 而且不生成 region
 // annotation。这是 studio ComposerBar 图生图入口最常见的请求形态，是 OAuth
 // 路径上历史最容易"看上去通了但参考图没生效"的退化点。
-func TestBuildImagesToolCreateMsg_Edit_Img2ImgNoMask(t *testing.T) {
+func TestBuildImagesToolCreateMsg_Edit_ImageToImageNoMask(t *testing.T) {
 	imageRef := testPNGDataURL(2, 2, func(x, y int) color.RGBA {
 		return color.RGBA{R: 120, G: 30, B: 30, A: 255}
 	})
@@ -1737,13 +1737,19 @@ func TestBuildImagesRESTResponse(t *testing.T) {
 	if got["output_format"] != "webp" {
 		t.Errorf("root output_format = %v, want webp", got["output_format"])
 	}
+	if _, ok := got["revised_prompt"]; ok {
+		t.Errorf("root revised_prompt should be omitted")
+	}
 	data, _ := got["data"].([]any)
 	if len(data) != 2 {
 		t.Fatalf("data len = %d, want 2", len(data))
 	}
 	first, _ := data[0].(map[string]any)
-	if first["b64_json"] != "PNG_BASE64_A" || first["revised_prompt"] != "revised a" {
+	if first["b64_json"] != "PNG_BASE64_A" {
 		t.Errorf("data[0] fields wrong: %+v", first)
+	}
+	if _, ok := first["revised_prompt"]; ok {
+		t.Errorf("data[0].revised_prompt should be omitted")
 	}
 	if _, ok := first["quality"]; ok {
 		t.Errorf("data[0].quality should be omitted")
@@ -1753,7 +1759,7 @@ func TestBuildImagesRESTResponse(t *testing.T) {
 		t.Errorf("data[1].b64_json = %v, want PNG_BASE64_B", second["b64_json"])
 	}
 	if _, ok := second["revised_prompt"]; ok {
-		t.Errorf("empty revised_prompt should be omitted")
+		t.Errorf("data[1].revised_prompt should be omitted")
 	}
 	usage, ok := got["usage"].(map[string]any)
 	if !ok {
@@ -2002,10 +2008,10 @@ func TestForwardImagesViaResponsesTool_InvalidSize(t *testing.T) {
 	}
 }
 
-// TestBuildImagesToolCreateMsg_Edit_GPTImage2_SkipsInputFidelity gpt-image-2 始终
+// TestBuildImagesToolCreateMsg_Edit_GPTImageTwo_SkipsInputFidelity gpt-image-2 始终
 // 用 high fidelity 处理输入图，input_fidelity 是 no-op，constraints 不应再追加。
 // SKILL.md: "do not set input_fidelity with this model".
-func TestBuildImagesToolCreateMsg_Edit_GPTImage2_SkipsInputFidelity(t *testing.T) {
+func TestBuildImagesToolCreateMsg_Edit_GPTImageTwo_SkipsInputFidelity(t *testing.T) {
 	imageRef := testPNGDataURL(2, 2, func(x, y int) color.RGBA {
 		return color.RGBA{R: 80, G: 90, B: 100, A: 255}
 	})

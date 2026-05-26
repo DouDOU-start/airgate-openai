@@ -6,49 +6,44 @@ import (
 )
 
 const (
-	gptImage2TokenFormulaBias  = int64(2_000_000)
-	gptImage2TokenFormulaScale = int64(4_000_000)
-	gptImage2DefaultQuality    = "high"
+	gptImageTokenFormulaBias  = int64(2_000_000)
+	gptImageTokenFormulaScale = int64(4_000_000)
+	gptImageDefaultQuality    = "high"
 )
 
-// GPTImage2TokenCalculator mirrors OpenAI's GPT Image 2 token calculator:
+// GPTImageTokenCalculator mirrors OpenAI's GPT Image 2 token calculator:
 // size + low/medium/high quality -> estimated image tokens.
-type GPTImage2TokenCalculator struct{}
-
-// NewGPTImage2TokenCalculator returns a stateless GPT Image 2 token calculator.
-func NewGPTImage2TokenCalculator() GPTImage2TokenCalculator {
-	return GPTImage2TokenCalculator{}
-}
+type GPTImageTokenCalculator struct{}
 
 // Calculate parses size as WIDTHxHEIGHT and returns GPT Image 2 image tokens for one image.
-func (GPTImage2TokenCalculator) Calculate(size, quality string) (int, error) {
+func (GPTImageTokenCalculator) Calculate(size, quality string) (int, error) {
 	width, height, ok := parseImageSize(size)
 	if !ok {
 		return 0, fmt.Errorf("size 格式无效，应为 WIDTHxHEIGHT")
 	}
-	return calculateGPTImage2Tokens(width, height, quality)
+	return calculateGPTImageTokens(width, height, quality)
 }
 
 // CalculateDefaultQuality parses size and calculates tokens with the default high quality.
-func (c GPTImage2TokenCalculator) CalculateDefaultQuality(size string) (int, error) {
-	return c.Calculate(size, gptImage2DefaultQuality)
+func (c GPTImageTokenCalculator) CalculateDefaultQuality(size string) (int, error) {
+	return c.Calculate(size, gptImageDefaultQuality)
 }
 
 // CalculateDimensions returns GPT Image 2 image tokens for one image.
-func (GPTImage2TokenCalculator) CalculateDimensions(width, height int, quality string) (int, error) {
-	return calculateGPTImage2Tokens(width, height, quality)
+func (GPTImageTokenCalculator) CalculateDimensions(width, height int, quality string) (int, error) {
+	return calculateGPTImageTokens(width, height, quality)
 }
 
 // CalculateDimensionsDefaultQuality calculates tokens with the default high quality.
-func (c GPTImage2TokenCalculator) CalculateDimensionsDefaultQuality(width, height int) (int, error) {
-	return c.CalculateDimensions(width, height, gptImage2DefaultQuality)
+func (c GPTImageTokenCalculator) CalculateDimensionsDefaultQuality(width, height int) (int, error) {
+	return c.CalculateDimensions(width, height, gptImageDefaultQuality)
 }
 
-func calculateGPTImage2Tokens(width, height int, quality string) (int, error) {
+func calculateGPTImageTokens(width, height int, quality string) (int, error) {
 	if width <= 0 || height <= 0 {
 		return 0, fmt.Errorf("size 宽高必须大于 0")
 	}
-	base, err := gptImage2QualityBase(quality)
+	base, err := gptImageQualityBase(quality)
 	if err != nil {
 		return 0, err
 	}
@@ -61,10 +56,10 @@ func calculateGPTImage2Tokens(width, height int, quality string) (int, error) {
 	scaledShort := roundPositiveRatio(int64(base*shortEdge), int64(longEdge))
 	patches := int64(base) * scaledShort
 	area := int64(width) * int64(height)
-	return int(ceilPositiveRatio(patches*(gptImage2TokenFormulaBias+area), gptImage2TokenFormulaScale)), nil
+	return int(ceilPositiveRatio(patches*(gptImageTokenFormulaBias+area), gptImageTokenFormulaScale)), nil
 }
 
-func gptImage2QualityBase(quality string) (int, error) {
+func gptImageQualityBase(quality string) (int, error) {
 	switch strings.ToLower(strings.TrimSpace(quality)) {
 	case "low":
 		return 16, nil

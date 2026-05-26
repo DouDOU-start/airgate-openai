@@ -169,7 +169,7 @@ func (g *OpenAIGateway) forwardImagesViaWebReverse(ctx context.Context, req *sdk
 
 	inputEstimate := imagesInputTokenEstimate{TextTokens: estimatePromptTokens(imgReq.Prompt)}
 	if isEdit {
-		inputEstimate.ImageTokens = estimateGPTImage2InputImageTokens(imgReq.Images, imgReq.Size)
+		inputEstimate.ImageTokens = estimateGPTImageInputTokensForImages(imgReq.Images, imgReq.Size)
 	}
 
 	var imageInputs []imgen.ImageInput
