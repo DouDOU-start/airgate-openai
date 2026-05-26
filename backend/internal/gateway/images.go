@@ -92,11 +92,25 @@ func lookupImageGenOutputTokens(size, quality string) int {
 }
 
 func normalizeImageQualityDefaultMedium(quality string) string {
-	q := strings.TrimSpace(quality)
+	q := strings.ToLower(strings.TrimSpace(quality))
 	if q == "" || strings.EqualFold(q, "auto") {
 		return "medium"
 	}
 	return q
+}
+
+func calculateGPTImage2OutputTokensForImages(modelName, size, quality string, numImages int) int {
+	if numImages <= 0 || !isGPTImage2Model(modelName) {
+		return 0
+	}
+	if _, _, ok := parseImageSize(size); !ok {
+		size = "1024x1024"
+	}
+	tokens, err := NewGPTImage2TokenCalculator().Calculate(size, normalizeImageQualityDefaultMedium(quality))
+	if err != nil {
+		return 0
+	}
+	return tokens * numImages
 }
 
 // estimateImageGenOutputTokens 汇总所有 image_generation_call 的估算 token 数。
@@ -379,15 +393,20 @@ func imagesResponseOptionsFromRequestBody(body []byte, contentType string, isEdi
 		return imagesResponseOptions{}
 	}
 	if isEdit && isMultipartContentType(contentType) {
-		fields := extractMultipartScalarFields(body, contentType, "size", "quality")
+		fields := extractMultipartScalarFields(body, contentType, "size", "quality", "output_format")
 		return imagesResponseOptions{
-			BillingSize:    fields["size"],
-			RequestQuality: normalizeImageQualityDefaultMedium(fields["quality"]),
+			BillingSize:         strings.TrimSpace(fields["size"]),
+			RequestSize:         strings.TrimSpace(fields["size"]),
+			RequestQuality:      normalizeImageQualityDefaultMedium(fields["quality"]),
+			RequestOutputFormat: strings.TrimSpace(fields["output_format"]),
 		}
 	}
+	size := strings.TrimSpace(gjson.GetBytes(body, "size").String())
 	return imagesResponseOptions{
-		BillingSize:    strings.TrimSpace(gjson.GetBytes(body, "size").String()),
-		RequestQuality: normalizeImageQualityDefaultMedium(gjson.GetBytes(body, "quality").String()),
+		BillingSize:         size,
+		RequestSize:         size,
+		RequestQuality:      normalizeImageQualityDefaultMedium(gjson.GetBytes(body, "quality").String()),
+		RequestOutputFormat: strings.TrimSpace(gjson.GetBytes(body, "output_format").String()),
 	}
 }
 
@@ -1439,7 +1458,30 @@ func (g *OpenAIGateway) forwardImagesViaResponsesTool(ctx context.Context, req *
 		"num_images", numImages,
 	)
 
-	respBody := buildImagesRESTResponse(wsResult, promptTokens, 0, billingModel, imgReq.Quality)
+	// 计费 size 优先级（高 → 低）：
+	//   1. 上游 image_generation_call event 的 size 字段（telemetry 反馈）
+	//   2. 直接解码生成的 base64 图 header 拿真实宽高（auto 时最准的来源——
+	//      上游有时不返 size 字段，但图本身永远是诚实的）
+	//   3. 客户端请求里的 size（最可能是 "auto" 兜底）
+	//
+	// 这里得到的 billingSize 同时用于 response.usage.output_tokens 估算，
+	// 避免为了写 usage 再额外解析一次图片。
+	billingSize := imgReq.Size
+	if len(wsResult.ImageGenCalls) > 0 {
+		first := wsResult.ImageGenCalls[0]
+		if first.Size != "" {
+			billingSize = first.Size
+		} else if sz, ok := imageActualSizeFromBase64(first.Result); ok {
+			billingSize = sz
+		}
+	}
+	imageOutputTokens := calculateGPTImage2OutputTokensForImages(billingModel, billingSize, imgReq.Quality, numImages)
+	respBody := buildImagesRESTResponse(wsResult, promptTokens, imageOutputTokens, billingModel, imagesResponseOptions{
+		BillingSize:         billingSize,
+		RequestSize:         imgReq.Size,
+		RequestQuality:      imgReq.Quality,
+		RequestOutputFormat: imgReq.OutputFormat,
+	})
 	outcome := sdk.ForwardOutcome{
 		Kind:     sdk.OutcomeSuccess,
 		Upstream: sdk.UpstreamResponse{StatusCode: http.StatusOK},
@@ -1455,21 +1497,8 @@ func (g *OpenAIGateway) forwardImagesViaResponsesTool(ctx context.Context, req *
 		outcome.Upstream.Headers = http.Header{"Content-Type": []string{"application/json"}}
 	}
 
-	// 计费 size 优先级（高 → 低）：
-	//   1. 上游 image_generation_call event 的 size 字段（telemetry 反馈）
-	//   2. 直接解码生成的 base64 图 header 拿真实宽高（auto 时最准的来源——
-	//      上游有时不返 size 字段，但图本身永远是诚实的）
-	//   3. 客户端请求里的 size（最可能是 "auto" 兜底）
-	billingSize := imgReq.Size
-	if len(wsResult.ImageGenCalls) > 0 {
-		first := wsResult.ImageGenCalls[0]
-		if first.Size != "" {
-			billingSize = first.Size
-		} else if sz, ok := imageActualSizeFromBase64(first.Result); ok {
-			billingSize = sz
-		}
-	}
 	// 图片尺寸作为通用 UsageAttribute 入库，后台费用明细可用它解释 1K/2K/4K 分档。
+	setUsageTokens(usage, promptTokens, imageOutputTokens, 0, 0)
 	fillUsageCostPerImageBySize(usage, numImages, billingSize)
 	return outcome, nil
 }
@@ -1480,41 +1509,55 @@ func (g *OpenAIGateway) forwardImagesViaResponsesTool(ctx context.Context, req *
 // 这样：
 //  1. 客户端拿到的 usage 数字语义与 OpenAI 原生 Images API 完全一致
 //  2. 外层再套一层 AirGate 时，两级按同一口径独立计算，金额零偏差
-func buildImagesRESTResponse(wsResult WSResult, promptTokens, imageOutputTokens int, responseModel string, requestQuality ...string) []byte {
+func buildImagesRESTResponse(wsResult WSResult, promptTokens, imageOutputTokens int, responseModel string, options ...imagesResponseOptions) []byte {
 	if responseModel == "" {
 		responseModel = imageToolCostModel
 	}
-	echoQuality := ""
-	if len(requestQuality) > 0 {
-		echoQuality = normalizeImageQualityDefaultMedium(requestQuality[0])
+	opts := imagesResponseOptions{}
+	if len(options) > 0 {
+		opts = options[0]
 	}
 	data := make([]map[string]any, 0, len(wsResult.ImageGenCalls))
 	for _, call := range wsResult.ImageGenCalls {
 		item := map[string]any{
 			"b64_json": call.Result,
 		}
-		quality := strings.TrimSpace(call.Quality)
-		if echoQuality != "" {
-			quality = echoQuality
-		}
-		if quality != "" {
-			item["quality"] = quality
-		}
 		if call.RevisedPrompt != "" {
 			item["revised_prompt"] = call.RevisedPrompt
 		}
-		// 透传上游实际生效的 image_generation 工具模型（从 response.tools[].model 提取）。
-		// 客户端可据此判断"请求的 model"是否被上游静默降级。
-		if wsResult.ToolImageModel != "" {
-			item["model"] = wsResult.ToolImageModel
-		}
 		data = append(data, item)
 	}
+	size := normalizeImagesResponseSize(opts.BillingSize)
+	if size == "" {
+		size = normalizeImagesResponseSize(opts.RequestSize)
+	}
+	if size == "" && len(wsResult.ImageGenCalls) > 0 {
+		size = normalizeImagesResponseSize(wsResult.ImageGenCalls[0].Size)
+	}
+	background := ""
+	if len(wsResult.ImageGenCalls) > 0 {
+		background = normalizeImagesResponseBackground(wsResult.ImageGenCalls[0].Background)
+	}
+	outputFormat := normalizeImagesResponseOutputFormat(opts.RequestOutputFormat)
+	if outputFormat == "" && len(wsResult.ImageGenCalls) > 0 {
+		outputFormat = normalizeImagesResponseOutputFormat(wsResult.ImageGenCalls[0].OutputFormat)
+	}
+	if outputFormat == "" {
+		outputFormat = "png"
+	}
 	payload := map[string]any{
-		"created": time.Now().Unix(),
-		"data":    data,
+		"created":       time.Now().Unix(),
+		"data":          data,
+		"quality":       normalizeImageQualityDefaultMedium(opts.RequestQuality),
+		"output_format": outputFormat,
 		// root 级 model，供下一级 handleImagesResponse 做 fillCost 查价和 usage 记录。
 		"model": responseModel,
+	}
+	if size != "" {
+		payload["size"] = size
+	}
+	if background != "" {
+		payload["background"] = background
 	}
 	if promptTokens+imageOutputTokens > 0 {
 		payload["usage"] = map[string]any{
@@ -1531,38 +1574,134 @@ func buildImagesRESTResponse(wsResult WSResult, promptTokens, imageOutputTokens 
 	return b
 }
 
-func applyImagesResponseQualityEcho(body []byte, requestQuality string) []byte {
+func normalizeImagesResponseSize(size string) string {
+	width, height, ok := parseImageSize(size)
+	if !ok {
+		return ""
+	}
+	return fmt.Sprintf("%dx%d", width, height)
+}
+
+func normalizeImagesResponseBackground(background string) string {
+	switch strings.ToLower(strings.TrimSpace(background)) {
+	case "transparent":
+		return "transparent"
+	case "opaque":
+		return "opaque"
+	default:
+		return ""
+	}
+}
+
+func normalizeImagesResponseOutputFormat(format string) string {
+	switch strings.ToLower(strings.TrimSpace(format)) {
+	case "png":
+		return "png"
+	case "webp":
+		return "webp"
+	case "jpeg":
+		return "jpeg"
+	default:
+		return ""
+	}
+}
+
+func applyImagesResponseMetadata(body []byte, opts imagesResponseOptions, summary imagesResponseSummary) []byte {
 	if len(body) == 0 {
 		return body
 	}
-	quality := normalizeImageQualityDefaultMedium(requestQuality)
 
 	updated := body
-	changed := false
-	if gjson.GetBytes(updated, "quality").Exists() {
-		next, err := sjson.SetBytes(updated, "quality", quality)
-		if err != nil {
-			return body
-		}
-		updated = next
-		changed = true
-	}
-	data := gjson.GetBytes(updated, "data")
+	data := gjson.GetBytes(body, "data")
 	if data.Exists() && data.IsArray() {
 		for idx, item := range data.Array() {
 			if !item.IsObject() {
 				continue
 			}
-			next, err := sjson.SetBytes(updated, fmt.Sprintf("data.%d.quality", idx), quality)
-			if err != nil {
-				return body
+			for _, field := range []string{"quality", "size", "background", "output_format"} {
+				if !item.Get(field).Exists() {
+					continue
+				}
+				next, err := sjson.DeleteBytes(updated, fmt.Sprintf("data.%d.%s", idx, field))
+				if err != nil {
+					return body
+				}
+				updated = next
 			}
-			updated = next
-			changed = true
 		}
 	}
-	if !changed {
-		next, err := sjson.SetBytes(updated, "quality", quality)
+
+	rootSize := strings.TrimSpace(gjson.GetBytes(body, "size").String())
+	rootBackground := strings.TrimSpace(gjson.GetBytes(body, "background").String())
+	rootOutputFormat := strings.TrimSpace(gjson.GetBytes(body, "output_format").String())
+	firstDataBackground := ""
+	firstDataOutputFormat := ""
+	if data.Exists() && data.IsArray() {
+		for _, item := range data.Array() {
+			if !item.IsObject() {
+				continue
+			}
+			if firstDataBackground == "" {
+				firstDataBackground = item.Get("background").String()
+			}
+			if firstDataOutputFormat == "" {
+				firstDataOutputFormat = item.Get("output_format").String()
+			}
+			if firstDataBackground != "" && firstDataOutputFormat != "" {
+				break
+			}
+		}
+	}
+
+	quality := normalizeImageQualityDefaultMedium(opts.RequestQuality)
+	size := ""
+	if candidate := normalizeImagesResponseSize(summary.BillingSize); candidate != "" {
+		size = candidate
+	} else if candidate := normalizeImagesResponseSize(rootSize); candidate != "" {
+		size = candidate
+	} else if candidate := normalizeImagesResponseSize(opts.RequestSize); candidate != "" {
+		size = candidate
+	}
+	background := ""
+	if candidate := normalizeImagesResponseBackground(rootBackground); candidate != "" {
+		background = candidate
+	} else if candidate := normalizeImagesResponseBackground(firstDataBackground); candidate != "" {
+		background = candidate
+	}
+	outputFormat := ""
+	if candidate := normalizeImagesResponseOutputFormat(opts.RequestOutputFormat); candidate != "" {
+		outputFormat = candidate
+	} else if candidate := normalizeImagesResponseOutputFormat(rootOutputFormat); candidate != "" {
+		outputFormat = candidate
+	} else if candidate := normalizeImagesResponseOutputFormat(firstDataOutputFormat); candidate != "" {
+		outputFormat = candidate
+	} else {
+		outputFormat = "png"
+	}
+
+	for _, field := range []string{"size", "background"} {
+		if (field == "size" && size != "") || (field == "background" && background != "") || !gjson.GetBytes(body, field).Exists() {
+			continue
+		}
+		next, err := sjson.DeleteBytes(updated, field)
+		if err != nil {
+			return body
+		}
+		updated = next
+	}
+	for _, field := range []struct {
+		name  string
+		value string
+	}{
+		{"background", background},
+		{"output_format", outputFormat},
+		{"quality", quality},
+		{"size", size},
+	} {
+		if field.value == "" {
+			continue
+		}
+		next, err := sjson.SetBytes(updated, field.name, field.value)
 		if err != nil {
 			return body
 		}
@@ -1570,6 +1709,72 @@ func applyImagesResponseQualityEcho(body []byte, requestQuality string) []byte {
 	}
 
 	return updated
+}
+
+func applyImagesResponseOutputTokens(body []byte, outputTokens int) []byte {
+	if len(body) == 0 || outputTokens <= 0 {
+		return body
+	}
+	updated := body
+	inputTokens := int(gjson.GetBytes(updated, "usage.input_tokens").Int())
+	if !gjson.GetBytes(updated, "usage.input_tokens").Exists() {
+		var err error
+		updated, err = sjson.SetBytes(updated, "usage.input_tokens", inputTokens)
+		if err != nil {
+			return body
+		}
+	}
+	var err error
+	updated, err = sjson.SetBytes(updated, "usage.output_tokens", outputTokens)
+	if err != nil {
+		return body
+	}
+	updated, err = sjson.SetBytes(updated, "usage.total_tokens", inputTokens+outputTokens)
+	if err != nil {
+		return body
+	}
+	return updated
+}
+
+type imagesResponseSummary struct {
+	NumImages   int
+	BillingSize string
+}
+
+func summarizeImagesResponseForBilling(body []byte, fallbackSize string) imagesResponseSummary {
+	summary := imagesResponseSummary{BillingSize: strings.TrimSpace(fallbackSize)}
+	sizeResolved := false
+	if rootSize := normalizeImagesResponseSize(gjson.GetBytes(body, "size").String()); rootSize != "" {
+		summary.BillingSize = rootSize
+		sizeResolved = true
+	}
+	dataArr := gjson.GetBytes(body, "data")
+	if !dataArr.Exists() || !dataArr.IsArray() {
+		return summary
+	}
+	for _, item := range dataArr.Array() {
+		b64 := item.Get("b64_json").String()
+		if b64 != "" {
+			summary.NumImages++
+		} else if u := item.Get("url").String(); strings.HasPrefix(u, "http://") || strings.HasPrefix(u, "https://") {
+			summary.NumImages++
+		}
+		if sizeResolved {
+			continue
+		}
+		if sz := normalizeImagesResponseSize(item.Get("size").String()); sz != "" {
+			summary.BillingSize = sz
+			sizeResolved = true
+			continue
+		}
+		if b64 != "" {
+			if sz, ok := imageActualSizeFromBase64(b64); ok {
+				summary.BillingSize = sz
+				sizeResolved = true
+			}
+		}
+	}
+	return summary
 }
 
 // buildImagesErrorBody 返回 OpenAI 风格错误 body。
@@ -1606,8 +1811,10 @@ func buildImagesErrorBodyWithCode(status int, code, message string) []byte {
 // usage.input_tokens / usage.output_tokens / usage.input_tokens_details.cached_tokens
 // 与 Responses API 字段同构，parseUsage 已经处理了 cached token 扣减。
 type imagesResponseOptions struct {
-	BillingSize    string
-	RequestQuality string
+	BillingSize         string
+	RequestSize         string
+	RequestQuality      string
+	RequestOutputFormat string
 }
 
 func handleImagesResponse(resp *http.Response, w http.ResponseWriter, sseKA *ssePingKeepAlive, start time.Time, fallbackModel string, options ...imagesResponseOptions) (sdk.ForwardOutcome, error) {
@@ -1636,7 +1843,18 @@ func handleImagesResponseWithLogger(logger *slog.Logger, resp *http.Response, w 
 	if len(options) > 0 {
 		opts = options[0]
 	}
-	body = applyImagesResponseQualityEcho(body, opts.RequestQuality)
+
+	modelName := strings.TrimSpace(gjson.GetBytes(body, "model").String())
+	if modelName == "" {
+		modelName = fallbackModel
+	}
+	if logger == nil {
+		logger = slog.Default()
+	}
+	summary := summarizeImagesResponseForBilling(body, opts.BillingSize)
+	body = applyImagesResponseMetadata(body, opts, summary)
+	imageOutputTokens := calculateGPTImage2OutputTokensForImages(modelName, summary.BillingSize, opts.RequestQuality, summary.NumImages)
+	body = applyImagesResponseOutputTokens(body, imageOutputTokens)
 
 	parsed := parseUsage(body)
 	headers := resp.Header.Clone()
@@ -1655,42 +1873,16 @@ func handleImagesResponseWithLogger(logger *slog.Logger, resp *http.Response, w 
 		_, _ = w.Write(body)
 	}
 
-	modelName := strings.TrimSpace(gjson.GetBytes(body, "model").String())
-	if modelName == "" {
-		modelName = fallbackModel
-	}
-
-	numImages := countUsableImages(body)
-	if logger == nil {
-		logger = slog.Default()
-	}
-	billSize := opts.BillingSize
-	// 与 OAuth 路径对齐：优先从响应体获取真实分辨率用于计费。
-	// 优先级：响应 data[0].size → 解码 base64 图片实际宽高 → 请求 size 兜底。
-	if dataArr := gjson.GetBytes(body, "data"); dataArr.Exists() && dataArr.IsArray() {
-		for _, item := range dataArr.Array() {
-			if sz := strings.TrimSpace(item.Get("size").String()); sz != "" {
-				billSize = sz
-				break
-			}
-			if b64 := item.Get("b64_json").String(); b64 != "" {
-				if sz, ok := imageActualSizeFromBase64(b64); ok {
-					billSize = sz
-					break
-				}
-			}
-		}
-	}
 	logger.Debug("images_native_result_returned",
 		"request_model", fallbackModel,
 		sdk.LogFieldModel, modelName,
-		"num_images", numImages,
-		"billing_size", billSize,
+		"num_images", summary.NumImages,
+		"billing_size", summary.BillingSize,
 	)
 
 	elapsed := time.Since(start)
 	usage := newTokenUsage(modelName, "", parsed.inputTokens, parsed.outputTokens, parsed.cachedInputTokens, 0, elapsed.Milliseconds())
-	fillUsageCostPerImageBySize(usage, numImages, billSize)
+	fillUsageCostPerImageBySize(usage, summary.NumImages, summary.BillingSize)
 
 	outcome := sdk.ForwardOutcome{
 		Kind:     sdk.OutcomeSuccess,

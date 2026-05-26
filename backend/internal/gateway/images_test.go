@@ -259,8 +259,14 @@ func TestHandleImagesResponse_TokenAttribution(t *testing.T) {
 		t.Errorf("writer status = %d, want 200", w.Code)
 	}
 	gotBody, _ := io.ReadAll(w.Result().Body)
-	if got := gjson.GetBytes(gotBody, "data.0.quality").String(); got != "medium" {
+	if got := gjson.GetBytes(gotBody, "quality").String(); got != "medium" {
 		t.Errorf("response quality = %q, want medium", got)
+	}
+	if gjson.GetBytes(gotBody, "data.0.quality").Exists() {
+		t.Errorf("data[0].quality should be omitted")
+	}
+	if got := gjson.GetBytes(gotBody, "size").String(); got != "2048x2048" {
+		t.Errorf("response size = %q, want 2048x2048", got)
 	}
 }
 
@@ -319,9 +325,20 @@ func TestHandleImagesResponse_StreamWrapsRESTJSONAsSSE(t *testing.T) {
 		t.Fatalf("writer Content-Type = %q, want text/event-stream", got)
 	}
 	gotBody := w.Body.String()
-	wantBody := "data: {\"created\":1713833628,\"data\":[{\"b64_json\":\"iVBORw0\",\"quality\":\"medium\"}],\"usage\":{\"input_tokens\":1,\"output_tokens\":2}}\n\ndata: [DONE]\n\n"
-	if gotBody != wantBody {
-		t.Fatalf("writer body = %q, want %q", gotBody, wantBody)
+	const prefix = "data: "
+	const suffix = "\n\ndata: [DONE]\n\n"
+	if !strings.HasPrefix(gotBody, prefix) || !strings.HasSuffix(gotBody, suffix) {
+		t.Fatalf("writer body = %q, want REST JSON event and DONE", gotBody)
+	}
+	eventBody := strings.TrimSuffix(strings.TrimPrefix(gotBody, prefix), suffix)
+	if got := gjson.Get(eventBody, "quality").String(); got != "medium" {
+		t.Fatalf("event quality = %q, want medium", got)
+	}
+	if gjson.Get(eventBody, "data.0.quality").Exists() {
+		t.Fatalf("event data[0].quality should be omitted")
+	}
+	if got := gjson.Get(eventBody, "output_format").String(); got != "png" {
+		t.Fatalf("event output_format = %q, want png", got)
 	}
 }
 
@@ -357,8 +374,14 @@ func TestHandleImagesResponse_NonStreamReturnsBodyWithoutWriter(t *testing.T) {
 	if err != nil {
 		t.Fatalf("handleImagesResponse returned err: %v", err)
 	}
-	if got := gjson.GetBytes(outcome.Upstream.Body, "data.0.quality").String(); got != "medium" {
-		t.Fatalf("Upstream.Body data[0].quality = %q, want medium", got)
+	if got := gjson.GetBytes(outcome.Upstream.Body, "quality").String(); got != "medium" {
+		t.Fatalf("Upstream.Body quality = %q, want medium", got)
+	}
+	if gjson.GetBytes(outcome.Upstream.Body, "data.0.quality").Exists() {
+		t.Fatalf("Upstream.Body data[0].quality should be omitted")
+	}
+	if gjson.GetBytes(outcome.Upstream.Body, "background").Exists() {
+		t.Fatalf("Upstream.Body background should be omitted when upstream did not return it")
 	}
 	if got := outcome.Upstream.Headers.Get("Content-Type"); got != "application/json" {
 		t.Fatalf("Content-Type = %q, want application/json", got)
@@ -391,9 +414,12 @@ func TestHandleImagesResponse_RequestQualityOverridesResponseEcho(t *testing.T) 
 	data := got["data"].([]any)
 	for i, item := range data {
 		obj := item.(map[string]any)
-		if obj["quality"] != "high" {
-			t.Fatalf("data[%d].quality = %v, want high", i, obj["quality"])
+		if _, ok := obj["quality"]; ok {
+			t.Fatalf("data[%d].quality should be omitted", i)
 		}
+	}
+	if got["output_format"] != "png" {
+		t.Fatalf("root output_format = %v, want png", got["output_format"])
 	}
 	if got, want := outcome.Upstream.Headers.Get("Content-Length"), fmt.Sprint(len(outcome.Upstream.Body)); got != want {
 		t.Fatalf("Content-Length = %q, want rewritten length %q", got, want)
@@ -415,8 +441,8 @@ func TestHandleImagesResponse_DefaultQualityEchoesMedium(t *testing.T) {
 	if got := gjson.GetBytes(outcome.Upstream.Body, "quality").String(); got != "medium" {
 		t.Fatalf("root quality = %q, want medium", got)
 	}
-	if got := gjson.GetBytes(outcome.Upstream.Body, "data.0.quality").String(); got != "medium" {
-		t.Fatalf("data[0].quality = %q, want medium", got)
+	if gjson.GetBytes(outcome.Upstream.Body, "data.0.quality").Exists() {
+		t.Fatalf("data[0].quality should be omitted")
 	}
 }
 
@@ -435,8 +461,40 @@ func TestHandleImagesResponse_AutoQualityEchoesMedium(t *testing.T) {
 	if got := gjson.GetBytes(outcome.Upstream.Body, "quality").String(); got != "medium" {
 		t.Fatalf("root quality = %q, want medium", got)
 	}
-	if got := gjson.GetBytes(outcome.Upstream.Body, "data.0.quality").String(); got != "medium" {
-		t.Fatalf("data[0].quality = %q, want medium", got)
+	if gjson.GetBytes(outcome.Upstream.Body, "data.0.quality").Exists() {
+		t.Fatalf("data[0].quality should be omitted")
+	}
+}
+
+func TestHandleImagesResponse_GPTImage2AddsCalculatedOutputTokens(t *testing.T) {
+	body := `{"data":[{"url":"https://example/a.png"}]}`
+	resp := &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": []string{"application/json"}},
+		Body:       ioNopCloserFromString(body),
+	}
+
+	outcome, err := handleImagesResponse(resp, nil, nil, time.Now(), "gpt-image-2", imagesResponseOptions{
+		BillingSize:    "3840x2160",
+		RequestQuality: "high",
+	})
+	if err != nil {
+		t.Fatalf("handleImagesResponse returned err: %v", err)
+	}
+	if got := int(gjson.GetBytes(outcome.Upstream.Body, "usage.output_tokens").Int()); got != 13342 {
+		t.Fatalf("response usage.output_tokens = %d, want 13342", got)
+	}
+	if got := int(gjson.GetBytes(outcome.Upstream.Body, "usage.total_tokens").Int()); got != 13342 {
+		t.Fatalf("response usage.total_tokens = %d, want 13342", got)
+	}
+	if got := usageMetricInt(outcome.Usage, usageMetricOutputTokens); got != 13342 {
+		t.Fatalf("Outcome output_tokens = %d, want 13342", got)
+	}
+	if got := gjson.GetBytes(outcome.Upstream.Body, "quality").String(); got != "high" {
+		t.Fatalf("response quality = %q, want high", got)
+	}
+	if got := gjson.GetBytes(outcome.Upstream.Body, "size").String(); got != "3840x2160" {
+		t.Fatalf("response size = %q, want 3840x2160", got)
 	}
 }
 
@@ -458,8 +516,11 @@ func TestHandleImagesResponse_FallbackModelWhenBodyLacksModel(t *testing.T) {
 		t.Fatalf("Usage.Model = %q, want gpt-image-1 (fallback)", outcome.Usage.Model)
 	}
 	// Writer 为 nil 时 Upstream.Body/Headers 应带回给 core
-	if got := gjson.GetBytes(outcome.Upstream.Body, "data.0.quality").String(); got != "medium" {
-		t.Errorf("Upstream.Body data[0].quality = %q, want medium", got)
+	if got := gjson.GetBytes(outcome.Upstream.Body, "quality").String(); got != "medium" {
+		t.Errorf("Upstream.Body quality = %q, want medium", got)
+	}
+	if gjson.GetBytes(outcome.Upstream.Body, "data.0.quality").Exists() {
+		t.Errorf("Upstream.Body data[0].quality should be omitted")
 	}
 	if outcome.Upstream.Headers.Get("Content-Type") != "application/json" {
 		t.Errorf("Upstream.Headers Content-Type not preserved")
@@ -1423,11 +1484,14 @@ func TestImagesResponseOptionsFromMultipartDoesNotParseImagePart(t *testing.T) {
 	_, _ = w.Write(bytes.Repeat([]byte{0x01, 0x02, 0x03, 0x04}, 1024))
 	_ = mw.WriteField("quality", "high")
 	_ = mw.WriteField("size", "2048x2048")
+	_ = mw.WriteField("background", "opaque")
+	_ = mw.WriteField("output_format", "webp")
 	_ = mw.Close()
 
 	opts := imagesResponseOptionsFromRequestBody(buf.Bytes(), mw.FormDataContentType(), true)
-	if opts.RequestQuality != "high" || opts.BillingSize != "2048x2048" {
-		t.Fatalf("options = %+v, want quality high and size 2048x2048", opts)
+	if opts.RequestQuality != "high" || opts.BillingSize != "2048x2048" ||
+		opts.RequestOutputFormat != "webp" {
+		t.Fatalf("options = %+v, want scalar response options", opts)
 	}
 }
 
@@ -1508,13 +1572,17 @@ func TestBuildImagesRESTResponse(t *testing.T) {
 		ToolImageOutputTokens: 4160,
 		ToolImageModel:        "gpt-image-2",
 		ImageGenCalls: []ImageGenCall{
-			{Result: "PNG_BASE64_A", RevisedPrompt: "revised a"},
+			{Result: "PNG_BASE64_A", Background: "opaque", RevisedPrompt: "revised a"},
 			{Result: "PNG_BASE64_B"},
 		},
 	}
 	promptTokens := 12
 	imageOut := 4160
-	body := buildImagesRESTResponse(ws, promptTokens, imageOut, imageGenerationBillingModel(ws.ToolImageModel, "dall-e-3"))
+	body := buildImagesRESTResponse(ws, promptTokens, imageOut, imageGenerationBillingModel(ws.ToolImageModel, "dall-e-3"), imagesResponseOptions{
+		BillingSize:         "1024x1024",
+		RequestQuality:      "high",
+		RequestOutputFormat: "webp",
+	})
 
 	var got map[string]any
 	if err := json.Unmarshal(body, &got); err != nil {
@@ -1523,6 +1591,18 @@ func TestBuildImagesRESTResponse(t *testing.T) {
 	if got["model"] != "gpt-image-2" {
 		t.Errorf("root model = %v, want gpt-image-2", got["model"])
 	}
+	if got["quality"] != "high" {
+		t.Errorf("root quality = %v, want high", got["quality"])
+	}
+	if got["size"] != "1024x1024" {
+		t.Errorf("root size = %v, want 1024x1024", got["size"])
+	}
+	if got["background"] != "opaque" {
+		t.Errorf("root background = %v, want opaque", got["background"])
+	}
+	if got["output_format"] != "webp" {
+		t.Errorf("root output_format = %v, want webp", got["output_format"])
+	}
 	data, _ := got["data"].([]any)
 	if len(data) != 2 {
 		t.Fatalf("data len = %d, want 2", len(data))
@@ -1530,6 +1610,9 @@ func TestBuildImagesRESTResponse(t *testing.T) {
 	first, _ := data[0].(map[string]any)
 	if first["b64_json"] != "PNG_BASE64_A" || first["revised_prompt"] != "revised a" {
 		t.Errorf("data[0] fields wrong: %+v", first)
+	}
+	if _, ok := first["quality"]; ok {
+		t.Errorf("data[0].quality should be omitted")
 	}
 	second, _ := data[1].(map[string]any)
 	if second["b64_json"] != "PNG_BASE64_B" {
@@ -1555,26 +1638,31 @@ func TestBuildImagesRESTResponse(t *testing.T) {
 
 func TestBuildImagesRESTResponse_QualityEchoPrefersRequest(t *testing.T) {
 	ws := WSResult{ImageGenCalls: []ImageGenCall{{Result: "PNG_BASE64", Quality: "low"}}}
-	body := buildImagesRESTResponse(ws, 1, 2, "gpt-image-2", "high")
+	body := buildImagesRESTResponse(ws, 1, 2, "gpt-image-2", imagesResponseOptions{RequestQuality: "high"})
 
-	data := gjson.GetBytes(body, "data.0")
-	if got := data.Get("quality").String(); got != "high" {
-		t.Fatalf("data[0].quality = %q, want high", got)
+	if got := gjson.GetBytes(body, "quality").String(); got != "high" {
+		t.Fatalf("root quality = %q, want high", got)
+	}
+	if gjson.GetBytes(body, "data.0.quality").Exists() {
+		t.Fatalf("data[0].quality should be omitted")
+	}
+	if gjson.GetBytes(body, "background").Exists() {
+		t.Fatalf("root background should be omitted when upstream did not return it")
 	}
 
 	body = buildImagesRESTResponse(ws, 1, 2, "gpt-image-2")
-	if got := gjson.GetBytes(body, "data.0.quality").String(); got != "low" {
-		t.Fatalf("data[0].quality without request = %q, want upstream low", got)
+	if got := gjson.GetBytes(body, "quality").String(); got != "medium" {
+		t.Fatalf("root quality without request = %q, want medium", got)
 	}
 
-	body = buildImagesRESTResponse(ws, 1, 2, "gpt-image-2", "")
-	if got := gjson.GetBytes(body, "data.0.quality").String(); got != "medium" {
-		t.Fatalf("data[0].quality with default request = %q, want medium", got)
+	body = buildImagesRESTResponse(ws, 1, 2, "gpt-image-2", imagesResponseOptions{RequestQuality: ""})
+	if got := gjson.GetBytes(body, "quality").String(); got != "medium" {
+		t.Fatalf("root quality with default request = %q, want medium", got)
 	}
 
-	body = buildImagesRESTResponse(ws, 1, 2, "gpt-image-2", "auto")
-	if got := gjson.GetBytes(body, "data.0.quality").String(); got != "medium" {
-		t.Fatalf("data[0].quality with auto request = %q, want medium", got)
+	body = buildImagesRESTResponse(ws, 1, 2, "gpt-image-2", imagesResponseOptions{RequestQuality: "auto"})
+	if got := gjson.GetBytes(body, "quality").String(); got != "medium" {
+		t.Fatalf("root quality with auto request = %q, want medium", got)
 	}
 }
 

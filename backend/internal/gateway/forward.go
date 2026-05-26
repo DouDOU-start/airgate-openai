@@ -255,7 +255,9 @@ func (g *OpenAIGateway) forwardAPIKey(ctx context.Context, req *sdk.ForwardReque
 		req.Headers.Set("Content-Type", contentType)
 		if parsed != nil {
 			imagesRespOpts.BillingSize = parsed.Size
+			imagesRespOpts.RequestSize = parsed.Size
 			imagesRespOpts.RequestQuality = normalizeImageQualityDefaultMedium(parsed.Quality)
+			imagesRespOpts.RequestOutputFormat = parsed.OutputFormat
 		}
 	} else if isImageReq && len(req.Body) > 0 && !isMultipart {
 		if patched, err := sjson.DeleteBytes(req.Body, "stream"); err == nil {
