@@ -91,6 +91,14 @@ func lookupImageGenOutputTokens(size, quality string) int {
 	return 1056
 }
 
+func normalizeImageQualityDefaultMedium(quality string) string {
+	q := strings.TrimSpace(quality)
+	if q == "" || strings.EqualFold(q, "auto") {
+		return "medium"
+	}
+	return q
+}
+
 // estimateImageGenOutputTokens 汇总所有 image_generation_call 的估算 token 数。
 func estimateImageGenOutputTokens(calls []ImageGenCall) int {
 	total := 0
@@ -374,12 +382,12 @@ func imagesResponseOptionsFromRequestBody(body []byte, contentType string, isEdi
 		fields := extractMultipartScalarFields(body, contentType, "size", "quality")
 		return imagesResponseOptions{
 			BillingSize:    fields["size"],
-			RequestQuality: fields["quality"],
+			RequestQuality: normalizeImageQualityDefaultMedium(fields["quality"]),
 		}
 	}
 	return imagesResponseOptions{
 		BillingSize:    strings.TrimSpace(gjson.GetBytes(body, "size").String()),
-		RequestQuality: strings.TrimSpace(gjson.GetBytes(body, "quality").String()),
+		RequestQuality: normalizeImageQualityDefaultMedium(gjson.GetBytes(body, "quality").String()),
 	}
 }
 
@@ -1087,6 +1095,7 @@ func buildImagesToolCreateMsg(
 	if err != nil {
 		return nil, 0, 0, err
 	}
+	req.Quality = normalizeImageQualityDefaultMedium(req.Quality)
 	// Responses API 的 image_generation tool 每次仅生成 1 张；n>1 在 REST 侧的语义
 	// 需要多轮工具调用才能模拟，暂不支持 —— V1 限定 n=1。
 	if req.N > 1 {
@@ -1125,9 +1134,7 @@ func buildImagesToolCreateMsg(
 	if size := normalizeImageSizeForUpstream(req.Size); size != "" && !strings.EqualFold(size, "auto") {
 		tool["size"] = size
 	}
-	if quality := strings.TrimSpace(req.Quality); quality != "" {
-		tool["quality"] = quality
-	}
+	tool["quality"] = req.Quality
 	if background := strings.TrimSpace(req.Background); background != "" {
 		tool["background"] = background
 	}
@@ -1479,7 +1486,7 @@ func buildImagesRESTResponse(wsResult WSResult, promptTokens, imageOutputTokens 
 	}
 	echoQuality := ""
 	if len(requestQuality) > 0 {
-		echoQuality = strings.TrimSpace(requestQuality[0])
+		echoQuality = normalizeImageQualityDefaultMedium(requestQuality[0])
 	}
 	data := make([]map[string]any, 0, len(wsResult.ImageGenCalls))
 	for _, call := range wsResult.ImageGenCalls {
@@ -1525,10 +1532,10 @@ func buildImagesRESTResponse(wsResult WSResult, promptTokens, imageOutputTokens 
 }
 
 func applyImagesResponseQualityEcho(body []byte, requestQuality string) []byte {
-	quality := strings.TrimSpace(requestQuality)
-	if quality == "" || len(body) == 0 {
+	if len(body) == 0 {
 		return body
 	}
+	quality := normalizeImageQualityDefaultMedium(requestQuality)
 
 	updated := body
 	changed := false

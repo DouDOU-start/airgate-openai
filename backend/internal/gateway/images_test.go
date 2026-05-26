@@ -259,8 +259,8 @@ func TestHandleImagesResponse_TokenAttribution(t *testing.T) {
 		t.Errorf("writer status = %d, want 200", w.Code)
 	}
 	gotBody, _ := io.ReadAll(w.Result().Body)
-	if len(gotBody) != len(body) {
-		t.Errorf("response body len = %d, want %d", len(gotBody), len(body))
+	if got := gjson.GetBytes(gotBody, "data.0.quality").String(); got != "medium" {
+		t.Errorf("response quality = %q, want medium", got)
 	}
 }
 
@@ -319,7 +319,7 @@ func TestHandleImagesResponse_StreamWrapsRESTJSONAsSSE(t *testing.T) {
 		t.Fatalf("writer Content-Type = %q, want text/event-stream", got)
 	}
 	gotBody := w.Body.String()
-	wantBody := "data: " + body + "\n\ndata: [DONE]\n\n"
+	wantBody := "data: {\"created\":1713833628,\"data\":[{\"b64_json\":\"iVBORw0\",\"quality\":\"medium\"}],\"usage\":{\"input_tokens\":1,\"output_tokens\":2}}\n\ndata: [DONE]\n\n"
 	if gotBody != wantBody {
 		t.Fatalf("writer body = %q, want %q", gotBody, wantBody)
 	}
@@ -357,8 +357,8 @@ func TestHandleImagesResponse_NonStreamReturnsBodyWithoutWriter(t *testing.T) {
 	if err != nil {
 		t.Fatalf("handleImagesResponse returned err: %v", err)
 	}
-	if len(outcome.Upstream.Body) != len(body) {
-		t.Fatalf("Upstream.Body len = %d, want %d", len(outcome.Upstream.Body), len(body))
+	if got := gjson.GetBytes(outcome.Upstream.Body, "data.0.quality").String(); got != "medium" {
+		t.Fatalf("Upstream.Body data[0].quality = %q, want medium", got)
 	}
 	if got := outcome.Upstream.Headers.Get("Content-Type"); got != "application/json" {
 		t.Fatalf("Content-Type = %q, want application/json", got)
@@ -400,7 +400,7 @@ func TestHandleImagesResponse_RequestQualityOverridesResponseEcho(t *testing.T) 
 	}
 }
 
-func TestHandleImagesResponse_NoRequestQualityPreservesResponseEcho(t *testing.T) {
+func TestHandleImagesResponse_DefaultQualityEchoesMedium(t *testing.T) {
 	body := `{"quality":"low","data":[{"url":"https://example/a.png","quality":"low"}],"usage":{"input_tokens":10,"output_tokens":100}}`
 	resp := &http.Response{
 		StatusCode: http.StatusOK,
@@ -412,8 +412,31 @@ func TestHandleImagesResponse_NoRequestQualityPreservesResponseEcho(t *testing.T
 	if err != nil {
 		t.Fatalf("handleImagesResponse returned err: %v", err)
 	}
-	if got := string(outcome.Upstream.Body); got != body {
-		t.Fatalf("response body = %s, want original %s", got, body)
+	if got := gjson.GetBytes(outcome.Upstream.Body, "quality").String(); got != "medium" {
+		t.Fatalf("root quality = %q, want medium", got)
+	}
+	if got := gjson.GetBytes(outcome.Upstream.Body, "data.0.quality").String(); got != "medium" {
+		t.Fatalf("data[0].quality = %q, want medium", got)
+	}
+}
+
+func TestHandleImagesResponse_AutoQualityEchoesMedium(t *testing.T) {
+	body := `{"quality":"low","data":[{"url":"https://example/a.png","quality":"low"}],"usage":{"input_tokens":10,"output_tokens":100}}`
+	resp := &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": []string{"application/json"}},
+		Body:       ioNopCloserFromString(body),
+	}
+
+	outcome, err := handleImagesResponse(resp, nil, nil, time.Now(), "gpt-image-2", imagesResponseOptions{RequestQuality: "auto"})
+	if err != nil {
+		t.Fatalf("handleImagesResponse returned err: %v", err)
+	}
+	if got := gjson.GetBytes(outcome.Upstream.Body, "quality").String(); got != "medium" {
+		t.Fatalf("root quality = %q, want medium", got)
+	}
+	if got := gjson.GetBytes(outcome.Upstream.Body, "data.0.quality").String(); got != "medium" {
+		t.Fatalf("data[0].quality = %q, want medium", got)
 	}
 }
 
@@ -435,8 +458,8 @@ func TestHandleImagesResponse_FallbackModelWhenBodyLacksModel(t *testing.T) {
 		t.Fatalf("Usage.Model = %q, want gpt-image-1 (fallback)", outcome.Usage.Model)
 	}
 	// Writer 为 nil 时 Upstream.Body/Headers 应带回给 core
-	if len(outcome.Upstream.Body) != len(body) {
-		t.Errorf("Upstream.Body len = %d, want %d", len(outcome.Upstream.Body), len(body))
+	if got := gjson.GetBytes(outcome.Upstream.Body, "data.0.quality").String(); got != "medium" {
+		t.Errorf("Upstream.Body data[0].quality = %q, want medium", got)
 	}
 	if outcome.Upstream.Headers.Get("Content-Type") != "application/json" {
 		t.Errorf("Upstream.Headers Content-Type not preserved")
@@ -959,6 +982,9 @@ func TestBuildImagesToolCreateMsg_ClampsOversizedSize(t *testing.T) {
 	if got := gjson.GetBytes(msg, "tools.0.size").String(); got != "3840x2160" {
 		t.Errorf("tools[0].size = %q, want clamped 3840x2160", got)
 	}
+	if got := gjson.GetBytes(msg, "tools.0.quality").String(); got != "medium" {
+		t.Errorf("tools[0].quality = %q, want medium", got)
+	}
 }
 
 // TestBuildImagesToolCreateMsg_NGreaterThanOne V1 不支持 n>1，应直接返错。
@@ -1405,6 +1431,28 @@ func TestImagesResponseOptionsFromMultipartDoesNotParseImagePart(t *testing.T) {
 	}
 }
 
+func TestImagesResponseOptionsDefaultAndAutoQualityUseMedium(t *testing.T) {
+	opts := imagesResponseOptionsFromRequestBody([]byte(`{"prompt":"x"}`), "application/json", false)
+	if opts.RequestQuality != "medium" {
+		t.Fatalf("default JSON quality = %q, want medium", opts.RequestQuality)
+	}
+
+	opts = imagesResponseOptionsFromRequestBody([]byte(`{"prompt":"x","quality":"auto"}`), "application/json", false)
+	if opts.RequestQuality != "medium" {
+		t.Fatalf("auto JSON quality = %q, want medium", opts.RequestQuality)
+	}
+
+	var buf bytes.Buffer
+	mw := multipart.NewWriter(&buf)
+	_ = mw.WriteField("prompt", "x")
+	_ = mw.WriteField("quality", "auto")
+	_ = mw.Close()
+	opts = imagesResponseOptionsFromRequestBody(buf.Bytes(), mw.FormDataContentType(), true)
+	if opts.RequestQuality != "medium" {
+		t.Fatalf("auto multipart quality = %q, want medium", opts.RequestQuality)
+	}
+}
+
 func TestNormalizeImageRef(t *testing.T) {
 	cases := map[string]string{
 		"data:image/png;base64,AAA=":     "data:image/png;base64,AAA=",
@@ -1517,6 +1565,16 @@ func TestBuildImagesRESTResponse_QualityEchoPrefersRequest(t *testing.T) {
 	body = buildImagesRESTResponse(ws, 1, 2, "gpt-image-2")
 	if got := gjson.GetBytes(body, "data.0.quality").String(); got != "low" {
 		t.Fatalf("data[0].quality without request = %q, want upstream low", got)
+	}
+
+	body = buildImagesRESTResponse(ws, 1, 2, "gpt-image-2", "")
+	if got := gjson.GetBytes(body, "data.0.quality").String(); got != "medium" {
+		t.Fatalf("data[0].quality with default request = %q, want medium", got)
+	}
+
+	body = buildImagesRESTResponse(ws, 1, 2, "gpt-image-2", "auto")
+	if got := gjson.GetBytes(body, "data.0.quality").String(); got != "medium" {
+		t.Fatalf("data[0].quality with auto request = %q, want medium", got)
 	}
 }
 
