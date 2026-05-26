@@ -237,6 +237,7 @@ func (g *OpenAIGateway) forwardImagesViaWebReverse(ctx context.Context, req *sdk
 
 	elapsed := time.Since(start)
 	usage := newTokenUsage(imagesWebReverseModel, "", inputEstimate.Total(), 0, 0, 0, elapsed.Milliseconds())
+	setUsageInputTokenDetails(usage, inputEstimate.TextTokens, inputEstimate.ImageTokens)
 	// Web 逆向上游不返 size 字段，直接解码生成的 PNG header 拿真实宽高（O(1)）。
 	// 解码失败 fallback 到请求 size（auto/空时 imagePriceForSize 兜底 1K）。
 	billingSize := imgReq.Size

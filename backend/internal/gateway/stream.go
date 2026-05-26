@@ -804,6 +804,8 @@ func parseSSEFailureEvent(data []byte) error {
 // openaiUsage 非流式响应的 usage 解析结果
 type openaiUsage struct {
 	inputTokens           int
+	textInputTokens       int
+	imageInputTokens      int
 	outputTokens          int
 	cachedInputTokens     int
 	reasoningOutputTokens int
@@ -831,6 +833,17 @@ func parseUsage(body []byte) openaiUsage {
 	}
 	if usage.outputTokens == 0 {
 		usage.outputTokens = int(usageNode.Get("completion_tokens").Int())
+	}
+	rawInputTokens := usage.inputTokens
+	textNode := usageNode.Get("input_tokens_details.text_tokens")
+	imageNode := usageNode.Get("input_tokens_details.image_tokens")
+	if imageNode.Exists() {
+		usage.imageInputTokens = int(imageNode.Int())
+	}
+	if textNode.Exists() {
+		usage.textInputTokens = int(textNode.Int())
+	} else if usage.imageInputTokens > 0 && rawInputTokens >= usage.imageInputTokens {
+		usage.textInputTokens = rawInputTokens - usage.imageInputTokens
 	}
 
 	// 仅提取 cache read（缓存命中）token，不含 cache creation

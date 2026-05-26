@@ -189,6 +189,16 @@ function outputTokenValue(reasoningTokens: number, outputTokens: number) {
   );
 }
 
+function inputTokenValue(textInputTokens: number, imageInputTokens: number, inputTokens: number) {
+  if (imageInputTokens <= 0) return formatNumber(inputTokens);
+  return (
+    <span style={inlineValueStyle}>
+      <span style={inlineValueMetaStyle}>(文字 {formatNumber(textInputTokens)})</span>
+      <span style={inlineValueNumberStyle}>{formatNumber(inputTokens)}</span>
+    </span>
+  );
+}
+
 export function UsageMetricDetail({ context }: UsageRecordSurfaceProps) {
   const record = recordFromContext(context);
   const attributes = contextArray<UsageAttribute>(context, 'usageAttributes', 'usage_attributes');
@@ -202,6 +212,9 @@ export function UsageMetricDetail({ context }: UsageRecordSurfaceProps) {
   const outputTokens = metricValue(metrics, ['output_tokens', 'output_token', 'completion_tokens', 'completion_token']) || record.output_tokens || 0;
   const cachedInputTokens = metricValue(metrics, ['cached_input_tokens', 'cached_input_token', 'cache_read_tokens', 'cache_read_token']) || record.cached_input_tokens || 0;
   const reasoningTokens = metricValue(metrics, ['reasoning_output_tokens', 'reasoning_tokens', 'reasoning_token']) || record.reasoning_output_tokens || 0;
+  const imageInputTokens = metricValue(metrics, ['input_image_tokens', 'image_input_tokens', 'image_tokens']);
+  const rawTextInputTokens = metricValue(metrics, ['input_text_tokens', 'text_input_tokens', 'text_tokens']);
+  const textInputTokens = rawTextInputTokens || (imageInputTokens > 0 && inputTokens >= imageInputTokens ? inputTokens - imageInputTokens : 0);
   const images = metricValue(metrics, ['images', 'image', 'image_generation']);
   const totalTokens = metricValue(metrics, ['total_tokens', 'total_token']) || inputTokens + outputTokens + cachedInputTokens;
 
@@ -220,7 +233,7 @@ export function UsageMetricDetail({ context }: UsageRecordSurfaceProps) {
       ) : null}
       <div style={bodyStyle}>
         {images > 0 ? <Row label="图片数量" value={formatNumber(images)} tone="var(--ag-success)" /> : null}
-        <Row label="输入 Token" value={formatNumber(inputTokens)} tone="var(--ag-info)" />
+        <Row label="输入 Token" value={inputTokenValue(textInputTokens, imageInputTokens, inputTokens)} tone="var(--ag-info)" />
         <Row label="输出 Token" value={outputTokenValue(reasoningTokens, outputTokens)} tone="var(--ag-primary)" />
         {cachedInputTokens > 0 ? <Row label="缓存读取 Token" value={formatNumber(cachedInputTokens)} tone="var(--ag-success)" /> : null}
         <Row label="总 Token" value={formatNumber(totalTokens)} tone="var(--ag-text)" />

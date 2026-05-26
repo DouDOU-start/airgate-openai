@@ -1685,6 +1685,7 @@ func (g *OpenAIGateway) forwardImagesViaResponsesTool(ctx context.Context, req *
 
 	// 图片尺寸作为通用 UsageAttribute 入库，后台费用明细可用它解释 1K/2K/4K 分档。
 	setUsageTokens(usage, inputTokens, imageOutputTokens, 0, 0)
+	setUsageInputTokenDetails(usage, inputEstimate.TextTokens, inputEstimate.ImageTokens)
 	fillUsageCostPerImageBySize(usage, numImages, billingSize)
 	return outcome, nil
 }
@@ -2116,6 +2117,7 @@ func handleImagesResponseWithLogger(logger *slog.Logger, resp *http.Response, w 
 
 	elapsed := time.Since(start)
 	usage := newTokenUsage(modelName, "", parsed.inputTokens, parsed.outputTokens, parsed.cachedInputTokens, 0, elapsed.Milliseconds())
+	setUsageInputTokenDetails(usage, parsed.textInputTokens, parsed.imageInputTokens)
 	fillUsageCostPerImageBySize(usage, summary.NumImages, summary.BillingSize)
 
 	outcome := sdk.ForwardOutcome{

@@ -24,6 +24,8 @@ const (
 	usageAttrImageSize   = "image_size"
 
 	usageMetricInputTokens           = "input_tokens"
+	usageMetricTextInputTokens       = "input_text_tokens"
+	usageMetricImageInputTokens      = "input_image_tokens"
 	usageMetricCachedInputTokens     = "cached_input_tokens"
 	usageMetricOutputTokens          = "output_tokens"
 	usageMetricReasoningOutputTokens = "reasoning_output_tokens"
@@ -218,6 +220,26 @@ func setUsageTokens(usage *sdk.Usage, inputTokens, outputTokens, cachedInputToke
 		Kind:  "token",
 		Unit:  "token",
 		Value: float64(inputTokens + cachedInputTokens + outputTokens),
+	})
+}
+
+func setUsageInputTokenDetails(usage *sdk.Usage, textInputTokens, imageInputTokens int) {
+	if usage == nil || textInputTokens+imageInputTokens <= 0 {
+		return
+	}
+	setUsageMetric(usage, sdk.UsageMetric{
+		Key:   usageMetricTextInputTokens,
+		Label: "文字输入 Token",
+		Kind:  "token",
+		Unit:  "token",
+		Value: float64(textInputTokens),
+	})
+	setUsageMetric(usage, sdk.UsageMetric{
+		Key:   usageMetricImageInputTokens,
+		Label: "图片输入 Token",
+		Kind:  "token",
+		Unit:  "token",
+		Value: float64(imageInputTokens),
 	})
 }
 

@@ -539,6 +539,12 @@ func TestHandleImagesResponse_GPTImage2AddsCalculatedInputImageTokens(t *testing
 	if got := usageMetricInt(outcome.Usage, usageMetricInputTokens); got != 7029 {
 		t.Fatalf("Outcome input_tokens = %d, want 7029", got)
 	}
+	if got := usageMetricInt(outcome.Usage, usageMetricTextInputTokens); got != 5 {
+		t.Fatalf("Outcome input_text_tokens = %d, want 5", got)
+	}
+	if got := usageMetricInt(outcome.Usage, usageMetricImageInputTokens); got != 7024 {
+		t.Fatalf("Outcome input_image_tokens = %d, want 7024", got)
+	}
 	if got := usageMetricInt(outcome.Usage, usageMetricOutputTokens); got != 14272 {
 		t.Fatalf("Outcome output_tokens = %d, want 14272", got)
 	}
@@ -718,6 +724,29 @@ func TestParseUsage_ToolImageGen(t *testing.T) {
 	}
 	if got.toolImageOutputTokens != 4160 {
 		t.Errorf("toolImageOutputTokens = %d, want 4160", got.toolImageOutputTokens)
+	}
+}
+
+func TestParseUsage_InputTokenDetails(t *testing.T) {
+	body := []byte(`{
+		"usage": {
+			"input_tokens": 23342,
+			"output_tokens": 50,
+			"input_tokens_details": {
+				"text_tokens": 42,
+				"image_tokens": 23300
+			}
+		}
+	}`)
+	got := parseUsage(body)
+	if got.inputTokens != 23342 {
+		t.Fatalf("inputTokens = %d, want 23342", got.inputTokens)
+	}
+	if got.textInputTokens != 42 {
+		t.Fatalf("textInputTokens = %d, want 42", got.textInputTokens)
+	}
+	if got.imageInputTokens != 23300 {
+		t.Fatalf("imageInputTokens = %d, want 23300", got.imageInputTokens)
 	}
 }
 
