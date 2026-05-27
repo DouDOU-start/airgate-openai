@@ -110,6 +110,13 @@ func TestClassifyHTTPFailureKeepsDisabled403AsAccountDead(t *testing.T) {
 	}
 }
 
+func TestClassifyHTTPFailureTreatsPlain403AsAccountUnavailable(t *testing.T) {
+	got := classifyHTTPFailure(403, "访问被拒绝，账号可能已被禁用或无权限 (HTTP 403)")
+	if got != sdk.OutcomeAccountUnavailable {
+		t.Fatalf("expected AccountUnavailable, got %v", got)
+	}
+}
+
 func TestClassifyHTTPFailureTreatsDisabled400AsAccountDead(t *testing.T) {
 	got := classifyHTTPFailure(400, "Organization disabled due to policy violation")
 	if got != sdk.OutcomeAccountDead {

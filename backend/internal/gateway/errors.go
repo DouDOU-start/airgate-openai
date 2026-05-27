@@ -20,7 +20,8 @@ import (
 // 返回的 Kind 决定 Core 如何处置账号：
 //
 //	429 → AccountRateLimited
-//	401 / 403 → AccountDead（附加消息关键词检查"usage limit" / "rate limit" 等会降级为 RateLimited）
+//	401 → AccountDead
+//	403 → AccountUnavailable（明确 disabled/deactivated/suspended 仍升级为 AccountDead）
 //	400 + 消息含限流关键词 → AccountRateLimited（部分上游用 400 返回 usage_limit_reached）
 //	400 + 消息含 disabled/deactivated → AccountDead
 //	5xx → UpstreamTransient
@@ -35,8 +36,10 @@ func classifyHTTPFailure(statusCode int, message string) sdk.OutcomeKind {
 	switch statusCode {
 	case 429:
 		return sdk.OutcomeAccountRateLimited
-	case 401, 403:
+	case 401:
 		return sdk.OutcomeAccountDead
+	case 403:
+		return sdk.OutcomeAccountUnavailable
 	}
 	if statusCode >= 500 {
 		return sdk.OutcomeUpstreamTransient
