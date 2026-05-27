@@ -114,21 +114,15 @@ func newTokenUsage(modelID, serviceTier string, inputTokens, outputTokens, cache
 }
 
 func setUsageModelAttribute(usage *sdk.Usage, modelID string) {
-	if usage == nil || modelID == "" {
-		return
-	}
-	setUsageAttribute(usage, sdk.UsageAttribute{
-		Key:   usageAttrModel,
-		Label: "模型",
-		Kind:  "model",
-		Value: modelID,
-	})
+	_ = usage
+	_ = modelID
 }
 
 func setUsageReasoningEffort(usage *sdk.Usage, effort string) {
 	if usage == nil || effort == "" {
 		return
 	}
+	usage.ReasoningEffort = effort
 	if usage.Metadata == nil {
 		usage.Metadata = map[string]string{}
 	}
@@ -143,12 +137,7 @@ func setUsageServiceTier(usage *sdk.Usage, tier string) {
 	if tier == "" {
 		return
 	}
-	setUsageAttribute(usage, sdk.UsageAttribute{
-		Key:   usageAttrServiceTier,
-		Label: "服务档位",
-		Kind:  "tier",
-		Value: tier,
-	})
+	usage.ServiceTier = tier
 	if usage.Metadata == nil {
 		usage.Metadata = map[string]string{}
 	}
@@ -159,10 +148,8 @@ func usageServiceTier(usage *sdk.Usage) string {
 	if usage == nil {
 		return ""
 	}
-	for _, attr := range usage.Attributes {
-		if attr.Key == usageAttrServiceTier {
-			return normalizeOpenAIServiceTier(attr.Value)
-		}
+	if usage.ServiceTier != "" {
+		return normalizeOpenAIServiceTier(usage.ServiceTier)
 	}
 	if usage.Metadata != nil {
 		return normalizeOpenAIServiceTier(usage.Metadata[usageAttrServiceTier])
@@ -174,18 +161,21 @@ func setUsageImageSize(usage *sdk.Usage, size string) {
 	if usage == nil || size == "" {
 		return
 	}
-	setUsageAttribute(usage, sdk.UsageAttribute{
-		Key:   usageAttrImageSize,
-		Label: "图片尺寸",
-		Kind:  "resolution",
-		Value: size,
-	})
+	usage.ImageSize = size
+	if usage.Metadata == nil {
+		usage.Metadata = map[string]string{}
+	}
+	usage.Metadata[usageAttrImageSize] = size
 }
 
 func setUsageTokens(usage *sdk.Usage, inputTokens, outputTokens, cachedInputTokens, reasoningOutputTokens int) {
 	if usage == nil {
 		return
 	}
+	usage.InputTokens = inputTokens
+	usage.OutputTokens = outputTokens
+	usage.CachedInputTokens = cachedInputTokens
+	usage.ReasoningOutputTokens = reasoningOutputTokens
 	setUsageMetric(usage, sdk.UsageMetric{
 		Key:   usageMetricInputTokens,
 		Label: "输入 Token",
@@ -227,6 +217,8 @@ func setUsageInputTokenDetails(usage *sdk.Usage, textInputTokens, imageInputToke
 	if usage == nil || textInputTokens+imageInputTokens <= 0 {
 		return
 	}
+	usage.TextInputTokens = textInputTokens
+	usage.ImageInputTokens = imageInputTokens
 	setUsageMetric(usage, sdk.UsageMetric{
 		Key:   usageMetricTextInputTokens,
 		Label: "文字输入 Token",
@@ -251,22 +243,30 @@ func usageMetricValue(usage *sdk.Usage, key string) float64 {
 	if usage == nil {
 		return 0
 	}
-	for _, metric := range usage.Metrics {
-		if metric.Key == key {
-			return metric.Value
-		}
+	switch key {
+	case usageMetricInputTokens:
+		return float64(usage.InputTokens)
+	case usageMetricTextInputTokens:
+		return float64(usage.TextInputTokens)
+	case usageMetricImageInputTokens:
+		return float64(usage.ImageInputTokens)
+	case usageMetricCachedInputTokens:
+		return float64(usage.CachedInputTokens)
+	case usageMetricOutputTokens:
+		return float64(usage.OutputTokens)
+	case usageMetricReasoningOutputTokens:
+		return float64(usage.ReasoningOutputTokens)
+	case usageMetricTotalTokens:
+		return float64(usage.InputTokens + usage.CachedInputTokens + usage.OutputTokens)
+	case usageMetricImages:
+		return float64(usage.ImageCount)
 	}
 	return 0
 }
 
 func setUsageAttribute(usage *sdk.Usage, attr sdk.UsageAttribute) {
-	for i := range usage.Attributes {
-		if usage.Attributes[i].Key == attr.Key {
-			usage.Attributes[i] = attr
-			return
-		}
-	}
-	usage.Attributes = append(usage.Attributes, attr)
+	_ = usage
+	_ = attr
 }
 
 func setUsageMetric(usage *sdk.Usage, metric sdk.UsageMetric) {
@@ -312,10 +312,7 @@ func recomputeUsageAccountCost(usage *sdk.Usage) {
 	if usage == nil {
 		return
 	}
-	var total float64
-	for _, detail := range usage.CostDetails {
-		total += detail.AccountCost
-	}
+	total := usage.InputCost + usage.OutputCost + usage.CachedInputCost + usage.CacheCreationCost
 	usage.AccountCost = total
 	if usage.Currency == "" {
 		usage.Currency = usageCurrencyUSD
@@ -427,6 +424,13 @@ func fillUsageCost(usage *sdk.Usage) {
 	inputCost := tokenCost(inputTokens, prices.input)
 	cachedCost := tokenCost(cachedInputTokens, prices.cached)
 	outputCost := tokenCost(outputTokens, prices.output)
+	usage.InputPrice = prices.input
+	usage.CachedInputPrice = prices.cached
+	usage.OutputPrice = prices.output
+	usage.InputCost = inputCost
+	usage.CachedInputCost = cachedCost
+	usage.OutputCost = outputCost
+	recomputeUsageAccountCost(usage)
 
 	setUsageMetric(usage, sdk.UsageMetric{
 		Key:         usageMetricInputTokens,
@@ -540,6 +544,12 @@ func addImageCost(usage *sdk.Usage, key, label string, numImages int, pricePerIm
 		return
 	}
 	cost := float64(numImages) * pricePerImage
+	usage.ImageCount += numImages
+	usage.ImageUnitPrice = pricePerImage
+	usage.ImageUnit = "USD/image"
+	usage.OutputPrice = pricePerImage
+	usage.OutputCost += cost
+	recomputeUsageAccountCost(usage)
 	metadata := map[string]string{
 		"unit_price": fmt.Sprintf("%.10g", pricePerImage),
 		"unit":       "USD/image",

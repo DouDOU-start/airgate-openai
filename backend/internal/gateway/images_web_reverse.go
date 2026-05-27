@@ -246,7 +246,7 @@ func (g *OpenAIGateway) forwardImagesViaWebReverse(ctx context.Context, req *sdk
 			billingSize = fmt.Sprintf("%dx%d", cfg.Width, cfg.Height)
 		}
 	}
-	// 图片尺寸作为通用 UsageAttribute 入库，后台费用明细可用它解释分档。
+	// 图片尺寸写入 Usage 标准字段和 metadata，后台费用明细可用它解释分档。
 	fillUsageCostPerImageBySize(usage, numImages, billingSize)
 
 	outcome := sdk.ForwardOutcome{

@@ -1630,7 +1630,7 @@ func (g *OpenAIGateway) forwardImagesViaResponsesTool(ctx context.Context, req *
 		outcome.Upstream.Headers = http.Header{"Content-Type": []string{"application/json"}}
 	}
 
-	// 图片尺寸作为通用 UsageAttribute 入库，后台费用明细可用它解释 1K/2K/4K 分档。
+	// 图片尺寸写入 Usage 标准字段和 metadata，后台费用明细可用它解释 1K/2K/4K 分档。
 	setUsageTokens(usage, inputTokens, imageOutputTokens, 0, 0)
 	setUsageInputTokenDetails(usage, inputEstimate.TextTokens, inputEstimate.ImageTokens)
 	fillUsageCostPerImageBySize(usage, numImages, billingSize)

@@ -8,7 +8,6 @@ interface UsageCostDetailItem {
   user_cost?: number;
   billing_multiplier?: number;
   currency?: string;
-  metadata?: Record<string, string>;
 }
 
 interface UsageRecordLike {
@@ -27,6 +26,7 @@ interface UsageRecordLike {
   service_tier?: string;
   input_price?: number;
   output_price?: number;
+  usage_metadata?: Record<string, string>;
 }
 
 const panelStyle: CSSProperties = {
@@ -100,14 +100,22 @@ const dividerStyle: CSSProperties = {
   borderTop: '1px solid var(--ag-border)',
 };
 
-function contextArray<T>(context: UsageRecordSurfaceProps['context'], camel: string, snake: string): T[] {
-  const value = context?.[camel] ?? context?.[snake];
-  return Array.isArray(value) ? value as T[] : [];
-}
-
 function recordFromContext(context: UsageRecordSurfaceProps['context']): UsageRecordLike {
   const record = context?.record;
   return record && typeof record === 'object' ? record as UsageRecordLike : {};
+}
+
+function metadataFromContext(context: UsageRecordSurfaceProps['context'], record: UsageRecordLike): Record<string, string> {
+  const fromContext = context?.usageMetadata ?? context?.usage_metadata;
+  if (fromContext && typeof fromContext === 'object' && !Array.isArray(fromContext)) {
+    return fromContext as Record<string, string>;
+  }
+  return record.usage_metadata ?? {};
+}
+
+function metadataText(metadata: Record<string, string>, key: string) {
+  const value = metadata[key]?.trim();
+  return value || '';
 }
 
 function money(value: unknown) {
@@ -134,12 +142,6 @@ function toCostLabel(raw: string): string {
   return stripTokenSuffix(s) + '成本';
 }
 
-function toUnitLabel(raw: string): string {
-  const s = raw.trim();
-  if (s.includes('单价') || s.toLowerCase().includes('price')) return s;
-  return stripTokenSuffix(s) + '单价';
-}
-
 function fallbackDetails(record: UsageRecordLike): UsageCostDetailItem[] {
   return [
     { key: 'input_tokens', label: '输入', account_cost: record.input_cost },
@@ -151,19 +153,19 @@ function fallbackDetails(record: UsageRecordLike): UsageCostDetailItem[] {
 
 export function UsageCostDetail({ context }: UsageRecordSurfaceProps) {
   const record = recordFromContext(context);
+  const metadata = metadataFromContext(context, record);
   const isAdmin = context?.adminView !== false;
 
-  const details = contextArray<UsageCostDetailItem>(context, 'usageCostDetails', 'usage_cost_details');
-  const rows = details.length > 0 ? details : fallbackDetails(record);
+  const rows = fallbackDetails(record);
 
   const unitPrices: { label: string; value: string }[] = [];
-  for (const item of rows) {
-    if (item.metadata?.unit_price && item.metadata?.unit) {
-      unitPrices.push({
-        label: toUnitLabel(item.label || item.key || ''),
-        value: `$${Number(item.metadata.unit_price).toFixed(4)} / ${item.metadata.unit.replace(/^USD\//, '')}`,
-      });
-    }
+  const imageUnitPrice = Number(metadataText(metadata, 'image_unit_price'));
+  const imageUnit = metadataText(metadata, 'image_unit') || 'USD/image';
+  if (Number.isFinite(imageUnitPrice) && imageUnitPrice > 0) {
+    unitPrices.push({
+      label: '图片单价',
+      value: `$${imageUnitPrice.toFixed(4)} / ${imageUnit.replace(/^USD\//, '')}`,
+    });
   }
   if (unitPrices.length === 0) {
     if (record.input_price && record.input_price > 0)

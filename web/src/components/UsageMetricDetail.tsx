@@ -1,25 +1,6 @@
 import type { CSSProperties, ReactNode } from 'react';
 import type { UsageRecordSurfaceProps } from '@doudou-start/airgate-theme/plugin';
 
-interface UsageAttribute {
-  key?: string;
-  label?: string;
-  kind?: string;
-  value?: string;
-  metadata?: Record<string, string>;
-}
-
-interface UsageMetric {
-  key?: string;
-  label?: string;
-  kind?: string;
-  unit?: string;
-  value?: number;
-  account_cost?: number;
-  currency?: string;
-  metadata?: Record<string, string>;
-}
-
 interface UsageRecordLike {
   model?: string;
   input_tokens?: number;
@@ -29,6 +10,7 @@ interface UsageRecordLike {
   reasoning_effort?: string;
   image_size?: string;
   service_tier?: string;
+  usage_metadata?: Record<string, string>;
 }
 
 const panelStyle: CSSProperties = {
@@ -140,22 +122,21 @@ const chipStyle: CSSProperties = {
   lineHeight: 1,
 };
 
-function contextArray<T>(context: UsageRecordSurfaceProps['context'], camel: string, snake: string): T[] {
-  const value = context?.[camel] ?? context?.[snake];
-  return Array.isArray(value) ? value as T[] : [];
-}
-
 function recordFromContext(context: UsageRecordSurfaceProps['context']): UsageRecordLike {
   const record = context?.record;
   return record && typeof record === 'object' ? record as UsageRecordLike : {};
 }
 
-function norm(value?: string) {
-  return (value || '').trim().toLowerCase().replace(/[\s-]+/g, '_');
+function metadataFromContext(context: UsageRecordSurfaceProps['context'], record: UsageRecordLike): Record<string, string> {
+  const fromContext = context?.usageMetadata ?? context?.usage_metadata;
+  if (fromContext && typeof fromContext === 'object' && !Array.isArray(fromContext)) {
+    return fromContext as Record<string, string>;
+  }
+  return record.usage_metadata ?? {};
 }
 
-function numberValue(value: unknown) {
-  return typeof value === 'number' && Number.isFinite(value) ? value : 0;
+function norm(value?: string) {
+  return (value || '').trim().toLowerCase().replace(/[\s-]+/g, '_');
 }
 
 function formatNumber(value: number) {
@@ -164,9 +145,20 @@ function formatNumber(value: number) {
     : value.toLocaleString(undefined, { maximumFractionDigits: 4 });
 }
 
-function metricValue(metrics: UsageMetric[], keys: string[]) {
-  const metric = metrics.find((item) => keys.includes(norm(item.key || item.kind || item.label)));
-  return metric ? numberValue(metric.value) : 0;
+function metadataText(metadata: Record<string, string>, keys: string[]) {
+  for (const [key, value] of Object.entries(metadata)) {
+    if (!keys.includes(norm(key))) continue;
+    const text = value.trim();
+    if (text) return text;
+  }
+  return '';
+}
+
+function metadataNumber(metadata: Record<string, string>, keys: string[]) {
+  const value = metadataText(metadata, keys);
+  if (!value) return 0;
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : 0;
 }
 
 function Row({ label, tone, value }: { label: ReactNode; tone?: string; value: ReactNode }) {
@@ -201,22 +193,20 @@ function inputTokenValue(textInputTokens: number, imageInputTokens: number, inpu
 
 export function UsageMetricDetail({ context }: UsageRecordSurfaceProps) {
   const record = recordFromContext(context);
-  const attributes = contextArray<UsageAttribute>(context, 'usageAttributes', 'usage_attributes');
-  const metrics = contextArray<UsageMetric>(context, 'usageMetrics', 'usage_metrics');
-  const attrValue = (keys: string[]) => attributes.find((item) => keys.includes(norm(item.key || item.kind || item.label)))?.value || '';
+  const metadata = metadataFromContext(context, record);
 
-  const imageSize = attrValue(['image_size', 'resolution', 'size']) || record.image_size || '';
-  const serviceTier = attrValue(['service_tier', 'tier']) || record.service_tier || '';
-  const reasoningEffort = attrValue(['reasoning_effort', 'reasoning']) || record.reasoning_effort || '';
-  const inputTokens = metricValue(metrics, ['input_tokens', 'input_token', 'prompt_tokens', 'prompt_token']) || record.input_tokens || 0;
-  const outputTokens = metricValue(metrics, ['output_tokens', 'output_token', 'completion_tokens', 'completion_token']) || record.output_tokens || 0;
-  const cachedInputTokens = metricValue(metrics, ['cached_input_tokens', 'cached_input_token', 'cache_read_tokens', 'cache_read_token']) || record.cached_input_tokens || 0;
-  const reasoningTokens = metricValue(metrics, ['reasoning_output_tokens', 'reasoning_tokens', 'reasoning_token']) || record.reasoning_output_tokens || 0;
-  const imageInputTokens = metricValue(metrics, ['input_image_tokens', 'image_input_tokens', 'image_tokens']);
-  const rawTextInputTokens = metricValue(metrics, ['input_text_tokens', 'text_input_tokens', 'text_tokens']);
+  const imageSize = metadataText(metadata, ['image_size', 'resolution', 'size']) || record.image_size || '';
+  const serviceTier = metadataText(metadata, ['service_tier', 'tier']) || record.service_tier || '';
+  const reasoningEffort = metadataText(metadata, ['reasoning_effort', 'reasoning']) || record.reasoning_effort || '';
+  const inputTokens = record.input_tokens || 0;
+  const outputTokens = record.output_tokens || 0;
+  const cachedInputTokens = record.cached_input_tokens || 0;
+  const reasoningTokens = record.reasoning_output_tokens || 0;
+  const imageInputTokens = metadataNumber(metadata, ['input_image_tokens', 'image_input_tokens', 'image_tokens']);
+  const rawTextInputTokens = metadataNumber(metadata, ['input_text_tokens', 'text_input_tokens', 'text_tokens']);
   const textInputTokens = rawTextInputTokens || (imageInputTokens > 0 && inputTokens >= imageInputTokens ? inputTokens - imageInputTokens : 0);
-  const images = metricValue(metrics, ['images', 'image', 'image_generation']);
-  const totalTokens = metricValue(metrics, ['total_tokens', 'total_token']) || inputTokens + outputTokens + cachedInputTokens;
+  const images = metadataNumber(metadata, ['images', 'image_count']);
+  const totalTokens = inputTokens + outputTokens + cachedInputTokens;
 
   return (
     <div style={panelStyle}>

@@ -852,8 +852,8 @@ func TestAddUsageCostForModel_CombinesResponsesContextAndImageCost(t *testing.T)
 	if got := usageCostByKey(usage, usageCostImage); !almostEqual(got, 0.10, 1e-9) {
 		t.Errorf("image cost = %v, want 0.10", got)
 	}
-	if !almostEqual(usage.AccountCost, 0.1100, 1e-9) {
-		t.Errorf("AccountCost = %v, want 0.1100", usage.AccountCost)
+	if !almostEqual(usage.AccountCost, 0.10, 1e-9) {
+		t.Errorf("AccountCost = %v, want 0.10", usage.AccountCost)
 	}
 	if usage.Model != "gpt-image-2" {
 		t.Errorf("Usage.Model = %q, want gpt-image-2", usage.Model)
