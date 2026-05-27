@@ -25,7 +25,8 @@ type Spec struct {
 	ContextWindow   int
 	MaxOutputTokens int
 
-	// 按张计费（$/张）。> 0 时图像生成走固定单价，不按 token 估算。
+	// 图像模型能力标记价（$/张）。> 0 表示具备图像生成能力；实际 token 标准价仍
+	// 使用 InputPrice / OutputPrice，分组固定单张价由 Core 通过 metadata 覆盖。
 	ImagePrice float64
 
 	// 标准档单价（$/1M tokens）
@@ -81,13 +82,12 @@ func withPriorityMultiplier(s Spec, multiplier float64) Spec {
 	return s
 }
 
-// imgSpec 构造按张计费的图像模型 Spec。
-func imgSpec(name string, pricePerImage float64) Spec {
-	return Spec{
-		Name:          name,
-		ContextWindow: 32000,
-		ImagePrice:    pricePerImage,
-	}
+// imgSpec 构造图像模型 Spec。ImagePrice 只作为图像能力标记；
+// 标准计费仍按 token 单价计算，Core 可用分组图片单张价替代最终计费。
+func imgSpec(name string, input, cached, output, pricePerImage float64) Spec {
+	spec := std(name, 32000, 0, input, cached, output)
+	spec.ImagePrice = pricePerImage
+	return spec
 }
 
 // withLongCtx 在已构造的 Spec 基础上附加 gpt-5.4 家族的长上下文阶梯。
@@ -116,10 +116,10 @@ var registry = map[string]Spec{
 	// ── GPT 基础系列 ──
 	"gpt-5.2": std("GPT 5.2", 272000, 128000, 1.75, 0.175, 14.0),
 
-	// ── 图像生成（按张计费 $0.20/张）──
-	"gpt-image-1":   imgSpec("GPT Image 1", 0.20),
-	"gpt-image-1.5": imgSpec("GPT Image 1.5", 0.20),
-	"gpt-image-2":   imgSpec("GPT Image 2", 0.20),
+	// ── 图像生成：标准成本按 token 计，分组图片固定单价由 Core 替代最终计费 ──
+	"gpt-image-1":   imgSpec("GPT Image 1", 5.0, 0.5, 30.0, 0.20),
+	"gpt-image-1.5": imgSpec("GPT Image 1.5", 5.0, 0.5, 30.0, 0.20),
+	"gpt-image-2":   imgSpec("GPT Image 2", 5.0, 0.5, 30.0, 0.20),
 }
 
 // DefaultSpec 未注册模型的最终兜底值。按 gpt-5.4 标准档计价——宁可略高也不能 0。

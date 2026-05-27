@@ -352,14 +352,14 @@ func fillUsageCost(usage *sdk.Usage) {
 
 }
 
-// fillUsageCostPerImageBySize 按 1K/2K/4K size 分档填充 Usage（USD/张）。
-// 用于 OAuth → image_generation tool 路径，价格由 imagePriceForSize 硬编码（详见其注释）。
-// 跟 spec.ImagePrice 解耦：plugin.yaml 不需要登记 ImagePrice，分档定价完全由网关侧决定。
+// fillUsageCostPerImageBySize 记录 1K/2K/4K 图片 metadata，并按模型 token 标准价
+// 填充 Usage。分组固定单张价由 Core 用 metadata 替代最终计费。
 func fillUsageCostPerImageBySize(usage *sdk.Usage, numImages int, size string) {
 	if usage == nil || numImages <= 0 {
 		return
 	}
 	price := imagePriceForSize(size)
+	fillUsageCost(usage)
 	setUsageImageSize(usage, size)
 	addImageCost(usage, numImages, price)
 }
@@ -390,7 +390,7 @@ func addUsageCostForModel(
 	recomputeUsageAccountCost(usage)
 }
 
-// fillUsageCostWithImageTool 先按主 model 定价算 token 成本，再按尺寸分档叠加图像费用。
+// fillUsageCostWithImageTool 先按主 model 定价算 token 成本，再写入图片分档 metadata。
 func fillUsageCostWithImageTool(usage *sdk.Usage, numImages int, size string) {
 	fillUsageCost(usage)
 	if usage == nil || numImages <= 0 {
@@ -405,11 +405,8 @@ func addImageCost(usage *sdk.Usage, numImages int, pricePerImage float64) {
 	if usage == nil || numImages <= 0 || pricePerImage <= 0 {
 		return
 	}
-	cost := float64(numImages) * pricePerImage
 	addUsageMetadataInt(usage, usageMetricImages, numImages)
 	setUsageMetadataFloat(usage, "openai.image.unit_price", pricePerImage)
 	setUsageMetadata(usage, "openai.image.unit", "USD/image")
-	usage.OutputPrice = pricePerImage
-	usage.OutputCost += cost
 	recomputeUsageAccountCost(usage)
 }

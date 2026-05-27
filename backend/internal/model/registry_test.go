@@ -64,4 +64,14 @@ func TestLookup_KnownModelUnchanged(t *testing.T) {
 			t.Errorf("gpt-5.4 定价变化: In=%v Out=%v", spec.InputPrice, spec.OutputPrice)
 		}
 	})
+
+	t.Run("gpt-image-2", func(t *testing.T) {
+		spec := Lookup("gpt-image-2")
+		if spec.InputPrice != 5.0 || spec.OutputPrice != 30.0 || spec.CachedPrice != 0.5 {
+			t.Errorf("gpt-image-2 token 定价变化: In=%v Out=%v Cached=%v", spec.InputPrice, spec.OutputPrice, spec.CachedPrice)
+		}
+		if spec.ImagePrice <= 0 {
+			t.Errorf("gpt-image-2 ImagePrice = %v, want image capability marker", spec.ImagePrice)
+		}
+	})
 }
