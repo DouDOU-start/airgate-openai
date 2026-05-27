@@ -1578,8 +1578,6 @@ func (g *OpenAIGateway) forwardImagesViaResponsesTool(ctx context.Context, req *
 		wsResult.OutputTokens,
 		wsResult.CachedInputTokens,
 		wsResult.ReasoningOutputTokens,
-		"responses_context",
-		"上下文",
 	)
 	g.logger.Debug("Images OAuth result",
 		"path", reqPath,

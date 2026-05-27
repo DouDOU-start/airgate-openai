@@ -8,7 +8,6 @@ interface UsageRecordLike {
   cached_input_tokens?: number;
   reasoning_output_tokens?: number;
   reasoning_effort?: string;
-  image_size?: string;
   service_tier?: string;
   usage_metadata?: Record<string, string>;
 }
@@ -128,7 +127,7 @@ function recordFromContext(context: UsageRecordSurfaceProps['context']): UsageRe
 }
 
 function metadataFromContext(context: UsageRecordSurfaceProps['context'], record: UsageRecordLike): Record<string, string> {
-  const fromContext = context?.usageMetadata ?? context?.usage_metadata;
+  const fromContext = context?.usage_metadata;
   if (fromContext && typeof fromContext === 'object' && !Array.isArray(fromContext)) {
     return fromContext as Record<string, string>;
   }
@@ -195,17 +194,17 @@ export function UsageMetricDetail({ context }: UsageRecordSurfaceProps) {
   const record = recordFromContext(context);
   const metadata = metadataFromContext(context, record);
 
-  const imageSize = metadataText(metadata, ['image_size', 'resolution', 'size']) || record.image_size || '';
-  const serviceTier = metadataText(metadata, ['service_tier', 'tier']) || record.service_tier || '';
-  const reasoningEffort = metadataText(metadata, ['reasoning_effort', 'reasoning']) || record.reasoning_effort || '';
+  const imageSize = metadataText(metadata, ['openai.image.size']);
+  const serviceTier = record.service_tier || '';
+  const reasoningEffort = record.reasoning_effort || '';
   const inputTokens = record.input_tokens || 0;
   const outputTokens = record.output_tokens || 0;
   const cachedInputTokens = record.cached_input_tokens || 0;
   const reasoningTokens = record.reasoning_output_tokens || 0;
-  const imageInputTokens = metadataNumber(metadata, ['input_image_tokens', 'image_input_tokens', 'image_tokens']);
-  const rawTextInputTokens = metadataNumber(metadata, ['input_text_tokens', 'text_input_tokens', 'text_tokens']);
+  const imageInputTokens = metadataNumber(metadata, ['openai.image.input_image_tokens']);
+  const rawTextInputTokens = metadataNumber(metadata, ['openai.image.input_text_tokens']);
   const textInputTokens = rawTextInputTokens || (imageInputTokens > 0 && inputTokens >= imageInputTokens ? inputTokens - imageInputTokens : 0);
-  const images = metadataNumber(metadata, ['images', 'image_count']);
+  const images = metadataNumber(metadata, ['openai.image.count']);
   const totalTokens = inputTokens + outputTokens + cachedInputTokens;
 
   return (

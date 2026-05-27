@@ -704,7 +704,6 @@ func parseSSEUsage(data []byte, out *sdk.Usage, toolImageIn, toolImageOut *int) 
 			return
 		}
 		out.Model = resp.Get("model").String()
-		setUsageModelAttribute(out, out.Model)
 		if usageServiceTier(out) == "" {
 			setUsageServiceTier(out, resp.Get("service_tier").String())
 		}
@@ -738,7 +737,6 @@ func parseSSEUsage(data []byte, out *sdk.Usage, toolImageIn, toolImageOut *int) 
 		cachedInputTokens := int(usage.Get("prompt_tokens_details.cached_tokens").Int())
 		reasoningOutputTokens := int(usage.Get("completion_tokens_details.reasoning_tokens").Int())
 		out.Model = gjson.GetBytes(data, "model").String()
-		setUsageModelAttribute(out, out.Model)
 		if cachedInputTokens > 0 && inputTokens >= cachedInputTokens {
 			inputTokens -= cachedInputTokens
 		}

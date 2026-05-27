@@ -26,6 +26,7 @@ interface UsageRecordLike {
   service_tier?: string;
   input_price?: number;
   output_price?: number;
+  cache_creation_price?: number;
   usage_metadata?: Record<string, string>;
 }
 
@@ -106,7 +107,7 @@ function recordFromContext(context: UsageRecordSurfaceProps['context']): UsageRe
 }
 
 function metadataFromContext(context: UsageRecordSurfaceProps['context'], record: UsageRecordLike): Record<string, string> {
-  const fromContext = context?.usageMetadata ?? context?.usage_metadata;
+  const fromContext = context?.usage_metadata;
   if (fromContext && typeof fromContext === 'object' && !Array.isArray(fromContext)) {
     return fromContext as Record<string, string>;
   }
@@ -159,8 +160,8 @@ export function UsageCostDetail({ context }: UsageRecordSurfaceProps) {
   const rows = fallbackDetails(record);
 
   const unitPrices: { label: string; value: string }[] = [];
-  const imageUnitPrice = Number(metadataText(metadata, 'image_unit_price'));
-  const imageUnit = metadataText(metadata, 'image_unit') || 'USD/image';
+  const imageUnitPrice = Number(metadataText(metadata, 'openai.image.unit_price'));
+  const imageUnit = metadataText(metadata, 'openai.image.unit') || 'USD/image';
   if (Number.isFinite(imageUnitPrice) && imageUnitPrice > 0) {
     unitPrices.push({
       label: '图片单价',
@@ -172,6 +173,8 @@ export function UsageCostDetail({ context }: UsageRecordSurfaceProps) {
       unitPrices.push({ label: '输入单价', value: `$${record.input_price.toFixed(4)} / 1M Token` });
     if (record.output_price && record.output_price > 0)
       unitPrices.push({ label: '输出单价', value: `$${record.output_price.toFixed(4)} / 1M Token` });
+    if (record.cache_creation_price && record.cache_creation_price > 0)
+      unitPrices.push({ label: '缓存写入单价', value: `$${record.cache_creation_price.toFixed(4)} / 1M Token` });
   }
 
   const hasRateInfo = !!record.service_tier

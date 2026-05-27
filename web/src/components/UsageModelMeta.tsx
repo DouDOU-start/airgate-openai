@@ -2,9 +2,9 @@ import type { UsageRecordSurfaceProps } from '@doudou-start/airgate-theme/plugin
 import type { CSSProperties } from 'react';
 
 type UsageContext = {
-  image_size?: string;
   reasoning_effort?: string;
   service_tier?: string;
+  usage_metadata?: Record<string, string>;
 };
 
 const EFFORT_LOW_COLOR = 'rgb(34,197,94)';
@@ -62,19 +62,26 @@ function isUsageServiceTierFast(context: UsageRecordSurfaceProps['context']): bo
   return serviceTier === 'fast' || serviceTier === 'priority' || serviceTier === 'scale';
 }
 
+function usageMetadata(context: UsageRecordSurfaceProps['context']): Record<string, string> {
+  const ctx = (context ?? {}) as UsageContext;
+  const metadata = ctx.usage_metadata;
+  return metadata && typeof metadata === 'object' && !Array.isArray(metadata) ? metadata : {};
+}
+
 export function UsageModelMeta(props: UsageRecordSurfaceProps) {
   const ctx = (props.context ?? {}) as UsageContext;
+  const imageSize = usageMetadata(props.context)['openai.image.size']?.trim() ?? '';
   const chips: Array<{ label: string; color: string; dotColor?: string; fastMark?: boolean }> = [];
 
-  if (ctx.image_size) {
+  if (imageSize) {
     chips.push({
-      label: ctx.image_size,
+      label: imageSize,
       color: IMAGE_SIZE_COLOR,
-      dotColor: imageSizeDotColor(ctx.image_size),
+      dotColor: imageSizeDotColor(imageSize),
     });
   }
   const hasReasoningEffort = Boolean(ctx.reasoning_effort?.trim());
-  const showFastMark = !ctx.image_size && isUsageServiceTierFast(ctx);
+  const showFastMark = !imageSize && isUsageServiceTierFast(ctx);
   if (showFastMark && !hasReasoningEffort) {
     chips.push({ label: 'fast', color: FAST_SERVICE_TIER_COLOR, fastMark: true });
   }

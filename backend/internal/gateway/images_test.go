@@ -248,7 +248,7 @@ func TestHandleImagesResponse_TokenAttribution(t *testing.T) {
 		t.Errorf("cached_input_tokens = %d, want 10", got)
 	}
 
-	if got := usageCostByKey(u, usageCostInput); !almostEqual(got, 0, 1e-9) {
+	if got := u.InputCost; !almostEqual(got, 0, 1e-9) {
 		t.Errorf("input cost = %v, want 0 (per-image billing)", got)
 	}
 	if !almostEqual(u.AccountCost, 0.20, 1e-9) {
@@ -667,35 +667,18 @@ func TestFillUsageCostPerImageBySize(t *testing.T) {
 			if !almostEqual(usage.AccountCost, tc.want, 1e-9) {
 				t.Errorf("AccountCost = %v, want %v", usage.AccountCost, tc.want)
 			}
-			if !almostEqual(usageCostByKey(usage, usageCostInput), 0, 1e-9) {
-				t.Errorf("input cost = %v, want 0", usageCostByKey(usage, usageCostInput))
+			if !almostEqual(usage.InputCost, 0, 1e-9) {
+				t.Errorf("input cost = %v, want 0", usage.InputCost)
 			}
 		})
 	}
-}
-
-func usageCostByKey(usage *sdk.Usage, key string) float64 {
-	if usage == nil {
-		return 0
-	}
-	for _, detail := range usage.CostDetails {
-		if detail.Key == key {
-			return detail.AccountCost
-		}
-	}
-	return 0
 }
 
 func usageImageUnitPrice(usage *sdk.Usage) string {
 	if usage == nil {
 		return ""
 	}
-	for _, detail := range usage.CostDetails {
-		if detail.Key == usageCostImage {
-			return detail.Metadata["unit_price"]
-		}
-	}
-	return ""
+	return usage.Metadata["openai.image.unit_price"]
 }
 
 func almostEqual(a, b, eps float64) bool {
@@ -827,33 +810,33 @@ func TestFillUsageCostWithImageTool(t *testing.T) {
 	// 主 gpt-5.4 standard: input=$2.5/1M → 0.0025, output=$15/1M → 0.0075
 	// image tool: 1 张 × $0.10 (1K) = 0.10
 	// total account cost = 0.0025 + 0.0075 + 0.10 = 0.1100
-	if !almostEqual(usageCostByKey(usage, usageCostInput), 0.0025, 1e-9) {
-		t.Errorf("input cost = %v, want 0.0025", usageCostByKey(usage, usageCostInput))
+	if !almostEqual(usage.InputCost, 0.0025, 1e-9) {
+		t.Errorf("input cost = %v, want 0.0025", usage.InputCost)
 	}
 	if !almostEqual(usage.AccountCost, 0.1100, 1e-9) {
 		t.Errorf("AccountCost = %v, want 0.1100", usage.AccountCost)
 	}
-	if got := usage.Metrics[0].Metadata["unit_price"]; got != "2.5" {
-		t.Errorf("input unit_price = %q, want 2.5", got)
+	if got := usage.InputPrice; !almostEqual(got, 2.5, 1e-9) {
+		t.Errorf("input unit price = %v, want 2.5", got)
 	}
 }
 
 func TestAddUsageCostForModel_CombinesResponsesContextAndImageCost(t *testing.T) {
 	usage := newTokenUsage("gpt-image-2", "", 12, 0, 0, 0, 0)
-	addUsageCostForModel(usage, "gpt-5.4", "", 1000, 500, 0, 0, "responses_context", "上下文")
+	addUsageCostForModel(usage, "gpt-5.4", "", 1000, 500, 0, 0)
 	fillUsageCostPerImageBySize(usage, 1, "1024x1024")
 
-	if got := usageCostByKey(usage, "responses_context_"+usageCostInput); !almostEqual(got, 0.0025, 1e-9) {
+	if got := usage.InputCost; !almostEqual(got, 0.0025, 1e-9) {
 		t.Errorf("context input cost = %v, want 0.0025", got)
 	}
-	if got := usageCostByKey(usage, "responses_context_"+usageCostOutput); !almostEqual(got, 0.0075, 1e-9) {
-		t.Errorf("context output cost = %v, want 0.0075", got)
+	if got := usage.OutputCost; !almostEqual(got, 0.1075, 1e-9) {
+		t.Errorf("context output + image cost = %v, want 0.1075", got)
 	}
-	if got := usageCostByKey(usage, usageCostImage); !almostEqual(got, 0.10, 1e-9) {
-		t.Errorf("image cost = %v, want 0.10", got)
+	if got := usageImageUnitPrice(usage); got != "0.1" {
+		t.Errorf("image unit price = %q, want 0.1", got)
 	}
-	if !almostEqual(usage.AccountCost, 0.10, 1e-9) {
-		t.Errorf("AccountCost = %v, want 0.10", usage.AccountCost)
+	if !almostEqual(usage.AccountCost, 0.1100, 1e-9) {
+		t.Errorf("AccountCost = %v, want 0.1100", usage.AccountCost)
 	}
 	if usage.Model != "gpt-image-2" {
 		t.Errorf("Usage.Model = %q, want gpt-image-2", usage.Model)
@@ -867,8 +850,8 @@ func TestFillUsageCostWithImageTool_NoToolUsage(t *testing.T) {
 	if usageMetricInt(usage, usageMetricInputTokens) != 1000 || usageMetricInt(usage, usageMetricOutputTokens) != 500 {
 		t.Errorf("token counts mutated when no image tool usage")
 	}
-	if !almostEqual(usageCostByKey(usage, usageCostInput), 0.0025, 1e-9) {
-		t.Errorf("input cost = %v, want 0.0025", usageCostByKey(usage, usageCostInput))
+	if !almostEqual(usage.InputCost, 0.0025, 1e-9) {
+		t.Errorf("input cost = %v, want 0.0025", usage.InputCost)
 	}
 }
 
