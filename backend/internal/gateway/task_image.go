@@ -1,10 +1,13 @@
 package gateway
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"image"
+	"image/png"
 	"net/http"
 	"strconv"
 	"strings"
@@ -153,7 +156,12 @@ func executeImageTask(ctx context.Context, g *OpenAIGateway, task sdk.HostTask, 
 		})
 	}
 
-	shrinkTaskInputImages(task.Input)
+	if err := shrinkTaskInputImages(task.Input); err != nil {
+		return rt.Fail(ctx, &TaskError{
+			Type:    "invalid_request",
+			Message: "压缩输入图片失败: " + err.Error(),
+		})
+	}
 
 	reqBody, err := buildImageRequestBody(task.Input)
 	if err != nil {
@@ -461,16 +469,76 @@ func stringSliceFromInput(input map[string]any, key string) []string {
 }
 
 // shrinkTaskInputImages 对任务输入中的图片做压缩，复用直通路径的 shrinkDataImageURL。
-// mask 保持 PNG 不压缩（需要透明通道）。
-func shrinkTaskInputImages(input map[string]any) {
+// mask 仍保持 PNG/透明通道，但要跟随第一张编辑目标图的最终尺寸缩放，避免
+// 原图被压缩后 mask 还停留在原尺寸导致局部重绘坐标漂移。
+func shrinkTaskInputImages(input map[string]any) error {
 	images := stringSliceFromInput(input, "images")
 	if len(images) == 0 {
-		return
+		return nil
 	}
+	firstWidth, firstHeight := 0, 0
 	for i, ref := range images {
 		if shrunk, err := shrinkDataImageURL(ref, maxEditInputImageBytes); err == nil {
 			images[i] = shrunk
+		} else {
+			return err
+		}
+		if i == 0 {
+			width, height, err := imageDataURLSize(images[i])
+			if err != nil {
+				return err
+			}
+			firstWidth, firstHeight = width, height
 		}
 	}
 	input["images"] = images
+	if maskRef, ok := input["mask"].(string); ok && maskRef != "" && firstWidth > 0 && firstHeight > 0 {
+		mask, err := resizeMaskDataURLToImageSize(maskRef, firstWidth, firstHeight)
+		if err != nil {
+			return err
+		}
+		input["mask"] = mask
+	}
+	return nil
+}
+
+func imageDataURLSize(ref string) (int, int, error) {
+	if !strings.HasPrefix(ref, "data:") {
+		return 0, 0, nil
+	}
+	mimeType, data, err := decodeDataImageURL(ref)
+	if err != nil {
+		return 0, 0, err
+	}
+	if !strings.HasPrefix(mimeType, "image/") {
+		return 0, 0, nil
+	}
+	cfg, _, err := image.DecodeConfig(bytes.NewReader(data))
+	if err != nil {
+		return 0, 0, err
+	}
+	return cfg.Width, cfg.Height, nil
+}
+
+func resizeMaskDataURLToImageSize(ref string, width, height int) (string, error) {
+	if !strings.HasPrefix(ref, "data:") {
+		return ref, nil
+	}
+	mimeType, data, err := decodeDataImageURL(ref)
+	if err != nil {
+		return "", err
+	}
+	data, mimeType, err = resizeMaskToImageSize(data, mimeType, width, height)
+	if err != nil {
+		return "", err
+	}
+	if mimeType != "image/png" {
+		return "", fmt.Errorf("mask resize returned unsupported MIME type %s", mimeType)
+	}
+	var decoded image.Image
+	decoded, err = png.Decode(bytes.NewReader(data))
+	if err != nil || decoded == nil {
+		return "", fmt.Errorf("缩放后的 mask PNG 无效: %w", err)
+	}
+	return "data:image/png;base64," + base64.StdEncoding.EncodeToString(data), nil
 }
