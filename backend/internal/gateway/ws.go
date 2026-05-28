@@ -251,16 +251,7 @@ func ReceiveWSResponse(ctx context.Context, conn *websocket.Conn, handler WSEven
 
 		_, msg, err := conn.ReadMessage()
 		if err != nil {
-			if websocket.IsCloseError(err, websocket.CloseMessageTooBig) {
-				result.Err = &responsesFailureError{
-					Kind:               responsesFailureKindClient,
-					StatusCode:         http.StatusRequestEntityTooLarge,
-					AnthropicErrorType: "request_too_large",
-					Message:            imageTooLargeSSEErrorMessage,
-				}
-			} else {
-				result.Err = fmt.Errorf("读取 WebSocket 消息失败: %w", err)
-			}
+			result.Err = fmt.Errorf("读取 WebSocket 消息失败: %w", err)
 			break
 		}
 

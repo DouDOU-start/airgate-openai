@@ -1351,12 +1351,16 @@ func (e imagesInputTokenEstimate) Total() int {
 }
 
 // forwardImagesViaResponsesTool 把 OpenAI Images REST 请求翻译成 Responses API
-// 的 image_generation tool 调用，跑 OAuth WS 通道，最后把生成的 base64 图像
+// 的 image_generation tool 调用，跑 OAuth HTTP/SSE 通道，最后把生成的 base64 图像
 // 重新包装成 Images REST 响应返回给客户端。
 //
 // 只在 OAuth 账号处理 /v1/images/generations 时使用；API Key 账号继续走原生
 // REST 通道（见 handleImagesResponse）。
 func (g *OpenAIGateway) forwardImagesViaResponsesTool(ctx context.Context, req *sdk.ForwardRequest) (sdk.ForwardOutcome, error) {
+	return g.forwardImagesViaResponsesToolWithURL(ctx, req, ChatGPTSSEURL)
+}
+
+func (g *OpenAIGateway) forwardImagesViaResponsesToolWithURL(ctx context.Context, req *sdk.ForwardRequest, targetURL string) (sdk.ForwardOutcome, error) {
 	start := time.Now()
 	account := req.Account
 
@@ -1405,35 +1409,32 @@ func (g *OpenAIGateway) forwardImagesViaResponsesTool(ctx context.Context, req *
 		}, nil
 	}
 
-	cfg := WSConfig{
-		Token:          account.Credentials["access_token"],
-		AccountID:      account.Credentials["chatgpt_account_id"],
-		ProxyURL:       account.ProxyURL,
-		SessionID:      session.SessionID,
-		ConversationID: session.ConversationID,
-		TurnState:      session.LastTurnState,
-		Originator:     req.Headers.Get("originator"),
-	}
-	conn, wsResp, err := DialWebSocket(cfg)
+	upstreamReq, err := http.NewRequestWithContext(ctx, http.MethodPost, targetURL, bytes.NewReader(createMsg))
 	if err != nil {
-		if wsResp != nil {
-			wsBody := openAIErrorJSON(openAIErrorTypeForStatus(wsResp.StatusCode), "", err.Error())
-			outcome := failureOutcome(wsResp.StatusCode, wsBody, wsResp.Header.Clone(), err.Error(), extractRetryAfterHeader(wsResp.Header))
-			outcome.Duration = time.Since(start)
-			return outcome, forwardErrForOutcome(outcome, err)
-		}
-		return transientOutcome(err.Error()), err
-	}
-	defer func() { _ = conn.Close() }()
-	if wsResp != nil {
-		if turnState := decodeTurnStateHeader(wsResp.Header); turnState != "" {
-			updateSessionStateTurnState(session.SessionKey, turnState)
-		}
+		reason := fmt.Sprintf("构建上游请求失败: %v", err)
+		return transientOutcome(reason), fmt.Errorf("%s", reason)
 	}
 
-	if err := conn.WriteJSON(json.RawMessage(createMsg)); err != nil {
-		reason := fmt.Sprintf("发送 WebSocket 消息失败: %v", err)
-		return transientOutcome(reason), fmt.Errorf("%s", reason)
+	upstreamReq.Header.Set("Content-Type", "application/json")
+	upstreamReq.Header.Set("Accept", "text/event-stream")
+	upstreamReq.Header.Set("Authorization", "Bearer "+account.Credentials["access_token"])
+	if aid := account.Credentials["chatgpt_account_id"]; aid != "" {
+		upstreamReq.Header.Set("ChatGPT-Account-ID", aid)
+	}
+	if session.SessionID != "" {
+		upstreamReq.Header.Set("session_id", session.SessionID)
+	}
+	if session.ConversationID != "" {
+		upstreamReq.Header.Set("conversation_id", session.ConversationID)
+	}
+	if session.LastTurnState != "" {
+		upstreamReq.Header.Set("x-codex-turn-state", session.LastTurnState)
+	}
+	if originator := req.Headers.Get("originator"); originator != "" {
+		upstreamReq.Header.Set("originator", originator)
+	}
+	if userAgent := req.Headers.Get("User-Agent"); userAgent != "" {
+		upstreamReq.Header.Set("User-Agent", userAgent)
 	}
 
 	var sseKA *ssePingKeepAlive
@@ -1441,8 +1442,57 @@ func (g *OpenAIGateway) forwardImagesViaResponsesTool(ctx context.Context, req *
 		sseKA = startSSEPingKeepAlive(req.Writer)
 	}
 
+	client := g.buildHTTPClient(account)
+	resp, err := client.Do(upstreamReq)
+	if err != nil {
+		if sseKA != nil {
+			sseKA.Stop()
+			writeSSEErrorIfStarted(req.Writer, sseKA, sanitizedImageSSEErrorMessage)
+		}
+		reason := fmt.Sprintf("请求上游失败: %v", err)
+		return transientOutcome(reason), fmt.Errorf("%s", reason)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if turnState := decodeTurnStateHeader(resp.Header); turnState != "" {
+		updateSessionStateTurnState(session.SessionKey, turnState)
+	}
+
 	handler := &imagesSilentHandler{accountID: account.ID, start: start}
-	wsResult := ReceiveWSResponse(ctx, conn, handler)
+	var wsResult WSResult
+	if resp.StatusCode >= http.StatusBadRequest {
+		body, readErr := io.ReadAll(resp.Body)
+		if readErr != nil {
+			if sseKA != nil {
+				sseKA.Stop()
+				writeSSEErrorIfStarted(req.Writer, sseKA, sanitizedImageSSEErrorMessage)
+			}
+			reason := fmt.Sprintf("读取上游错误响应失败: %v", readErr)
+			outcome := transientOutcome(reason)
+			outcome.Duration = time.Since(start)
+			return outcome, fmt.Errorf("%s", reason)
+		} else if failureErr := parseSSEFailureEvent(body); failureErr != nil {
+			wsResult.Err = failureErr
+		} else {
+			reason := extractOpenAIErrorMessage(body)
+			if reason == "" {
+				reason = truncate(string(body), 200)
+			}
+			if reason == "" {
+				reason = fmt.Sprintf("上游返回 HTTP %d", resp.StatusCode)
+			}
+			outcome := failureOutcome(resp.StatusCode, body, resp.Header.Clone(), reason, extractRetryAfterHeader(resp.Header))
+			outcome.Duration = time.Since(start)
+			if sseKA != nil {
+				sseKA.Stop()
+				g.logger.Warn("Images OAuth HTTP 请求失败，已脱敏响应",
+					"path", reqPath, "model", imgReq.Model, "status_code", resp.StatusCode, "reason", reason)
+				writeSSEErrorIfStarted(req.Writer, sseKA, sanitizedImageSSEErrorMessage)
+			}
+			return outcome, forwardErrForOutcome(outcome, fmt.Errorf("%s", reason))
+		}
+	} else {
+		wsResult = ParseSSEStream(resp.Body, handler)
+	}
 	if wsResult.ResponseID != "" && session.SessionKey != "" {
 		updateSessionStateResponseID(session.SessionKey, wsResult.ResponseID)
 	}
