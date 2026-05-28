@@ -1033,11 +1033,11 @@ func TestImageTaskQualityEcho(t *testing.T) {
 	}
 }
 
-// TestBuildImagesToolCreateMsg 翻译 Images REST 请求体为 Responses API
-// response.create 消息，tool 配置保持 Codex 对齐的极简 schema。
+// TestBuildImagesToolCreateMsg 翻译 Images REST 请求体为 Codex HTTP SSE
+// Responses body，tool 配置保持 Codex 对齐的极简 schema。
 func TestBuildImagesToolCreateMsg(t *testing.T) {
 	body := []byte(`{"model":"gpt-image-1.5","prompt":"a shiba","n":1,"size":"1024x1024","quality":"low","background":"transparent","output_format":"png"}`)
-	msg, n, promptTokens, err := buildImagesToolCreateMsg(body, "application/json", false, openAISessionResolution{})
+	msg, n, inputTokens, err := buildImagesToolCreateMsg(body, "application/json", false, openAISessionResolution{})
 	if err != nil {
 		t.Fatalf("buildImagesToolCreateMsg returned err: %v", err)
 	}
@@ -1045,12 +1045,12 @@ func TestBuildImagesToolCreateMsg(t *testing.T) {
 		t.Errorf("n = %d, want 1", n)
 	}
 	// "a shiba" = 7 runes → (7+2)/3 = 3 tokens
-	if promptTokens != 3 {
-		t.Errorf("promptTokens = %d, want 3", promptTokens)
+	if inputTokens != 3 {
+		t.Errorf("inputTokens = %d, want 3", inputTokens)
 	}
 
-	if gjson.GetBytes(msg, "type").String() != "response.create" {
-		t.Errorf("type = %q, want response.create", gjson.GetBytes(msg, "type").String())
+	if gjson.GetBytes(msg, "type").Exists() {
+		t.Errorf("top-level type should not be present for HTTP SSE body: %s", msg)
 	}
 	if gjson.GetBytes(msg, "model").String() != imagesOAuthChatModel {
 		t.Errorf("model = %q, want %q", gjson.GetBytes(msg, "model").String(), imagesOAuthChatModel)
@@ -1128,6 +1128,25 @@ func TestBuildImagesToolCreateMsg_ClampsOversizedSize(t *testing.T) {
 	}
 }
 
+func TestBuildImagesToolCreateMsg_KeepsSessionFieldsWithoutEventWrapper(t *testing.T) {
+	body := []byte(`{"model":"gpt-image-2","prompt":"a shiba","n":1,"size":"1024x1024"}`)
+	msg, _, _, err := buildImagesToolCreateMsg(body, "application/json", false, openAISessionResolution{
+		PromptCacheKey: "cache-key-1",
+	})
+	if err != nil {
+		t.Fatalf("buildImagesToolCreateMsg returned err: %v", err)
+	}
+	if gjson.GetBytes(msg, "type").Exists() {
+		t.Fatalf("HTTP SSE body must not include response.create event wrapper: %s", msg)
+	}
+	if got := gjson.GetBytes(msg, "prompt_cache_key").String(); got != "cache-key-1" {
+		t.Fatalf("prompt_cache_key = %q, want cache-key-1", got)
+	}
+	if got := gjson.GetBytes(msg, "tools.0.type").String(); got != "image_generation" {
+		t.Fatalf("tools[0].type = %q, want image_generation", got)
+	}
+}
+
 // TestBuildImagesToolCreateMsg_NGreaterThanOne V1 不支持 n>1，应直接返错。
 func TestBuildImagesToolCreateMsg_NGreaterThanOne(t *testing.T) {
 	body := []byte(`{"prompt":"x","n":3}`)
@@ -1175,6 +1194,9 @@ func TestBuildImagesToolCreateMsg_Edit_JSON(t *testing.T) {
 	msg, n, inputTokens, err := buildImagesToolCreateMsg(body, "application/json", true, openAISessionResolution{})
 	if err != nil {
 		t.Fatalf("err: %v", err)
+	}
+	if gjson.GetBytes(msg, "type").Exists() {
+		t.Errorf("top-level type should not be present for HTTP SSE body: %s", msg)
 	}
 	if n != 1 {
 		t.Errorf("n = %d, want 1", n)

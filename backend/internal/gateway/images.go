@@ -1218,8 +1218,9 @@ func classifyImageGenCallFailures(failures []ImageGenCallFailure, fallbackDetail
 	return nil
 }
 
-// buildImagesToolCreateMsg 把 Images REST 请求体翻译成 Responses API 的
-// response.create 消息（tools 数组带一个 image_generation 项）。
+// buildImagesToolCreateMsg 把 Images REST 请求体翻译成 Codex HTTP SSE
+// /backend-api/codex/responses 接受的 Responses body（tools 数组带一个
+// image_generation 项）。
 // 返回：上游消息 bytes；n（当前固定 1）；input 估算的 token 数（用于计费）。
 //
 // contentType 仅在 isEdit=true 时需要（可能是 multipart/form-data）。
@@ -1326,7 +1327,8 @@ func buildImagesToolCreateMsgWithUsage(
 		"stream":       true,
 		"store":        false,
 	}
-	msg, err := wrapResponseCreate(payload, imagesOAuthChatModel, session)
+	payload = applySessionFields(payload, session)
+	msg, err := json.Marshal(payload)
 	if err != nil {
 		return nil, 0, imagesInputTokenEstimate{}, err
 	}
@@ -1350,9 +1352,9 @@ func (e imagesInputTokenEstimate) Total() int {
 	return e.TextTokens + e.ImageTokens
 }
 
-// forwardImagesViaResponsesTool 把 OpenAI Images REST 请求翻译成 Responses API
-// 的 image_generation tool 调用，跑 OAuth HTTP/SSE 通道，最后把生成的 base64 图像
-// 重新包装成 Images REST 响应返回给客户端。
+// forwardImagesViaResponsesTool 把 OpenAI Images REST 请求翻译成 Codex HTTP SSE
+// /backend-api/codex/responses 的 image_generation tool 调用，最后把生成的 base64
+// 图像重新包装成 Images REST 响应返回给客户端。
 //
 // 只在 OAuth 账号处理 /v1/images/generations 时使用；API Key 账号继续走原生
 // REST 通道（见 handleImagesResponse）。
