@@ -1412,10 +1412,6 @@ func buildImagesToolCreateMsgWithUsage(
 		if err := normalizeResponsesEditTargetAnnotationPair(req, &regionAnnotation); err != nil {
 			return nil, 0, imagesInputTokenEstimate{}, err
 		}
-		regionAnnotation, err = shrinkResponsesInputImageRef(regionAnnotation)
-		if err != nil {
-			return nil, 0, imagesInputTokenEstimate{}, err
-		}
 	}
 	outputFormat := normalizedImageOutputFormat(req.OutputFormat)
 	if isEdit && req.Mask != "" {
