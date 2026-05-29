@@ -313,19 +313,43 @@ func buildAPIKeyImagesEditMultipartBodyWithRequest(body []byte, contentType stri
 	if req.N > 0 {
 		_ = mw.WriteField("n", strconv.Itoa(req.N))
 	}
+	var firstImageWidth, firstImageHeight int
 	for i, ref := range req.Images {
 		fieldName := "image"
 		if len(req.Images) > 1 {
 			fieldName = "image[]"
 		}
-		if err := writeMultipartImageRef(mw, fieldName, fmt.Sprintf("image-%d", i+1), ref, maxEditInputImageBytes); err != nil {
+		mimeType, data, err := readImageRefBytes(ref, maxEditInputImageBytes)
+		if err != nil {
+			_ = mw.Close()
+			return nil, "", err
+		}
+		if i == 0 {
+			if cfg, _, cfgErr := image.DecodeConfig(bytes.NewReader(data)); cfgErr == nil {
+				firstImageWidth = cfg.Width
+				firstImageHeight = cfg.Height
+			}
+		}
+		if err := writeMultipartImageBytes(mw, fieldName, fmt.Sprintf("image-%d", i+1), mimeType, data); err != nil {
 			_ = mw.Close()
 			return nil, "", nil, err
 		}
 	}
 	if req.Mask != "" {
 		// mask 不压缩：透明度信息不能转 JPEG
-		if err := writeMultipartImageRef(mw, "mask", "mask", req.Mask, 0); err != nil {
+		mimeType, data, err := readImageRefBytes(req.Mask, 0)
+		if err != nil {
+			_ = mw.Close()
+			return nil, "", err
+		}
+		if firstImageWidth > 0 && firstImageHeight > 0 {
+			data, mimeType, err = resizeMaskToImageSize(data, mimeType, firstImageWidth, firstImageHeight)
+			if err != nil {
+				_ = mw.Close()
+				return nil, "", err
+			}
+		}
+		if err := writeMultipartImageBytes(mw, "mask", "mask", mimeType, data); err != nil {
 			_ = mw.Close()
 			return nil, "", nil, err
 		}
@@ -336,11 +360,7 @@ func buildAPIKeyImagesEditMultipartBodyWithRequest(body []byte, contentType stri
 	return buf.Bytes(), mw.FormDataContentType(), req, nil
 }
 
-func writeMultipartImageRef(mw *multipart.Writer, fieldName, baseName, ref string, shrinkLimit int) error {
-	mimeType, data, err := readImageRefBytes(ref, shrinkLimit)
-	if err != nil {
-		return err
-	}
+func writeMultipartImageBytes(mw *multipart.Writer, fieldName, baseName, mimeType string, data []byte) error {
 	ext := ".png"
 	switch mimeType {
 	case "image/jpeg", "image/jpg":
@@ -359,6 +379,29 @@ func writeMultipartImageRef(mw *multipart.Writer, fieldName, baseName, ref strin
 	}
 	_, err = part.Write(data)
 	return err
+}
+
+func resizeMaskToImageSize(data []byte, mimeType string, width, height int) ([]byte, string, error) {
+	if width <= 0 || height <= 0 {
+		return data, mimeType, nil
+	}
+	cfg, _, err := image.DecodeConfig(bytes.NewReader(data))
+	if err != nil {
+		return nil, "", fmt.Errorf("读取 mask 尺寸失败: %w", err)
+	}
+	if cfg.Width == width && cfg.Height == height {
+		return data, mimeType, nil
+	}
+	mask, _, err := image.Decode(bytes.NewReader(data))
+	if err != nil {
+		return nil, "", fmt.Errorf("解码 mask 失败: %w", err)
+	}
+	resized := resizeImageNearest(mask, width, height)
+	var buf bytes.Buffer
+	if err := png.Encode(&buf, resized); err != nil {
+		return nil, "", fmt.Errorf("编码缩放后的 mask 失败: %w", err)
+	}
+	return buf.Bytes(), "image/png", nil
 }
 
 func readImageRefBytes(ref string, shrinkLimit int) (string, []byte, error) {
@@ -1064,8 +1107,108 @@ func shrinkResponsesInputImages(req *imagesRequest) error {
 	return nil
 }
 
+func normalizeResponsesEditTargetImage(req *imagesRequest) error {
+	if req == nil || len(req.Images) == 0 {
+		return nil
+	}
+	mimeType, data, err := readImageRefBytes(req.Images[0], maxResponsesInputImageBytes)
+	if err != nil {
+		return err
+	}
+	req.Images[0] = "data:" + mimeType + ";base64," + base64.StdEncoding.EncodeToString(data)
+	return nil
+}
+
+func normalizeResponsesEditTargetAnnotationPair(req *imagesRequest, annotationRef *string) error {
+	if req == nil || len(req.Images) == 0 || annotationRef == nil || *annotationRef == "" {
+		return nil
+	}
+	targetMime, targetData, err := decodeDataImageURL(req.Images[0])
+	if err != nil {
+		return err
+	}
+	annotationMime, annotationData, err := decodeDataImageURL(*annotationRef)
+	if err != nil {
+		return err
+	}
+	targetCfg, _, err := image.DecodeConfig(bytes.NewReader(targetData))
+	if err != nil {
+		return err
+	}
+	annotationCfg, _, err := image.DecodeConfig(bytes.NewReader(annotationData))
+	if err != nil {
+		return err
+	}
+	if targetCfg.Width == annotationCfg.Width && targetCfg.Height == annotationCfg.Height &&
+		len(targetData) <= maxResponsesInputImageBytes && len(annotationData) <= maxResponsesInputImageBytes {
+		return nil
+	}
+	targetImg, _, err := image.Decode(bytes.NewReader(targetData))
+	if err != nil {
+		return err
+	}
+	annotationImg, _, err := image.Decode(bytes.NewReader(annotationData))
+	if err != nil {
+		return err
+	}
+
+	width, height := targetCfg.Width, targetCfg.Height
+	if annotationCfg.Width < width {
+		width = annotationCfg.Width
+	}
+	if annotationCfg.Height < height {
+		height = annotationCfg.Height
+	}
+	for range 10 {
+		if width <= 0 || height <= 0 {
+			break
+		}
+		targetOut := targetImg
+		annotationOut := annotationImg
+		if targetCfg.Width != width || targetCfg.Height != height {
+			targetOut = resizeImageNearest(targetImg, width, height)
+		}
+		if annotationCfg.Width != width || annotationCfg.Height != height {
+			annotationOut = resizeImageNearest(annotationImg, width, height)
+		}
+		targetBytes, targetOutMime, err := encodeImageForResponsesInput(targetOut, targetMime)
+		if err != nil {
+			return err
+		}
+		annotationBytes, annotationOutMime, err := encodeImageForResponsesInput(annotationOut, annotationMime)
+		if err != nil {
+			return err
+		}
+		if len(targetBytes) <= maxResponsesInputImageBytes && len(annotationBytes) <= maxResponsesInputImageBytes {
+			req.Images[0] = "data:" + targetOutMime + ";base64," + base64.StdEncoding.EncodeToString(targetBytes)
+			*annotationRef = "data:" + annotationOutMime + ";base64," + base64.StdEncoding.EncodeToString(annotationBytes)
+			return nil
+		}
+		width = width * 3 / 4
+		height = height * 3 / 4
+		if width < 256 || height < 256 {
+			break
+		}
+	}
+	return fmt.Errorf("OAuth edit input pair exceeds %dMB limit after resizing", maxResponsesInputImageBytes/(1024*1024))
+}
+
 func shrinkResponsesInputImageRef(ref string) (string, error) {
 	return shrinkDataImageURL(ref, maxResponsesInputImageBytes)
+}
+
+func encodeImageForResponsesInput(img image.Image, preferredMime string) ([]byte, string, error) {
+	if strings.EqualFold(preferredMime, "image/png") {
+		var buf bytes.Buffer
+		if err := png.Encode(&buf, img); err != nil {
+			return nil, "", err
+		}
+		if buf.Len() <= maxResponsesInputImageBytes {
+			return buf.Bytes(), "image/png", nil
+		}
+	}
+	data, mimeType, err := encodeJPEGWithinLimit(img, maxResponsesInputImageBytes)
+	return data, mimeType, err
 }
 
 // shrinkDataImageURL 将 data URL 格式的图片压缩到 limit 字节以内。
@@ -1256,11 +1399,19 @@ func buildImagesToolCreateMsgWithUsage(
 	if err := shrinkResponsesInputImages(req); err != nil {
 		return nil, 0, imagesInputTokenEstimate{}, err
 	}
+	if isEdit && req.Mask != "" {
+		if err := normalizeResponsesEditTargetImage(req); err != nil {
+			return nil, 0, imagesInputTokenEstimate{}, err
+		}
+	}
 	regionAnnotation, err := buildEditRegionAnnotation(req)
 	if err != nil {
 		return nil, 0, imagesInputTokenEstimate{}, err
 	}
 	if regionAnnotation != "" {
+		if err := normalizeResponsesEditTargetAnnotationPair(req, &regionAnnotation); err != nil {
+			return nil, 0, imagesInputTokenEstimate{}, err
+		}
 		regionAnnotation, err = shrinkResponsesInputImageRef(regionAnnotation)
 		if err != nil {
 			return nil, 0, imagesInputTokenEstimate{}, err

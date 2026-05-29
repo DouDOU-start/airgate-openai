@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"image"
 	"image/color"
+	"image/draw"
 	"image/png"
 	"io"
 	"log/slog"
@@ -1430,6 +1431,60 @@ func TestBuildImagesToolCreateMsg_Edit_StudioShape(t *testing.T) {
 	}
 }
 
+func TestShrinkTaskInputImages_ResizesMaskWithShrunkImage(t *testing.T) {
+	img := image.NewRGBA(image.Rect(0, 0, 3000, 3000))
+	seed := uint32(1)
+	for y := 0; y < 3000; y++ {
+		for x := 0; x < 3000; x++ {
+			seed = seed*1664525 + 1013904223
+			img.SetRGBA(x, y, color.RGBA{R: uint8(seed >> 16), G: uint8(seed >> 8), B: uint8(seed), A: 255})
+		}
+	}
+	mask := image.NewRGBA(image.Rect(0, 0, 3000, 3000))
+	draw.Draw(mask, mask.Bounds(), image.NewUniform(color.RGBA{R: 255, G: 255, B: 255, A: 255}), image.Point{}, draw.Src)
+	draw.Draw(mask, image.Rect(750, 900, 1600, 1800), image.Transparent, image.Point{}, draw.Src)
+
+	input := map[string]any{
+		"images": []string{testPNGDataURLFromImage(img)},
+		"mask":   testPNGDataURLFromImage(mask),
+	}
+	if err := shrinkTaskInputImages(input); err != nil {
+		t.Fatalf("shrinkTaskInputImages returned err: %v", err)
+	}
+	images := input["images"].([]string)
+	if len(images) != 1 {
+		t.Fatalf("images len = %d", len(images))
+	}
+	imageMime, imageBytes, err := decodeDataImageURL(images[0])
+	if err != nil {
+		t.Fatalf("decode image: %v", err)
+	}
+	maskMime, maskBytes, err := decodeDataImageURL(input["mask"].(string))
+	if err != nil {
+		t.Fatalf("decode mask: %v", err)
+	}
+	if imageMime != "image/jpeg" {
+		t.Fatalf("image mime = %q, want compressed jpeg", imageMime)
+	}
+	if maskMime != "image/png" {
+		t.Fatalf("mask mime = %q, want png", maskMime)
+	}
+	imageCfg, _, err := image.DecodeConfig(bytes.NewReader(imageBytes))
+	if err != nil {
+		t.Fatalf("decode image config: %v", err)
+	}
+	maskCfg, _, err := image.DecodeConfig(bytes.NewReader(maskBytes))
+	if err != nil {
+		t.Fatalf("decode mask config: %v", err)
+	}
+	if imageCfg.Width >= 3000 || imageCfg.Height >= 3000 {
+		t.Fatalf("test image did not shrink: %dx%d", imageCfg.Width, imageCfg.Height)
+	}
+	if maskCfg.Width != imageCfg.Width || maskCfg.Height != imageCfg.Height {
+		t.Fatalf("mask size = %dx%d, want image size %dx%d", maskCfg.Width, maskCfg.Height, imageCfg.Width, imageCfg.Height)
+	}
+}
+
 type noopWSEventHandler struct{}
 
 func (noopWSEventHandler) OnTextDelta(string)        {}
@@ -1499,6 +1554,64 @@ func TestBuildImagesToolCreateMsg_Edit_ShrinksLargeInputImage(t *testing.T) {
 	}
 }
 
+func TestBuildImagesToolCreateMsg_Edit_AlignsRegionAnnotationWithShrunkTarget(t *testing.T) {
+	img := image.NewRGBA(image.Rect(0, 0, 3000, 3000))
+	seed := uint32(1)
+	for y := 0; y < 3000; y++ {
+		for x := 0; x < 3000; x++ {
+			seed = seed*1664525 + 1013904223
+			img.SetRGBA(x, y, color.RGBA{R: uint8(seed >> 16), G: uint8(seed >> 8), B: uint8(seed), A: 255})
+		}
+	}
+	mask := image.NewRGBA(image.Rect(0, 0, 3000, 3000))
+	draw.Draw(mask, mask.Bounds(), image.NewUniform(color.RGBA{R: 255, G: 255, B: 255, A: 255}), image.Point{}, draw.Src)
+	draw.Draw(mask, image.Rect(750, 900, 1600, 1800), image.Transparent, image.Point{}, draw.Src)
+
+	body := []byte(fmt.Sprintf(`{
+		"prompt":"edit marked region",
+		"model":"gpt-image-2",
+		"image":%q,
+		"mask":%q
+	}`, testPNGDataURLFromImage(img), testPNGDataURLFromImage(mask)))
+	msg, _, _, err := buildImagesToolCreateMsg(body, "application/json", true, openAISessionResolution{})
+	if err != nil {
+		t.Fatalf("buildImagesToolCreateMsg returned err: %v", err)
+	}
+	targetRef := gjson.GetBytes(msg, "input.0.content.1.image_url").String()
+	annotationRef := gjson.GetBytes(msg, "input.0.content.2.image_url").String()
+	if targetRef == "" || annotationRef == "" {
+		t.Fatalf("missing target or annotation: %s", msg)
+	}
+	_, targetBytes, err := decodeDataImageURL(targetRef)
+	if err != nil {
+		t.Fatalf("decode target: %v", err)
+	}
+	_, annotationBytes, err := decodeDataImageURL(annotationRef)
+	if err != nil {
+		t.Fatalf("decode annotation: %v", err)
+	}
+	if len(targetBytes) > maxResponsesInputImageBytes {
+		t.Fatalf("target bytes = %d, want <= %d", len(targetBytes), maxResponsesInputImageBytes)
+	}
+	if len(annotationBytes) > maxResponsesInputImageBytes {
+		t.Fatalf("annotation bytes = %d, want <= %d", len(annotationBytes), maxResponsesInputImageBytes)
+	}
+	targetCfg, _, err := image.DecodeConfig(bytes.NewReader(targetBytes))
+	if err != nil {
+		t.Fatalf("decode target config: %v", err)
+	}
+	annotationCfg, _, err := image.DecodeConfig(bytes.NewReader(annotationBytes))
+	if err != nil {
+		t.Fatalf("decode annotation config: %v", err)
+	}
+	if targetCfg.Width >= 3000 || targetCfg.Height >= 3000 {
+		t.Fatalf("test target did not shrink: %dx%d", targetCfg.Width, targetCfg.Height)
+	}
+	if annotationCfg.Width != targetCfg.Width || annotationCfg.Height != targetCfg.Height {
+		t.Fatalf("annotation size = %dx%d, want target size %dx%d", annotationCfg.Width, annotationCfg.Height, targetCfg.Width, targetCfg.Height)
+	}
+}
+
 // TestParseImagesEditMultipart 覆盖 OpenAI SDK 标准的 multipart/form-data 请求：
 // image 文件 + prompt 文本 + mask 文件 → 规范化后 images / mask 都应是 data URL。
 func TestBuildAPIKeyImagesEditMultipartBody(t *testing.T) {
@@ -1529,6 +1642,68 @@ func TestBuildAPIKeyImagesEditMultipartBody(t *testing.T) {
 	}
 	if len(req.Images) != 1 || req.Images[0] != "data:image/png;base64,"+base64.StdEncoding.EncodeToString(pngBytes) {
 		t.Fatalf("image wrong: %+v", req.Images)
+	}
+}
+
+func TestBuildAPIKeyImagesEditMultipartBody_ResizesMaskWithShrunkImage(t *testing.T) {
+	img := image.NewRGBA(image.Rect(0, 0, 3000, 3000))
+	seed := uint32(1)
+	for y := 0; y < 3000; y++ {
+		for x := 0; x < 3000; x++ {
+			seed = seed*1664525 + 1013904223
+			img.SetRGBA(x, y, color.RGBA{R: uint8(seed >> 16), G: uint8(seed >> 8), B: uint8(seed), A: 255})
+		}
+	}
+	mask := image.NewRGBA(image.Rect(0, 0, 3000, 3000))
+	draw.Draw(mask, mask.Bounds(), image.NewUniform(color.RGBA{R: 255, G: 255, B: 255, A: 255}), image.Point{}, draw.Src)
+	draw.Draw(mask, image.Rect(750, 900, 1600, 1800), image.Transparent, image.Point{}, draw.Src)
+
+	body := []byte(fmt.Sprintf(`{
+		"prompt":"edit marked region",
+		"model":"gpt-image-2",
+		"image":%q,
+		"mask":%q
+	}`, testPNGDataURLFromImage(img), testPNGDataURLFromImage(mask)))
+
+	multipartBody, contentType, err := buildAPIKeyImagesEditMultipartBody(body, "application/json")
+	if err != nil {
+		t.Fatalf("buildAPIKeyImagesEditMultipartBody err: %v", err)
+	}
+	req, err := parseImagesRequest(multipartBody, contentType, true)
+	if err != nil {
+		t.Fatalf("parseImagesRequest err: %v", err)
+	}
+	if len(req.Images) != 1 || req.Mask == "" {
+		t.Fatalf("missing image/mask: images=%d mask=%v", len(req.Images), req.Mask != "")
+	}
+
+	imageMime, imageBytes, err := decodeDataImageURL(req.Images[0])
+	if err != nil {
+		t.Fatalf("decode image: %v", err)
+	}
+	maskMime, maskBytes, err := decodeDataImageURL(req.Mask)
+	if err != nil {
+		t.Fatalf("decode mask: %v", err)
+	}
+	if imageMime != "image/jpeg" {
+		t.Fatalf("image mime = %q, want compressed jpeg", imageMime)
+	}
+	if maskMime != "image/png" {
+		t.Fatalf("mask mime = %q, want png", maskMime)
+	}
+	imageCfg, _, err := image.DecodeConfig(bytes.NewReader(imageBytes))
+	if err != nil {
+		t.Fatalf("decode image config: %v", err)
+	}
+	maskCfg, _, err := image.DecodeConfig(bytes.NewReader(maskBytes))
+	if err != nil {
+		t.Fatalf("decode mask config: %v", err)
+	}
+	if imageCfg.Width >= 3000 || imageCfg.Height >= 3000 {
+		t.Fatalf("test image did not shrink: %dx%d", imageCfg.Width, imageCfg.Height)
+	}
+	if maskCfg.Width != imageCfg.Width || maskCfg.Height != imageCfg.Height {
+		t.Fatalf("mask size = %dx%d, want image size %dx%d", maskCfg.Width, maskCfg.Height, imageCfg.Width, imageCfg.Height)
 	}
 }
 
