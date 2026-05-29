@@ -7,9 +7,9 @@ import (
 	"strings"
 	"time"
 
-	sdk "github.com/DouDOU-start/airgate-sdk/sdkgo"
+	sdk "github.com/DevilGenius/airgate-sdk/sdkgo"
 
-	"github.com/DouDOU-start/airgate-openai/backend/internal/model"
+	"github.com/DevilGenius/airgate-openai/backend/internal/model"
 )
 
 // 构造 ForwardOutcome 的小 helper，避免各路径散落一堆 struct literal。

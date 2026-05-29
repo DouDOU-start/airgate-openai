@@ -1,5 +1,5 @@
 import type { CSSProperties, ReactNode } from 'react';
-import type { UsageRecordSurfaceProps } from '@doudou-start/airgate-theme/plugin';
+import type { UsageRecordSurfaceProps } from '@devilgenius/airgate-theme/plugin';
 
 interface UsageRecordLike {
   model?: string;

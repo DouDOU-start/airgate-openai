@@ -9,7 +9,7 @@ permissions:
   contents: write
 
 env:
-  GOPRIVATE: github.com/DouDOU-start/airgate-sdk
+  GOPRIVATE: github.com/DevilGenius/airgate-sdk
 
 jobs:
   build:
@@ -64,7 +64,7 @@ jobs:
           echo "Injecting PluginVersion=${VERSION}"
           mkdir -p bin
           cd backend && go build -buildvcs=false -trimpath \
-            -ldflags "-X 'github.com/DouDOU-start/airgate-openai/backend/internal/gateway.PluginVersion=${VERSION}'" \
+            -ldflags "-X 'github.com/DevilGenius/airgate-openai/backend/internal/gateway.PluginVersion=${VERSION}'" \
             -o ../bin/gateway-openai-${{ matrix.goos }}-${{ matrix.goarch }} .
 
       - name: Generate SHA256

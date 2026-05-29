@@ -16,9 +16,9 @@ import (
 	"strings"
 	"time"
 
-	sdk "github.com/DouDOU-start/airgate-sdk/sdkgo"
+	sdk "github.com/DevilGenius/airgate-sdk/sdkgo"
 
-	"github.com/DouDOU-start/airgate-openai/backend/internal/gateway/imgen"
+	"github.com/DevilGenius/airgate-openai/backend/internal/gateway/imgen"
 )
 
 // decodeImageRefs 把 parseImagesRequest 返回的 data URL / http URL 字符串列表

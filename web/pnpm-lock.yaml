@@ -8,9 +8,9 @@ importers:
 
   .:
     dependencies:
-      '@doudou-start/airgate-theme':
-        specifier: https://github.com/DouDOU-start/airgate-sdk/releases/download/v0.2.1/airgate-theme-v0.2.1.tgz
-        version: https://github.com/DouDOU-start/airgate-sdk/releases/download/v0.2.1/airgate-theme-v0.2.1.tgz(react@19.2.5)
+      '@devilgenius/airgate-theme':
+        specifier: https://github.com/DevilGenius/airgate-sdk/releases/download/v0.2.1/airgate-theme-v0.2.1.tgz
+        version: https://github.com/DevilGenius/airgate-sdk/releases/download/v0.2.1/airgate-theme-v0.2.1.tgz(react@19.2.5)
       react:
         specifier: ^19.0.0
         version: 19.2.5
@@ -128,8 +128,8 @@ packages:
     resolution: {integrity: sha512-LwdZHpScM4Qz8Xw2iKSzS+cfglZzJGvofQICy7W7v4caru4EaAmyUuO6BGrbyQ2mYV11W0U8j5mBhd14dd3B0A==}
     engines: {node: '>=6.9.0'}
 
-  '@doudou-start/airgate-theme@https://github.com/DouDOU-start/airgate-sdk/releases/download/v0.2.1/airgate-theme-v0.2.1.tgz':
-    resolution: {tarball: https://github.com/DouDOU-start/airgate-sdk/releases/download/v0.2.1/airgate-theme-v0.2.1.tgz}
+  '@devilgenius/airgate-theme@https://github.com/DevilGenius/airgate-sdk/releases/download/v0.2.1/airgate-theme-v0.2.1.tgz':
+    resolution: {tarball: https://github.com/DevilGenius/airgate-sdk/releases/download/v0.2.1/airgate-theme-v0.2.1.tgz}
     version: 0.2.1
     peerDependencies:
       react: ^19.0.0
@@ -1123,7 +1123,7 @@ snapshots:
       '@babel/helper-string-parser': 7.27.1
       '@babel/helper-validator-identifier': 7.28.5
 
-  '@doudou-start/airgate-theme@https://github.com/DouDOU-start/airgate-sdk/releases/download/v0.2.1/airgate-theme-v0.2.1.tgz(react@19.2.5)':
+  '@devilgenius/airgate-theme@https://github.com/DevilGenius/airgate-sdk/releases/download/v0.2.1/airgate-theme-v0.2.1.tgz(react@19.2.5)':
     dependencies:
       react: 19.2.5
 

@@ -16,7 +16,7 @@ import (
 
 	"github.com/tidwall/gjson"
 
-	sdk "github.com/DouDOU-start/airgate-sdk/sdkgo"
+	sdk "github.com/DevilGenius/airgate-sdk/sdkgo"
 )
 
 // upstreamSSEMaxLineBytes 是上游 SSE 单行最大字节数。

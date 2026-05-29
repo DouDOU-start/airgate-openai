@@ -75,7 +75,7 @@ lint: ## 代码检查（需要安装 golangci-lint）
 fmt: ## 格式化代码
 	@cd backend && \
 	if command -v goimports > /dev/null 2>&1; then \
-		goimports -w -local github.com/DouDOU-start .; \
+		goimports -w -local github.com/DevilGenius .; \
 	else \
 		$(GO) fmt ./...; \
 	fi

@@ -4,9 +4,9 @@
   <p><strong>OpenAI / ChatGPT / Anthropic 协议三合一网关插件</strong></p>
 
   <p>
-    <a href="https://github.com/DouDOU-start/airgate-openai/releases"><img src="https://img.shields.io/github/v/release/DouDOU-start/airgate-openai?style=flat-square" alt="release" /></a>
-    <a href="https://github.com/DouDOU-start/airgate-openai/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/DouDOU-start/airgate-openai/ci.yml?branch=master&style=flat-square&label=CI" alt="ci" /></a>
-    <a href="https://github.com/DouDOU-start/airgate-openai/blob/master/LICENSE"><img src="https://img.shields.io/github/license/DouDOU-start/airgate-openai?style=flat-square" alt="license" /></a>
+    <a href="https://github.com/DevilGenius/airgate-openai/releases"><img src="https://img.shields.io/github/v/release/DevilGenius/airgate-openai?style=flat-square" alt="release" /></a>
+    <a href="https://github.com/DevilGenius/airgate-openai/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/DevilGenius/airgate-openai/ci.yml?branch=apex&style=flat-square&label=CI" alt="ci" /></a>
+    <a href="https://github.com/DevilGenius/airgate-openai/blob/apex/LICENSE"><img src="https://img.shields.io/github/license/DevilGenius/airgate-openai?style=flat-square" alt="license" /></a>
     <img src="https://img.shields.io/badge/Go-1.25-00ADD8?style=flat-square&logo=go" alt="go" />
     <img src="https://img.shields.io/badge/React-19-61DAFB?style=flat-square&logo=react" alt="react" />
   </p>
@@ -14,7 +14,7 @@
 
 ---
 
-AirGate OpenAI 不是又一个"OpenAI 转发服务"，而是 [airgate-core](https://github.com/DouDOU-start/airgate-core) 的旗舰网关插件，也是 [airgate-sdk](https://github.com/DouDOU-start/airgate-sdk) 的官方参考实现。它在一个 gRPC 子进程里同时承载：
+AirGate OpenAI 不是又一个"OpenAI 转发服务"，而是 [airgate-core](https://github.com/DevilGenius/airgate-core) 的旗舰网关插件，也是 [airgate-sdk](https://github.com/DevilGenius/airgate-sdk) 的官方参考实现。它在一个 gRPC 子进程里同时承载：
 
 - **OpenAI Responses / Chat Completions API** 转发（Codex 核心端点）
 - **ChatGPT OAuth 浏览器授权账号** 接入（PKCE + WebSocket 桥接）
@@ -128,19 +128,19 @@ AirGate OpenAI 不是又一个"OpenAI 转发服务"，而是 [airgate-core](http
 ```text
 1. 插件市场 → 点击「安装」               （从 GitHub Release 自动拉取，匹配当前架构）
 2. 上传安装 → 拖入二进制文件              （适合内部环境 / 自建二进制）
-3. GitHub 安装 → 输入 DouDOU-start/airgate-openai
+3. GitHub 安装 → 输入 DevilGenius/airgate-openai
 ```
 
 market 会**定时从 GitHub API 同步**最新 release（默认 6h，使用 ETag 不消耗 API 配额），新 tag push 后通常几分钟内即可在市场看到。
 
 ### 方式 2：源码运行（开发）
 
-需要 Go 1.25+、Node 22+，以及兄弟目录 [`airgate-sdk`](https://github.com/DouDOU-start/airgate-sdk) 与 [`airgate-core`](https://github.com/DouDOU-start/airgate-core)：
+需要 Go 1.25+、Node 22+，以及兄弟目录 [`airgate-sdk`](https://github.com/DevilGenius/airgate-sdk) 与 [`airgate-core`](https://github.com/DevilGenius/airgate-core)：
 
 ```bash
-git clone https://github.com/DouDOU-start/airgate-sdk.git
-git clone https://github.com/DouDOU-start/airgate-core.git
-git clone https://github.com/DouDOU-start/airgate-openai.git
+git clone https://github.com/DevilGenius/airgate-sdk.git
+git clone https://github.com/DevilGenius/airgate-core.git
+git clone https://github.com/DevilGenius/airgate-openai.git
 cd airgate-openai
 
 make install        # 装 web 依赖与 Go 模块
@@ -248,9 +248,9 @@ git push origin v0.2.0
 
 ## 🤝 贡献 / 反馈
 
-- Bug / Feature: [Issues](https://github.com/DouDOU-start/airgate-openai/issues)
-- 主仓库: [airgate-core](https://github.com/DouDOU-start/airgate-core)
-- 插件 SDK: [airgate-sdk](https://github.com/DouDOU-start/airgate-sdk)
+- Bug / Feature: [Issues](https://github.com/DevilGenius/airgate-openai/issues)
+- 主仓库: [airgate-core](https://github.com/DevilGenius/airgate-core)
+- 插件 SDK: [airgate-sdk](https://github.com/DevilGenius/airgate-sdk)
 
 ## 📜 License
 

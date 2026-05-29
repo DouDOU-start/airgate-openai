@@ -11,9 +11,9 @@ import (
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 
-	"github.com/DouDOU-start/airgate-openai/backend/internal/model"
-	"github.com/DouDOU-start/airgate-openai/backend/resources"
-	sdk "github.com/DouDOU-start/airgate-sdk/sdkgo"
+	"github.com/DevilGenius/airgate-openai/backend/internal/model"
+	"github.com/DevilGenius/airgate-openai/backend/resources"
+	sdk "github.com/DevilGenius/airgate-sdk/sdkgo"
 )
 
 // modelMetadataOverrides 仅用于 /v1/models 响应补齐。

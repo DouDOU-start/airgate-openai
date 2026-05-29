@@ -17,8 +17,8 @@ import (
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 
-	"github.com/DouDOU-start/airgate-openai/backend/internal/model"
-	sdk "github.com/DouDOU-start/airgate-sdk/sdkgo"
+	"github.com/DevilGenius/airgate-openai/backend/internal/model"
+	sdk "github.com/DevilGenius/airgate-sdk/sdkgo"
 )
 
 // redactURL 去掉 query string，仅保留 host+path（避免敏感参数泄漏到日志）

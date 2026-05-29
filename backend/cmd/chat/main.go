@@ -10,7 +10,7 @@ import (
 	"os"
 	"strings"
 
-	"github.com/DouDOU-start/airgate-openai/backend/internal/gateway"
+	"github.com/DevilGenius/airgate-openai/backend/internal/gateway"
 )
 
 func main() {

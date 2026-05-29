@@ -1,5 +1,5 @@
 import type { CSSProperties } from 'react';
-import type { AccountSurfaceProps } from '@doudou-start/airgate-theme/plugin';
+import type { AccountSurfaceProps } from '@devilgenius/airgate-theme/plugin';
 
 type AccountLike = {
   type?: string;

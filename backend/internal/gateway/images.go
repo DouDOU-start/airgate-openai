@@ -27,7 +27,7 @@ import (
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 
-	sdk "github.com/DouDOU-start/airgate-sdk/sdkgo"
+	sdk "github.com/DevilGenius/airgate-sdk/sdkgo"
 )
 
 // imagesOAuthChatModel OAuth 下 REST→tools 翻译时使用的主 chat 模型。

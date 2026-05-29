@@ -1,8 +1,8 @@
 package main
 
 import (
-	"github.com/DouDOU-start/airgate-openai/backend/internal/gateway"
-	sdkgrpc "github.com/DouDOU-start/airgate-sdk/runtimego/grpc"
+	"github.com/DevilGenius/airgate-openai/backend/internal/gateway"
+	sdkgrpc "github.com/DevilGenius/airgate-sdk/runtimego/grpc"
 )
 
 func main() {

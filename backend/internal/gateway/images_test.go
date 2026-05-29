@@ -24,7 +24,7 @@ import (
 	"github.com/gorilla/websocket"
 	"github.com/tidwall/gjson"
 
-	sdk "github.com/DouDOU-start/airgate-sdk/sdkgo"
+	sdk "github.com/DevilGenius/airgate-sdk/sdkgo"
 )
 
 func testPNGDataURL(width, height int, pixel func(int, int) color.RGBA) string {

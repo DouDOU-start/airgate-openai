@@ -14,9 +14,9 @@ import (
 	"strings"
 	"time"
 
-	sdk "github.com/DouDOU-start/airgate-sdk/sdkgo"
+	sdk "github.com/DevilGenius/airgate-sdk/sdkgo"
 
-	"github.com/DouDOU-start/airgate-openai/backend/internal/model"
+	"github.com/DevilGenius/airgate-openai/backend/internal/model"
 )
 
 // OpenAIGateway OpenAI 网关插件（SimpleGatewayPlugin 实现）

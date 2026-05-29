@@ -6,9 +6,9 @@ import (
 	"log"
 	"net/http"
 
-	"github.com/DouDOU-start/airgate-sdk/devkit/devserver"
+	"github.com/DevilGenius/airgate-sdk/devkit/devserver"
 
-	"github.com/DouDOU-start/airgate-openai/backend/internal/gateway"
+	"github.com/DevilGenius/airgate-openai/backend/internal/gateway"
 )
 
 func main() {

@@ -4,7 +4,7 @@ import (
 	"context"
 	"sort"
 
-	sdk "github.com/DouDOU-start/airgate-sdk/sdkgo"
+	sdk "github.com/DevilGenius/airgate-sdk/sdkgo"
 )
 
 // TaskHandler 任务类型处理器。插件为每个任务类型实现此接口，注册到 TaskRegistry。

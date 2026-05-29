@@ -12,8 +12,8 @@ import (
 
 	"github.com/gorilla/websocket"
 
-	"github.com/DouDOU-start/airgate-openai/backend/internal/gateway"
-	"github.com/DouDOU-start/airgate-openai/backend/resources"
+	"github.com/DevilGenius/airgate-openai/backend/internal/gateway"
+	"github.com/DevilGenius/airgate-openai/backend/resources"
 )
 
 // ──────────────────────────────────────────────────────

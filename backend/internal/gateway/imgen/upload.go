@@ -14,7 +14,7 @@ import (
 	"net/http"
 	"strings"
 
-	sdk "github.com/DouDOU-start/airgate-sdk/sdkgo"
+	sdk "github.com/DevilGenius/airgate-sdk/sdkgo"
 )
 
 // ImageInput 调用方传入的待上传图片（内存中的原始二进制）。

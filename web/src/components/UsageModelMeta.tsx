@@ -1,4 +1,4 @@
-import type { UsageRecordSurfaceProps } from '@doudou-start/airgate-theme/plugin';
+import type { UsageRecordSurfaceProps } from '@devilgenius/airgate-theme/plugin';
 import type { CSSProperties } from 'react';
 
 type UsageContext = {
