@@ -115,7 +115,7 @@ func TestIsAnthropicRequest(t *testing.T) {
 	}
 }
 
-func TestApplyContinuationStateDoesNotBackfillPreviousResponseID(t *testing.T) {
+func TestApplyContinuationStateBackfillsPreviousResponseIDForToolOutput(t *testing.T) {
 	reqBody := map[string]any{
 		"input": []any{
 			map[string]any{
@@ -128,18 +128,31 @@ func TestApplyContinuationStateDoesNotBackfillPreviousResponseID(t *testing.T) {
 
 	session := openAISessionResolution{PreviousRespID: "resp_prev"}
 	reqBody = applyContinuationState(reqBody, session)
-	if got, _ := reqBody["previous_response_id"].(string); got != "" {
-		t.Fatalf("expected previous_response_id to NOT be backfilled, got %q", got)
+	if got, _ := reqBody["previous_response_id"].(string); got != "resp_prev" {
+		t.Fatalf("previous_response_id = %q, want resp_prev", got)
 	}
 }
 
-func TestDropPreviousResponseIDFromJSON(t *testing.T) {
-	next, changed := dropPreviousResponseIDFromJSON([]byte(`{"model":"gpt-5.4","previous_response_id":"resp_old","input":[]}`))
-	if !changed {
-		t.Fatalf("expected previous_response_id to be removed")
+func TestApplyContinuationStateDoesNotBackfillWithToolCallContext(t *testing.T) {
+	reqBody := map[string]any{
+		"input": []any{
+			map[string]any{
+				"type":    "function_call",
+				"call_id": "call_1",
+				"name":    "lookup",
+			},
+			map[string]any{
+				"type":    "function_call_output",
+				"call_id": "call_1",
+				"output":  "ok",
+			},
+		},
 	}
-	if string(next) == `{"model":"gpt-5.4","previous_response_id":"resp_old","input":[]}` {
-		t.Fatalf("expected updated payload")
+
+	session := openAISessionResolution{PreviousRespID: "resp_prev"}
+	reqBody = applyContinuationState(reqBody, session)
+	if got, _ := reqBody["previous_response_id"].(string); got != "" {
+		t.Fatalf("expected previous_response_id to stay empty when tool call context is present, got %q", got)
 	}
 }
 
@@ -323,6 +336,14 @@ func TestPreprocessRequestBody_ForcesResponsesStoreFalse(t *testing.T) {
 				t.Fatalf("store = %v, want false; body=%s", store.Value(), got)
 			}
 		})
+	}
+}
+
+func TestPreprocessRequestBodyPreservesPreviousResponseID(t *testing.T) {
+	body := []byte(`{"model":"gpt-5.4","previous_response_id":"resp_old","input":[]}`)
+	got := preprocessRequestBody(body, "gpt-5.4", "/v1/responses")
+	if previous := gjson.GetBytes(got, "previous_response_id").String(); previous != "resp_old" {
+		t.Fatalf("previous_response_id = %q, want resp_old; body=%s", previous, got)
 	}
 }
 

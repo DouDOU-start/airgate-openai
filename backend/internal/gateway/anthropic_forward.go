@@ -26,7 +26,7 @@ func (g *OpenAIGateway) forwardAnthropicMessage(ctx context.Context, req *sdk.Fo
 	start := time.Now()
 	body := req.Body
 	strategy := resolveAnthropicUpstreamStrategy(req.Account)
-	session := resolveOpenAISession(req.Headers, req.Body)
+	session := resolveOpenAISession(req.Headers, req.Body, req.Account.ID)
 	session.DigestChain = buildAnthropicDigestChain(body)
 	if session.SessionKey == "" {
 		if reusedSessionID, matchedChain, ok := findAnthropicDigestSession(req.Account.ID, session.DigestChain); ok {
@@ -41,7 +41,7 @@ func (g *OpenAIGateway) forwardAnthropicMessage(ctx context.Context, req *sdk.Fo
 			session.SessionSource = "anthropic_digest_new"
 		}
 	}
-	updateSessionStateFromRequest(session)
+	updateSessionStateFromRequest(session, req.Account.ID)
 
 	logger := sdk.LoggerFromContext(ctx)
 	logger.Debug("anthropic_request_received",
@@ -516,7 +516,7 @@ func (g *OpenAIGateway) handleAnthropicNonStreamFromResponses(
 		return transientOutcome(reason), fmt.Errorf("%s", reason)
 	}
 	if session.SessionKey != "" && wsResult.ResponseID != "" {
-		updateSessionStateResponseID(session.SessionKey, wsResult.ResponseID)
+		updateSessionStateResponseID(session.SessionKey, wsResult.ResponseID, accountID)
 	}
 	if session.SessionID != "" && session.DigestChain != "" {
 		saveAnthropicDigestSession(accountID, session.DigestChain, session.SessionID, session.MatchedDigest)
@@ -554,6 +554,7 @@ func (g *OpenAIGateway) handleAnthropicNonStreamFromResponses(
 		elapsed.Milliseconds(),
 	)
 	fillUsageCost(usage)
+	setUsageResponseID(usage, wsResult.ResponseID)
 	return sdk.ForwardOutcome{
 		Kind:     sdk.OutcomeSuccess,
 		Upstream: sdk.UpstreamResponse{StatusCode: http.StatusOK, Headers: upstreamHeaders, Body: anthropicBody},

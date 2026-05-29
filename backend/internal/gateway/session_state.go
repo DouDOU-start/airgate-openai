@@ -17,6 +17,7 @@ type openAISessionState struct {
 	SessionID       string    `json:"session_id,omitempty"`
 	ConversationID  string    `json:"conversation_id,omitempty"`
 	PromptCacheKey  string    `json:"prompt_cache_key,omitempty"`
+	AccountID       int64     `json:"account_id,omitempty"`
 	LastResponseID  string    `json:"last_response_id,omitempty"`
 	LastTurnState   string    `json:"last_turn_state,omitempty"`
 	LastSeenAt      time.Time `json:"last_seen_at"`
@@ -130,13 +131,14 @@ type openAISessionResolution struct {
 	PromptCacheKey  string
 	PreviousRespID  string
 	LastTurnState   string
+	AccountID       int64
 	FromStoredState bool
 	DigestChain     string
 	MatchedDigest   string
 	SessionSource   string
 }
 
-func resolveOpenAISession(headers http.Header, body []byte) openAISessionResolution {
+func resolveOpenAISession(headers http.Header, body []byte, accountID int64) openAISessionResolution {
 	promptCacheKey := resolvePromptCacheKeyFromBody(body)
 	sessionID := ""
 	conversationID := ""
@@ -159,6 +161,7 @@ func resolveOpenAISession(headers http.Header, body []byte) openAISessionResolut
 		SessionID:      sessionID,
 		ConversationID: conversationID,
 		PromptCacheKey: promptCacheKey,
+		AccountID:      accountID,
 	}
 	switch {
 	case sessionID != "":
@@ -184,7 +187,7 @@ func resolveOpenAISession(headers http.Header, body []byte) openAISessionResolut
 		if resolution.PromptCacheKey == "" {
 			resolution.PromptCacheKey = state.PromptCacheKey
 		}
-		if previousResponseID == "" {
+		if previousResponseID == "" && (state.AccountID == 0 || state.AccountID == accountID) {
 			previousResponseID = state.LastResponseID
 		}
 		resolution.LastTurnState = state.LastTurnState
@@ -412,7 +415,7 @@ func touchSessionState(sessionKey string, update func(*openAISessionState)) {
 	upsertSessionState(current)
 }
 
-func updateSessionStateFromRequest(resolution openAISessionResolution) {
+func updateSessionStateFromRequest(resolution openAISessionResolution, accountID int64) {
 	if resolution.SessionKey == "" {
 		return
 	}
@@ -429,16 +432,22 @@ func updateSessionStateFromRequest(resolution openAISessionResolution) {
 		if pck := normalizeSessionValue(resolution.PromptCacheKey); pck != "" {
 			state.PromptCacheKey = pck
 		}
+		if accountID > 0 {
+			state.AccountID = accountID
+		}
 	})
 }
 
-func updateSessionStateResponseID(sessionKey, responseID string) {
+func updateSessionStateResponseID(sessionKey, responseID string, accountID int64) {
 	responseID = strings.TrimSpace(responseID)
 	if sessionKey == "" || responseID == "" {
 		return
 	}
 	now := time.Now().UTC()
 	touchSessionState(sessionKey, func(state *openAISessionState) {
+		if accountID > 0 {
+			state.AccountID = accountID
+		}
 		state.LastResponseID = responseID
 		state.LastResponseAt = now
 	})

@@ -528,8 +528,8 @@ func (g *OpenAIGateway) forwardOAuth(ctx context.Context, req *sdk.ForwardReques
 	start := time.Now()
 	account := req.Account
 	logger := sdk.LoggerFromContext(ctx)
-	session := resolveOpenAISession(req.Headers, req.Body)
-	updateSessionStateFromRequest(session)
+	session := resolveOpenAISession(req.Headers, req.Body, account.ID)
+	updateSessionStateFromRequest(session, account.ID)
 
 	cfg := WSConfig{
 		Token:          account.Credentials["access_token"],
@@ -693,7 +693,7 @@ func (g *OpenAIGateway) forwardOAuth(ctx context.Context, req *sdk.ForwardReques
 	}
 	if session.SessionKey != "" {
 		if result.ResponseID != "" {
-			updateSessionStateResponseID(session.SessionKey, result.ResponseID)
+			updateSessionStateResponseID(session.SessionKey, result.ResponseID, account.ID)
 		}
 	}
 
@@ -812,6 +812,7 @@ func (g *OpenAIGateway) forwardOAuth(ctx context.Context, req *sdk.ForwardReques
 		"stream", req.Stream,
 	)
 	fillUsageCostWithImageTool(usage, numImages, imageToolSize)
+	setUsageResponseID(usage, result.ResponseID)
 	return sdk.ForwardOutcome{
 		Kind:     sdk.OutcomeSuccess,
 		Upstream: sdk.UpstreamResponse{StatusCode: http.StatusOK},
@@ -867,7 +868,7 @@ func (s *sseEventWriter) OnRawEvent(eventType string, data []byte) {
 	case "response.created", "response.completed", "response.done":
 		if s.sessionKey != "" {
 			if responseID := gjson.GetBytes(data, "response.id").String(); strings.TrimSpace(responseID) != "" {
-				updateSessionStateResponseID(s.sessionKey, responseID)
+				updateSessionStateResponseID(s.sessionKey, responseID, s.accountID)
 			}
 		}
 	}

@@ -102,6 +102,7 @@ CREATE TABLE IF NOT EXISTS %s (
   session_id        text        NOT NULL DEFAULT '',
   conversation_id   text        NOT NULL DEFAULT '',
   prompt_cache_key  text        NOT NULL DEFAULT '',
+  account_id        bigint      NOT NULL DEFAULT 0,
   last_response_id  text        NOT NULL DEFAULT '',
   last_turn_state   text        NOT NULL DEFAULT '',
   last_seen_at      timestamptz NOT NULL DEFAULT NOW(),
@@ -118,6 +119,9 @@ CREATE INDEX IF NOT EXISTS idx_%s_updated_at
 	)
 	if _, err := s.db.ExecContext(ctx, sessionQuery); err != nil {
 		return fmt.Errorf("ensure session state schema: %w", err)
+	}
+	if _, err := s.db.ExecContext(ctx, fmt.Sprintf(`ALTER TABLE %s ADD COLUMN IF NOT EXISTS account_id bigint NOT NULL DEFAULT 0`, sessionStatePersistTable)); err != nil {
+		return fmt.Errorf("ensure session account_id column: %w", err)
 	}
 	return nil
 }
@@ -263,15 +267,16 @@ func (s *codexUsagePersistenceStore) upsertSessionState(ctx context.Context, sta
 	query := fmt.Sprintf(`
 INSERT INTO %s (
   plugin_id, session_key, session_id, conversation_id, prompt_cache_key,
-  last_response_id, last_turn_state, last_seen_at, last_updated_at,
+  account_id, last_response_id, last_turn_state, last_seen_at, last_updated_at,
   last_response_at, last_turn_state_at
 )
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
 ON CONFLICT (plugin_id, session_key)
 DO UPDATE SET
   session_id = EXCLUDED.session_id,
   conversation_id = EXCLUDED.conversation_id,
   prompt_cache_key = EXCLUDED.prompt_cache_key,
+  account_id = EXCLUDED.account_id,
   last_response_id = EXCLUDED.last_response_id,
   last_turn_state = EXCLUDED.last_turn_state,
   last_seen_at = EXCLUDED.last_seen_at,
@@ -288,6 +293,7 @@ DO UPDATE SET
 		strings.TrimSpace(state.SessionID),
 		strings.TrimSpace(state.ConversationID),
 		strings.TrimSpace(state.PromptCacheKey),
+		state.AccountID,
 		strings.TrimSpace(state.LastResponseID),
 		strings.TrimSpace(state.LastTurnState),
 		state.LastSeenAt.UTC(),
@@ -367,7 +373,7 @@ func (s *codexUsagePersistenceStore) WarmCache(ctx context.Context) error {
 }
 
 func (s *codexUsagePersistenceStore) warmSessionStateCache(ctx context.Context) (int, error) {
-	query := fmt.Sprintf(`SELECT session_key, session_id, conversation_id, prompt_cache_key, last_response_id, last_turn_state, last_seen_at, last_updated_at, last_response_at, last_turn_state_at FROM %s WHERE plugin_id = $1`, sessionStatePersistTable)
+	query := fmt.Sprintf(`SELECT session_key, session_id, conversation_id, prompt_cache_key, account_id, last_response_id, last_turn_state, last_seen_at, last_updated_at, last_response_at, last_turn_state_at FROM %s WHERE plugin_id = $1`, sessionStatePersistTable)
 	rows, err := s.db.QueryContext(ctx, query, s.pluginID)
 	if err != nil {
 		return 0, fmt.Errorf("warm session state query: %w", err)
@@ -383,6 +389,7 @@ func (s *codexUsagePersistenceStore) warmSessionStateCache(ctx context.Context) 
 			&state.SessionID,
 			&state.ConversationID,
 			&state.PromptCacheKey,
+			&state.AccountID,
 			&state.LastResponseID,
 			&state.LastTurnState,
 			&state.LastSeenAt,

@@ -1366,8 +1366,8 @@ func (g *OpenAIGateway) forwardImagesViaResponsesToolWithURL(ctx context.Context
 	start := time.Now()
 	account := req.Account
 
-	session := resolveOpenAISession(req.Headers, req.Body)
-	updateSessionStateFromRequest(session)
+	session := resolveOpenAISession(req.Headers, req.Body, account.ID)
+	updateSessionStateFromRequest(session, account.ID)
 
 	_, reqPath := resolveAPIKeyRoute(req)
 	isEdit := isImagesEditRequest(reqPath)
@@ -1496,7 +1496,7 @@ func (g *OpenAIGateway) forwardImagesViaResponsesToolWithURL(ctx context.Context
 		wsResult = ParseSSEStream(resp.Body, handler)
 	}
 	if wsResult.ResponseID != "" && session.SessionKey != "" {
-		updateSessionStateResponseID(session.SessionKey, wsResult.ResponseID)
+		updateSessionStateResponseID(session.SessionKey, wsResult.ResponseID, account.ID)
 	}
 
 	elapsed := time.Since(start)
@@ -1684,6 +1684,7 @@ func (g *OpenAIGateway) forwardImagesViaResponsesToolWithURL(ctx context.Context
 	setUsageTokens(usage, inputTokens, imageOutputTokens, 0, 0)
 	setUsageInputTokenDetails(usage, inputEstimate.TextTokens, inputEstimate.ImageTokens)
 	fillUsageCostPerImageBySize(usage, numImages, billingSize)
+	setUsageResponseID(usage, wsResult.ResponseID)
 	return outcome, nil
 }
 

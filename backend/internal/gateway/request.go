@@ -196,7 +196,7 @@ func buildAPIKeyURL(account *sdk.Account, reqPath string) string {
 // 拿到的 body 格式一致。当前处理步骤：
 //  1. model 同步（body 中的 model 与 core 传入的 model 对齐）
 //  2. data:image 输入保持原样（对齐 Codex，不在网关内重采样用户图片）
-//  3. 剔除客户端 previous_response_id（跨账号接续不可靠，会话接续由网关内部管理）
+//  3. 保留 previous_response_id（Core 已按 response_id 做账号粘连）
 //  4. 上下文守卫（/v1/chat/completions 超长 messages 裁剪）
 //  5. input 规范化（/v1/responses 的 string input → list，messages → input 转换）
 //  6. Responses API 强制禁用上游存储（store=false）
@@ -224,12 +224,6 @@ func preprocessRequestBody(body []byte, model, reqPath string) []byte {
 	}
 
 	result = preserveOpenAIConversationImages(result)
-
-	// 剔除客户端传入的 previous_response_id。
-	// AirGate 在多个上游账号之间做负载均衡，客户端的 previous_response_id
-	// 可能指向另一个账号的 response，上游会返回 "not found"。
-	// 会话接续由网关内部的 session 机制（OAuth sessionState / Anthropic digestChain）管理。
-	result, _ = dropPreviousResponseIDFromJSON(result)
 
 	result = applyContextGuard(result, reqPath)
 	result = normalizeResponsesInput(result, reqPath)
@@ -470,20 +464,11 @@ func applyContinuationState(reqData map[string]any, session openAISessionResolut
 		return reqData
 	}
 
-	// 不再从 session 回填 previous_response_id。
-	// 跨账号接续时，上一轮 response 可能在另一个账号上，注入后上游会返回 "not found"；
-	// 且 function_call_output 自带 call_id，上游可以靠 call_id 匹配，不依赖 previous_response_id。
-	// 客户端的 previous_response_id 已在 preprocessRequestBody 统一剔除。
+	if _, ok := reqData["previous_response_id"].(string); ok {
+		return reqData
+	}
+	if requestNeedsPreviousResponseID(reqData) && strings.TrimSpace(session.PreviousRespID) != "" {
+		reqData["previous_response_id"] = strings.TrimSpace(session.PreviousRespID)
+	}
 	return reqData
-}
-
-func dropPreviousResponseIDFromJSON(body []byte) ([]byte, bool) {
-	if len(body) == 0 || !gjson.GetBytes(body, "previous_response_id").Exists() {
-		return body, false
-	}
-	next, err := sjson.DeleteBytes(body, "previous_response_id")
-	if err != nil {
-		return body, false
-	}
-	return next, true
 }

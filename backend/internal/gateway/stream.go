@@ -62,6 +62,7 @@ func handleStreamResponseWithLogger(logger *slog.Logger, resp *http.Response, w 
 	var toolImageIn, toolImageOut int // 接收 response.tool_usage.image_gen，用于图像工具计费。
 	var imageGenCount int
 	var imageGenSize string
+	responseID := ""
 
 	for scanner.Scan() {
 		line := scanner.Text()
@@ -77,6 +78,9 @@ func handleStreamResponseWithLogger(logger *slog.Logger, resp *http.Response, w 
 				completed = true
 				diagnostics.completionEvent = "[DONE]"
 			} else if data != "" {
+				if id := responseIDFromSSEData(data); id != "" {
+					responseID = id
+				}
 				if streamErr = parseSSEFailureEvent([]byte(data)); streamErr != nil {
 					logStreamFailure(logger, streamErr, resp, streamStarted, diagnostics)
 					streamErrLogged = true
@@ -174,6 +178,7 @@ func handleStreamResponseWithLogger(logger *slog.Logger, resp *http.Response, w 
 		numImages = estimateImageCountFromTokens(toolImageOut)
 	}
 	fillUsageCostWithImageTool(usage, numImages, imageGenSize)
+	setUsageResponseID(usage, responseID)
 	return sdk.ForwardOutcome{
 		Kind:     sdk.OutcomeSuccess,
 		Upstream: sdk.UpstreamResponse{StatusCode: resp.StatusCode},
@@ -405,6 +410,7 @@ func handleNonStreamResponse(resp *http.Response, w http.ResponseWriter, start t
 		numImages = estimateImageCountFromTokens(parsed.toolImageOutputTokens)
 	}
 	fillUsageCostWithImageTool(usage, numImages, parsed.imageGenCallSize)
+	setUsageResponseID(usage, responseIDFromBody(body))
 
 	outcome := sdk.ForwardOutcome{
 		Kind:     sdk.OutcomeSuccess,
@@ -678,6 +684,20 @@ func firstNonEmptyHeader(headers http.Header, keys ...string) string {
 		}
 	}
 	return ""
+}
+
+func responseIDFromSSEData(data string) string {
+	if id := strings.TrimSpace(gjson.Get(data, "response.id").String()); id != "" {
+		return id
+	}
+	return strings.TrimSpace(gjson.Get(data, "id").String())
+}
+
+func responseIDFromBody(body []byte) string {
+	if id := strings.TrimSpace(gjson.GetBytes(body, "id").String()); id != "" {
+		return id
+	}
+	return strings.TrimSpace(gjson.GetBytes(body, "response.id").String())
 }
 
 // extractSSEData 从 SSE 行中提取 data 内容

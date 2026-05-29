@@ -649,6 +649,7 @@ func translateResponsesSSEToAnthropicSSE(
 	serviceTier := firstNonEmptyTier(requestServiceTier)
 	skipCurrentOutput := false
 	firstTokenRecorded := false
+	responseID := ""
 
 	for scanner.Scan() {
 		skipCurrentOutput = false
@@ -687,8 +688,11 @@ func translateResponsesSSEToAnthropicSSE(
 			}
 			if session.SessionKey != "" {
 				if responseID := gjson.Get(data, "response.id").String(); strings.TrimSpace(responseID) != "" {
-					updateSessionStateResponseID(session.SessionKey, responseID)
+					updateSessionStateResponseID(session.SessionKey, responseID, session.AccountID)
 				}
+			}
+			if id := strings.TrimSpace(gjson.Get(data, "response.id").String()); id != "" {
+				responseID = id
 			}
 			if eventType == "response.completed" || eventType == "response.done" {
 				if serviceTier == "" {
@@ -802,6 +806,7 @@ done:
 	}
 
 	fillUsageCost(usage)
+	setUsageResponseID(usage, responseID)
 	return sdk.ForwardOutcome{
 		Kind:     sdk.OutcomeSuccess,
 		Upstream: sdk.UpstreamResponse{StatusCode: http.StatusOK},

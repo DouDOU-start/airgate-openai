@@ -157,7 +157,7 @@ func (s *chatCompletionsStreamWriter) OnRawEvent(eventType string, data []byte) 
 	case "response.created", "response.completed", "response.done":
 		if s.sessionKey != "" {
 			if responseID := gjson.GetBytes(data, "response.id").String(); strings.TrimSpace(responseID) != "" {
-				updateSessionStateResponseID(s.sessionKey, responseID)
+				updateSessionStateResponseID(s.sessionKey, responseID, s.accountID)
 			}
 		}
 	}
@@ -506,7 +506,7 @@ func (h *chatCompletionsSilentHandler) OnRawEvent(eventType string, data []byte)
 	case "response.created", "response.completed", "response.done":
 		if h.sessionKey != "" {
 			if responseID := gjson.GetBytes(data, "response.id").String(); strings.TrimSpace(responseID) != "" {
-				updateSessionStateResponseID(h.sessionKey, responseID)
+				updateSessionStateResponseID(h.sessionKey, responseID, h.accountID)
 			}
 		}
 	}
@@ -557,7 +557,7 @@ func (h *responsesSilentHandler) OnRawEvent(eventType string, data []byte) {
 	case "response.created", "response.completed", "response.done":
 		if h.sessionKey != "" {
 			if responseID := gjson.GetBytes(data, "response.id").String(); strings.TrimSpace(responseID) != "" {
-				updateSessionStateResponseID(h.sessionKey, responseID)
+				updateSessionStateResponseID(h.sessionKey, responseID, h.accountID)
 			}
 		}
 	}

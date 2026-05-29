@@ -23,6 +23,7 @@ const (
 
 	usageAttrServiceTier = "service_tier"
 	usageAttrImageSize   = "openai.image.size"
+	usageAttrResponseID  = "openai.response_id"
 
 	usageMetricInputTokens           = "input_tokens"
 	usageMetricTextInputTokens       = "openai.image.input_text_tokens"
@@ -137,6 +138,14 @@ func setUsageImageSize(usage *sdk.Usage, size string) {
 		return
 	}
 	setUsageMetadata(usage, usageAttrImageSize, size)
+}
+
+func setUsageResponseID(usage *sdk.Usage, responseID string) {
+	responseID = strings.TrimSpace(responseID)
+	if usage == nil || !strings.HasPrefix(responseID, "resp_") {
+		return
+	}
+	setUsageMetadata(usage, usageAttrResponseID, responseID)
 }
 
 func setUsageTokens(usage *sdk.Usage, inputTokens, outputTokens, cachedInputTokens, reasoningOutputTokens int) {
