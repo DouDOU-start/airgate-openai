@@ -5,8 +5,8 @@
 
   <p>
     <a href="https://github.com/DevilGenius/airgate-openai/releases"><img src="https://img.shields.io/github/v/release/DevilGenius/airgate-openai?style=flat-square" alt="release" /></a>
-    <a href="https://github.com/DevilGenius/airgate-openai/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/DevilGenius/airgate-openai/ci.yml?branch=apex&style=flat-square&label=CI" alt="ci" /></a>
-    <a href="https://github.com/DevilGenius/airgate-openai/blob/apex/LICENSE"><img src="https://img.shields.io/github/license/DevilGenius/airgate-openai?style=flat-square" alt="license" /></a>
+    <a href="https://github.com/DevilGenius/airgate-openai/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/DevilGenius/airgate-openai/ci.yml?branch=master&style=flat-square&label=CI" alt="ci" /></a>
+    <a href="https://github.com/DevilGenius/airgate-openai/blob/master/LICENSE"><img src="https://img.shields.io/github/license/DevilGenius/airgate-openai?style=flat-square" alt="license" /></a>
     <img src="https://img.shields.io/badge/Go-1.25-00ADD8?style=flat-square&logo=go" alt="go" />
     <img src="https://img.shields.io/badge/React-19-61DAFB?style=flat-square&logo=react" alt="react" />
   </p>
