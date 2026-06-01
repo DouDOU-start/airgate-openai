@@ -198,24 +198,45 @@ gateway:
       max_output_tokens: 0
       capabilities:
         - image_generation
-      input_price: 0
-      output_price: 0
+      input_price: 5
+      output_price: 30
+      cached_input_price: 0.5
+      input_price_priority: 10
+      output_price_priority: 60
+      cached_input_price_priority: 1
+      input_price_flex: 2.5
+      output_price_flex: 15
+      cached_input_price_flex: 0.25
     - id: gpt-image-1.5
       name: GPT Image 1.5
       context_window: 32000
       max_output_tokens: 0
       capabilities:
         - image_generation
-      input_price: 0
-      output_price: 0
+      input_price: 5
+      output_price: 30
+      cached_input_price: 0.5
+      input_price_priority: 10
+      output_price_priority: 60
+      cached_input_price_priority: 1
+      input_price_flex: 2.5
+      output_price_flex: 15
+      cached_input_price_flex: 0.25
     - id: gpt-image-2
       name: GPT Image 2
       context_window: 32000
       max_output_tokens: 0
       capabilities:
         - image_generation
-      input_price: 0
-      output_price: 0
+      input_price: 5
+      output_price: 30
+      cached_input_price: 0.5
+      input_price_priority: 10
+      output_price_priority: 60
+      cached_input_price_priority: 1
+      input_price_flex: 2.5
+      output_price_flex: 15
+      cached_input_price_flex: 0.25
   account_types:
     - key: apikey
       label: API Key

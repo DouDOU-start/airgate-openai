@@ -509,7 +509,7 @@ func fillUsageCostPerImageBySize(usage *sdk.Usage, numImages int, size, quality 
 	}
 	billingModelID := imageTokenBillingModel(usage.Model)
 	fillUsageCostForModel(usage, billingModelID, false)
-	if usage == nil || numImages <= 0 {
+	if numImages <= 0 {
 		return
 	}
 	outputTokens := usageMetricInt(usage, usageMetricOutputTokens)
@@ -561,7 +561,7 @@ func fillUsageCostWithImageTool(usage *sdk.Usage, numImages int, size string, im
 	}
 	billingModelID := imageTokenBillingModel(usage.Model)
 	fillUsageCostForModel(usage, billingModelID, true)
-	if usage == nil || (numImages <= 0 && imageInputTokens <= 0 && imageOutputTokens <= 0) {
+	if numImages <= 0 && imageInputTokens <= 0 && imageOutputTokens <= 0 {
 		return
 	}
 	prices, longContext := usagePricesForBillingModel(usage, billingModelID)
