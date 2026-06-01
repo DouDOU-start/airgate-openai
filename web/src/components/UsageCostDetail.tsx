@@ -13,6 +13,8 @@ interface UsageCostDetailItem {
 
 interface UsageRecordLike {
   model?: string;
+  image_size?: string;
+  endpoint?: string;
   input_cost?: number;
   output_cost?: number;
   cached_input_cost?: number;
@@ -149,32 +151,197 @@ function fallbackDetails(record: UsageRecordLike): UsageCostDetailItem[] {
   ].filter((item) => (item.account_cost ?? 0) > 0);
 }
 
+function normalizedKey(item: UsageCostDetailItem): string {
+  return `${item.key || ''} ${item.label || ''}`.toLowerCase().replace(/[\s-]+/g, '_');
+}
+
+function isImageCostDetail(item: UsageCostDetailItem): boolean {
+  const key = normalizedKey(item);
+  if (key.includes('input') || key.includes('输入')) return false;
+  return key.includes('image') || key.includes('图片');
+}
+
+function isImageInputDetail(item: UsageCostDetailItem): boolean {
+  const key = normalizedKey(item);
+  return (key.includes('image') || key.includes('图片')) && (key.includes('input') || key.includes('输入'));
+}
+
+function isImageRelatedDetail(item: UsageCostDetailItem): boolean {
+  const key = normalizedKey(item);
+  return key.includes('image') || key.includes('图片');
+}
+
+function isInputDetail(item: UsageCostDetailItem): boolean {
+  const key = normalizedKey(item);
+  return !isImageRelatedDetail(item)
+    && !key.includes('cached')
+    && !key.includes('cache')
+    && !key.includes('缓存')
+    && (key.includes('input') || key.includes('输入'));
+}
+
+function isOutputDetail(item: UsageCostDetailItem): boolean {
+  const key = normalizedKey(item);
+  return !isImageRelatedDetail(item) && (key.includes('output') || key.includes('输出'));
+}
+
+function isImageOnlyModel(model: string | undefined): boolean {
+  const normalized = (model || '').trim().toLowerCase();
+  return normalized.startsWith('gpt-image')
+    || normalized.startsWith('dall-e')
+    || normalized.startsWith('dalle');
+}
+
+function hasFixedImagePricing(rows: UsageCostDetailItem[]): boolean {
+  return rows.some((item) => item.metadata?.billing_mode === 'fixed_image_price');
+}
+
+function hasImageContext(record: UsageRecordLike, rows: UsageCostDetailItem[]): boolean {
+  const endpoint = (record.endpoint || '').toLowerCase();
+  return !!record.image_size
+    || endpoint.includes('/images/')
+    || rows.some((item) => isImageRelatedDetail(item));
+}
+
+function visibleUserCost(item: UsageCostDetailItem): number {
+  return item.user_cost ?? item.account_cost ?? 0;
+}
+
+function mergeCostDetail(base: UsageCostDetailItem, extra: UsageCostDetailItem): UsageCostDetailItem {
+  const accountCost = (base.account_cost ?? 0) + (extra.account_cost ?? 0);
+  const userCost = (base.user_cost ?? base.account_cost ?? 0) + (extra.user_cost ?? extra.account_cost ?? 0);
+  return {
+    ...base,
+    account_cost: accountCost,
+    user_cost: userCost,
+    billing_multiplier: accountCost > 0 ? userCost / accountCost : base.billing_multiplier,
+  };
+}
+
+function normalizeTokenDetail(item: UsageCostDetailItem, key: string, label: string): UsageCostDetailItem {
+  const metadata: Record<string, string> = {};
+  for (const metadataKey of ['unit', 'unit_price', 'billing_model']) {
+    const value = item.metadata?.[metadataKey];
+    if (value) metadata[metadataKey] = value;
+  }
+  return {
+    ...item,
+    key,
+    label,
+    metadata: Object.keys(metadata).length > 0 ? metadata : undefined,
+  };
+}
+
+function mergeTokenBillingRows(rows: UsageCostDetailItem[]): UsageCostDetailItem[] {
+  const merged: UsageCostDetailItem[] = [];
+  let inputIndex = -1;
+  let outputIndex = -1;
+
+  for (const item of rows) {
+    if (isImageInputDetail(item)) {
+      const detail = normalizeTokenDetail(item, 'input_tokens', '输入 Token');
+      if (inputIndex >= 0) {
+        merged[inputIndex] = mergeCostDetail(merged[inputIndex], detail);
+      } else {
+        inputIndex = merged.length;
+        merged.push(detail);
+      }
+      continue;
+    }
+    if (isImageCostDetail(item)) {
+      const detail = normalizeTokenDetail(item, 'output_tokens', '输出 Token');
+      if (outputIndex >= 0) {
+        merged[outputIndex] = mergeCostDetail(merged[outputIndex], detail);
+      } else {
+        outputIndex = merged.length;
+        merged.push(detail);
+      }
+      continue;
+    }
+    if (isInputDetail(item)) {
+      if (inputIndex >= 0) {
+        merged[inputIndex] = mergeCostDetail(merged[inputIndex], item);
+      } else {
+        inputIndex = merged.length;
+        merged.push(item);
+      }
+      continue;
+    }
+    if (isOutputDetail(item)) {
+      if (outputIndex >= 0) {
+        merged[outputIndex] = mergeCostDetail(merged[outputIndex], item);
+      } else {
+        outputIndex = merged.length;
+        merged.push(item);
+      }
+      continue;
+    }
+    merged.push(item);
+  }
+
+  return merged;
+}
+
+function shouldShowCostRow(item: UsageCostDetailItem, fixedImagePricing: boolean, responseLikeRequest: boolean): boolean {
+  if (!fixedImagePricing) {
+    return visibleUserCost(item) > 0;
+  }
+  if (isImageCostDetail(item)) return true;
+  if (isImageRelatedDetail(item)) return false;
+  if (!responseLikeRequest) return false;
+  return visibleUserCost(item) > 0;
+}
+
+function displayCostLabel(item: UsageCostDetailItem, fixedImagePricing: boolean): string {
+  if (fixedImagePricing && isImageCostDetail(item)) {
+    return '图片生成成本';
+  }
+  const label = toCostLabel(item.label || item.key || '费用');
+  return label;
+}
+
 export function UsageCostDetail({ context }: UsageRecordSurfaceProps) {
   const record = recordFromContext(context);
   const isAdmin = context?.adminView !== false;
 
   const details = contextArray<UsageCostDetailItem>(context, 'usageCostDetails', 'usage_cost_details');
   const rows = details.length > 0 ? details : fallbackDetails(record);
-
+  const fixedImagePricing = hasFixedImagePricing(rows);
+  const imageContext = fixedImagePricing || hasImageContext(record, rows);
+  const responseLikeRequest = !isImageOnlyModel(record.model);
+  const imageOnlyFixedPricing = fixedImagePricing && !responseLikeRequest;
+  const displayRows = imageContext && !fixedImagePricing ? mergeTokenBillingRows(rows) : rows;
+  const visibleRows = displayRows.filter((item) => shouldShowCostRow(item, fixedImagePricing, responseLikeRequest));
   const unitPrices: { label: string; value: string }[] = [];
-  for (const item of rows) {
-    if (item.metadata?.unit_price && item.metadata?.unit) {
-      unitPrices.push({
-        label: toUnitLabel(item.label || item.key || ''),
-        value: `$${Number(item.metadata.unit_price).toFixed(4)} / ${item.metadata.unit.replace(/^USD\//, '')}`,
-      });
+  if (!imageOnlyFixedPricing) {
+    for (const item of visibleRows) {
+      if (fixedImagePricing && isImageCostDetail(item)) continue;
+      if (item.metadata?.unit_price && item.metadata?.unit) {
+        unitPrices.push({
+          label: toUnitLabel(item.label || item.key || ''),
+          value: `$${Number(item.metadata.unit_price).toFixed(4)} / ${item.metadata.unit.replace(/^USD\//, '')}`,
+        });
+      }
+    }
+    if (unitPrices.length === 0) {
+      if (record.input_price && record.input_price > 0)
+        unitPrices.push({ label: '输入单价', value: `$${record.input_price.toFixed(4)} / 1M Token` });
+      if (record.output_price && record.output_price > 0)
+        unitPrices.push({ label: '输出单价', value: `$${record.output_price.toFixed(4)} / 1M Token` });
     }
   }
-  if (unitPrices.length === 0) {
-    if (record.input_price && record.input_price > 0)
-      unitPrices.push({ label: '输入单价', value: `$${record.input_price.toFixed(4)} / 1M Token` });
-    if (record.output_price && record.output_price > 0)
-      unitPrices.push({ label: '输出单价', value: `$${record.output_price.toFixed(4)} / 1M Token` });
-  }
 
-  const hasRateInfo = !!record.service_tier
+  const showRateInfo = !imageOnlyFixedPricing;
+  const showAccountInfo = isAdmin && !fixedImagePricing;
+  const hasRateInfo = showRateInfo && (!!record.service_tier
     || (record.rate_multiplier !== undefined && record.rate_multiplier > 0)
-    || (isAdmin && record.account_rate_multiplier !== undefined && record.account_rate_multiplier > 0 && record.account_rate_multiplier !== 1);
+    || (showAccountInfo && record.account_rate_multiplier !== undefined && record.account_rate_multiplier > 0 && record.account_rate_multiplier !== 1));
+  const conversationBaseCost = Math.max(
+    0,
+    visibleRows
+      .filter((item) => !isImageRelatedDetail(item))
+      .reduce((sum, item) => sum + (item.account_cost ?? 0), 0),
+  );
 
   return (
     <div style={panelStyle}>
@@ -183,10 +350,10 @@ export function UsageCostDetail({ context }: UsageRecordSurfaceProps) {
         {record.model ? <div style={subtitleStyle}>{record.model}</div> : null}
       </div>
       <div style={bodyStyle}>
-        {rows.map((item, index) => (
+        {visibleRows.map((item, index) => (
           <Row
             key={item.key || `${item.label}:${index}`}
-            label={toCostLabel(item.label || item.key || '费用')}
+            label={displayCostLabel(item, fixedImagePricing)}
             value={money(item.user_cost ?? item.account_cost)}
           />
         ))}
@@ -194,25 +361,30 @@ export function UsageCostDetail({ context }: UsageRecordSurfaceProps) {
           <Row key={`up-${i}`} label={up.label} value={up.value} />
         ))}
         <div style={dividerStyle} />
-        {record.service_tier ? (
+        {showRateInfo && record.service_tier ? (
           <Row label="服务档位" value={<span style={{ textTransform: 'capitalize' }}>{record.service_tier}</span>} />
         ) : null}
-        {record.rate_multiplier !== undefined && record.rate_multiplier > 0 ? (
+        {showRateInfo && record.rate_multiplier !== undefined && record.rate_multiplier > 0 ? (
           <Row label="倍率" value={`${record.rate_multiplier.toFixed(2)}x`} />
         ) : null}
-        {isAdmin && record.account_rate_multiplier !== undefined && record.account_rate_multiplier > 0 ? (
+        {showRateInfo && showAccountInfo && record.account_rate_multiplier !== undefined && record.account_rate_multiplier > 0 ? (
           <Row label="账号倍率" value={`${record.account_rate_multiplier.toFixed(2)}x`} />
         ) : null}
-        {isAdmin && record.sell_rate && record.sell_rate > 0 ? (
+        {showRateInfo && isAdmin && record.sell_rate && record.sell_rate > 0 ? (
           <Row label="销售倍率" value={`${record.sell_rate.toFixed(2)}x`} />
         ) : null}
         {hasRateInfo ? <div style={dividerStyle} /> : null}
-        <Row label="原始" value={money(record.total_cost)} tone="var(--ag-text)" />
-        {isAdmin && record.account_cost !== undefined ? (
+        {!fixedImagePricing ? (
+          <Row label={imageContext ? '倍率前成本' : '原始'} value={money(record.total_cost)} tone="var(--ag-text)" />
+        ) : null}
+        {fixedImagePricing && responseLikeRequest ? (
+          <Row label="对话原始" value={money(conversationBaseCost)} tone="var(--ag-text)" />
+        ) : null}
+        {showAccountInfo && record.account_cost !== undefined ? (
           <Row label="账号计费" value={money(record.account_cost)} tone="var(--ag-success)" />
         ) : null}
         <Row label="本次消费" value={money(record.actual_cost)} tone="var(--ag-warning)" />
-        {isAdmin && record.sell_rate && record.sell_rate > 0 && record.billed_cost !== record.actual_cost ? (
+        {isAdmin && !imageOnlyFixedPricing && record.sell_rate && record.sell_rate > 0 && record.billed_cost !== record.actual_cost ? (
           <>
             <Row label="客户账面" value={money(record.billed_cost)} tone="var(--ag-primary)" />
             <Row label="利润" value={money((record.billed_cost ?? 0) - (record.actual_cost ?? 0))} tone="var(--ag-success)" />

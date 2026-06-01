@@ -759,7 +759,7 @@ func (g *OpenAIGateway) forwardOAuth(ctx context.Context, req *sdk.ForwardReques
 		// 即使请求失败，上游可能已消耗 token（如 response.failed / response.incomplete），
 		// 仍需计费避免漏洞。
 		if result.InputTokens > 0 || result.OutputTokens > 0 || result.CachedInputTokens > 0 {
-			fillUsageCostWithImageTool(usage, numImages, imageToolSize)
+			fillUsageCostWithImageTool(usage, numImages, imageToolSize, result.ToolImageInputTokens, result.ToolImageOutputTokens)
 			outcome.Usage = usage
 		}
 		return outcome, result.Err
@@ -808,7 +808,7 @@ func (g *OpenAIGateway) forwardOAuth(ctx context.Context, req *sdk.ForwardReques
 		"output_tokens", result.OutputTokens,
 		"stream", req.Stream,
 	)
-	fillUsageCostWithImageTool(usage, numImages, imageToolSize)
+	fillUsageCostWithImageTool(usage, numImages, imageToolSize, result.ToolImageInputTokens, result.ToolImageOutputTokens)
 	return sdk.ForwardOutcome{
 		Kind:     sdk.OutcomeSuccess,
 		Upstream: sdk.UpstreamResponse{StatusCode: http.StatusOK},

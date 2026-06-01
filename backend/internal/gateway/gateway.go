@@ -889,7 +889,7 @@ func (g *OpenAIGateway) HandleRequest(ctx context.Context, _, path, _ string, _ 
 
 // imageToolCostModel 是 Responses API 的 image_generation 内置工具使用的模型。
 // 上游文档与 Codex `$imagegen` 技能均使用 gpt-image-1.5 作为实际图像生成模型。
-// 计费 helper 见 outcome.go 的 fillUsageCost / fillUsageCostWithImageTool。
+// 默认计费模型选择见 outcome.go 的 imageTokenBillingModel。
 const imageToolCostModel = "gpt-image-1.5"
 
 func jsonError(msg string) []byte {

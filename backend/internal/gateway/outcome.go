@@ -3,6 +3,7 @@ package gateway
 import (
 	"fmt"
 	"net/http"
+	"strings"
 	"time"
 
 	sdk "github.com/DouDOU-start/airgate-sdk/sdkgo"
@@ -17,7 +18,8 @@ import (
 // Upstream + 上游错误消息推出 Kind。
 
 const (
-	usageCurrencyUSD = "USD"
+	usageCurrencyUSD              = "USD"
+	defaultImageTokenBillingModel = "gpt-5.5"
 
 	usageAttrModel       = "model"
 	usageAttrServiceTier = "service_tier"
@@ -387,10 +389,18 @@ func priceMetadata(price float64, tier string, longContext bool) map[string]stri
 // SDK 只承载通用 Usage 结构；OpenAI 的标准价格、服务档位和长上下文阶梯都留在
 // 插件内部实现，Core 入库后再按用户倍率写入 UserCost。
 func fillUsageCost(usage *sdk.Usage) {
-	if usage == nil || usage.Model == "" {
+	fillUsageCostForModel(usage, usage.Model, true)
+}
+
+func fillUsageCostForModel(usage *sdk.Usage, billingModelID string, includeOutputCost bool) {
+	if usage == nil {
 		return
 	}
-	spec := model.Lookup(usage.Model)
+	billingModelID = strings.TrimSpace(billingModelID)
+	if billingModelID == "" {
+		return
+	}
+	spec := model.Lookup(billingModelID)
 	serviceTier := usageServiceTier(usage)
 	inputTokens := usageMetricInt(usage, usageMetricInputTokens)
 	outputTokens := usageMetricInt(usage, usageMetricOutputTokens)
@@ -405,6 +415,18 @@ func fillUsageCost(usage *sdk.Usage) {
 	inputCost := tokenCost(inputTokens, prices.input)
 	cachedCost := tokenCost(cachedInputTokens, prices.cached)
 	outputCost := tokenCost(outputTokens, prices.output)
+	if !includeOutputCost {
+		outputCost = 0
+	}
+
+	inputMetadata := priceMetadata(prices.input, serviceTier, longContext)
+	cachedMetadata := priceMetadata(prices.cached, serviceTier, longContext)
+	outputMetadata := priceMetadata(prices.output, serviceTier, longContext)
+	if billingModelID != usage.Model {
+		inputMetadata["billing_model"] = billingModelID
+		cachedMetadata["billing_model"] = billingModelID
+		outputMetadata["billing_model"] = billingModelID
+	}
 
 	setUsageMetric(usage, sdk.UsageMetric{
 		Key:         usageMetricInputTokens,
@@ -414,7 +436,7 @@ func fillUsageCost(usage *sdk.Usage) {
 		Value:       float64(inputTokens),
 		AccountCost: inputCost,
 		Currency:    usageCurrencyUSD,
-		Metadata:    priceMetadata(prices.input, serviceTier, longContext),
+		Metadata:    inputMetadata,
 	})
 	setUsageMetric(usage, sdk.UsageMetric{
 		Key:         usageMetricCachedInputTokens,
@@ -424,7 +446,7 @@ func fillUsageCost(usage *sdk.Usage) {
 		Value:       float64(cachedInputTokens),
 		AccountCost: cachedCost,
 		Currency:    usageCurrencyUSD,
-		Metadata:    priceMetadata(prices.cached, serviceTier, longContext),
+		Metadata:    cachedMetadata,
 	})
 	setUsageMetric(usage, sdk.UsageMetric{
 		Key:         usageMetricOutputTokens,
@@ -434,41 +456,70 @@ func fillUsageCost(usage *sdk.Usage) {
 		Value:       float64(outputTokens),
 		AccountCost: outputCost,
 		Currency:    usageCurrencyUSD,
-		Metadata:    priceMetadata(prices.output, serviceTier, longContext),
+		Metadata:    outputMetadata,
 	})
 	setUsageCostDetail(usage, sdk.UsageCostDetail{
 		Key:         usageCostInput,
 		Label:       "输入 Token",
 		AccountCost: inputCost,
 		Currency:    usageCurrencyUSD,
-		Metadata:    priceMetadata(prices.input, serviceTier, longContext),
+		Metadata:    inputMetadata,
 	})
 	setUsageCostDetail(usage, sdk.UsageCostDetail{
 		Key:         usageCostCachedInput,
 		Label:       "缓存输入 Token",
 		AccountCost: cachedCost,
 		Currency:    usageCurrencyUSD,
-		Metadata:    priceMetadata(prices.cached, serviceTier, longContext),
+		Metadata:    cachedMetadata,
 	})
 	setUsageCostDetail(usage, sdk.UsageCostDetail{
 		Key:         usageCostOutput,
 		Label:       "输出 Token",
 		AccountCost: outputCost,
 		Currency:    usageCurrencyUSD,
-		Metadata:    priceMetadata(prices.output, serviceTier, longContext),
+		Metadata:    outputMetadata,
 	})
 }
 
-// fillUsageCostPerImageBySize 按 1K/2K/4K size 分档填充 Usage（USD/张）。
-// 用于 OAuth → image_generation tool 路径，价格由 imagePriceForSize 硬编码（详见其注释）。
-// 跟 spec.ImagePrice 解耦：plugin.yaml 不需要登记 ImagePrice，分档定价完全由网关侧决定。
-func fillUsageCostPerImageBySize(usage *sdk.Usage, numImages int, size string) {
+func imageTokenBillingModel(modelID string) string {
+	modelID = strings.TrimSpace(modelID)
+	if modelID == "" || model.IsImageOnly(modelID) {
+		return defaultImageTokenBillingModel
+	}
+	return modelID
+}
+
+func usagePricesForBillingModel(usage *sdk.Usage, billingModelID string) (tokenPrices, bool) {
+	spec := model.Lookup(billingModelID)
+	serviceTier := usageServiceTier(usage)
+	return applyLongContextPricing(
+		spec,
+		pricesForServiceTier(spec, serviceTier),
+		usageMetricInt(usage, usageMetricInputTokens),
+		usageMetricInt(usage, usageMetricCachedInputTokens),
+	)
+}
+
+// fillUsageCostPerImageBySize 按图像 token 规则填充 Usage。
+// Core 如配置 1K/2K/4K 固定价，会根据这里写入的 image_count/image_tier
+// 覆盖图片输出部分；未配置时按对话模型价格（纯图像接口回退 gpt-5.5）并套倍率。
+func fillUsageCostPerImageBySize(usage *sdk.Usage, numImages int, size, quality string) {
+	if usage == nil {
+		return
+	}
+	billingModelID := imageTokenBillingModel(usage.Model)
+	fillUsageCostForModel(usage, billingModelID, false)
 	if usage == nil || numImages <= 0 {
 		return
 	}
-	price := imagePriceForSize(size)
+	outputTokens := usageMetricInt(usage, usageMetricOutputTokens)
+	if outputTokens <= 0 {
+		outputTokens = numImages * lookupImageGenOutputTokens(size, quality)
+	}
+	prices, _ := usagePricesForBillingModel(usage, billingModelID)
+	cost := tokenCost(outputTokens, prices.output)
 	setUsageImageSize(usage, size)
-	addImageCost(usage, usageCostImage, "图片生成", numImages, price, size)
+	addImageOutputCost(usage, usageCostImage, "图片生成", numImages, cost, size, quality, outputTokens, prices.output, billingModelID)
 }
 
 func addUsageCostForModel(
@@ -502,28 +553,66 @@ func addUsageCostForModel(
 	}
 }
 
-// fillUsageCostWithImageTool 先按主 model 定价算 token 成本，再按尺寸分档叠加图像费用。
-func fillUsageCostWithImageTool(usage *sdk.Usage, numImages int, size string) {
-	fillUsageCost(usage)
-	if usage == nil || numImages <= 0 {
+// fillUsageCostWithImageTool 先按主 model 定价算 token 成本，再按同一对话模型
+// 价格叠加 image_generation 工具费用。
+func fillUsageCostWithImageTool(usage *sdk.Usage, numImages int, size string, imageInputTokens, imageOutputTokens int) {
+	if usage == nil {
 		return
 	}
-	price := imagePriceForSize(size)
+	billingModelID := imageTokenBillingModel(usage.Model)
+	fillUsageCostForModel(usage, billingModelID, true)
+	if usage == nil || (numImages <= 0 && imageInputTokens <= 0 && imageOutputTokens <= 0) {
+		return
+	}
+	prices, longContext := usagePricesForBillingModel(usage, billingModelID)
+	serviceTier := usageServiceTier(usage)
+	if imageInputTokens > 0 {
+		metadata := priceMetadata(prices.input, serviceTier, longContext)
+		metadata["billing_model"] = billingModelID
+		metadata["tokens"] = fmt.Sprintf("%d", imageInputTokens)
+		setUsageCostDetail(usage, sdk.UsageCostDetail{
+			Key:         "image_input_tokens",
+			Label:       "图片输入 Token",
+			AccountCost: tokenCost(imageInputTokens, prices.input),
+			Currency:    usageCurrencyUSD,
+			Metadata:    metadata,
+		})
+	}
+	if numImages <= 0 && imageOutputTokens > 0 {
+		numImages = estimateImageCountFromTokens(imageOutputTokens)
+	}
+	if numImages <= 0 {
+		return
+	}
+	if imageOutputTokens <= 0 {
+		imageOutputTokens = numImages * lookupImageGenOutputTokens(size, "")
+	}
+	cost := tokenCost(imageOutputTokens, prices.output)
 	setUsageImageSize(usage, size)
-	addImageCost(usage, usageCostImageTool, "图片工具", numImages, price, size)
+	addImageOutputCost(usage, usageCostImageTool, "图片生成", numImages, cost, size, "", imageOutputTokens, prices.output, billingModelID)
 }
 
-func addImageCost(usage *sdk.Usage, key, label string, numImages int, pricePerImage float64, size string) {
-	if usage == nil || numImages <= 0 || pricePerImage <= 0 {
+func addImageOutputCost(usage *sdk.Usage, key, label string, numImages int, cost float64, size, quality string, outputTokens int, pricePerMillion float64, billingModelID string) {
+	if usage == nil || numImages <= 0 || cost <= 0 {
 		return
 	}
-	cost := float64(numImages) * pricePerImage
 	metadata := map[string]string{
-		"unit_price": fmt.Sprintf("%.10g", pricePerImage),
-		"unit":       "USD/image",
+		"unit_price":  fmt.Sprintf("%.10g", pricePerMillion),
+		"unit":        "USD/1M output tokens",
+		"image_count": fmt.Sprintf("%d", numImages),
+		"tokens":      fmt.Sprintf("%d", outputTokens),
+	}
+	if billingModelID != "" {
+		metadata["billing_model"] = billingModelID
 	}
 	if size != "" {
 		metadata["size"] = size
+		if tier := imageTierForSize(size); tier != "" {
+			metadata["image_tier"] = tier
+		}
+	}
+	if quality != "" {
+		metadata["quality"] = quality
 	}
 	setUsageMetric(usage, sdk.UsageMetric{
 		Key:         usageMetricImages,
@@ -542,4 +631,23 @@ func addImageCost(usage *sdk.Usage, key, label string, numImages int, pricePerIm
 		Currency:    usageCurrencyUSD,
 		Metadata:    metadata,
 	})
+}
+
+func imageTierForSize(size string) string {
+	width, height, ok := parseImageSize(size)
+	if !ok {
+		return "1k"
+	}
+	longest := width
+	if height > longest {
+		longest = height
+	}
+	switch {
+	case longest <= 1536:
+		return "1k"
+	case longest <= 2048:
+		return "2k"
+	default:
+		return "4k"
+	}
 }

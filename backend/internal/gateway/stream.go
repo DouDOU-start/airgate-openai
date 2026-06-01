@@ -173,7 +173,7 @@ func handleStreamResponseWithLogger(logger *slog.Logger, resp *http.Response, w 
 	if numImages <= 0 {
 		numImages = estimateImageCountFromTokens(toolImageOut)
 	}
-	fillUsageCostWithImageTool(usage, numImages, imageGenSize)
+	fillUsageCostWithImageTool(usage, numImages, imageGenSize, toolImageIn, toolImageOut)
 	return sdk.ForwardOutcome{
 		Kind:     sdk.OutcomeSuccess,
 		Upstream: sdk.UpstreamResponse{StatusCode: resp.StatusCode},
@@ -404,7 +404,7 @@ func handleNonStreamResponse(resp *http.Response, w http.ResponseWriter, start t
 	if numImages <= 0 {
 		numImages = estimateImageCountFromTokens(parsed.toolImageOutputTokens)
 	}
-	fillUsageCostWithImageTool(usage, numImages, parsed.imageGenCallSize)
+	fillUsageCostWithImageTool(usage, numImages, parsed.imageGenCallSize, parsed.toolImageInputTokens, parsed.toolImageOutputTokens)
 
 	outcome := sdk.ForwardOutcome{
 		Kind:     sdk.OutcomeSuccess,
@@ -808,7 +808,7 @@ type openaiUsage struct {
 	cachedInputTokens     int
 	reasoningOutputTokens int
 	// image_generation tool 的用量，从 response.tool_usage.image_gen 提取。
-	// 按 gpt-image-1.5 单价单独计费，与主 model 的单价隔离。
+	// 按本次对话模型单价单独归集，便于 Core 对生成图片输出做固定价覆盖。
 	toolImageInputTokens  int
 	toolImageOutputTokens int
 	imageGenCallCount     int

@@ -217,7 +217,7 @@ func convertModels(models []model.NamedSpec) []modelInfo {
 }
 
 func modelCapabilities(spec model.Spec) []string {
-	if spec.ImagePrice > 0 {
+	if spec.ImageOnly {
 		return []string{sdk.ModelCapImageGeneration}
 	}
 	return []string{sdk.ModelCapChat, sdk.ModelCapReasoning}

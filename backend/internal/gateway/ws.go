@@ -53,8 +53,8 @@ type WSResult struct {
 	CachedInputTokens     int
 	ReasoningOutputTokens int
 	// ToolImageInputTokens / ToolImageOutputTokens 来自 response.usage.tool_usage.image_gen
-	// 或 response.completed 的 tool_usage 字段。按 gpt-image-1.5 单价单独计费，
-	// 因为主 model（通常是 gpt-5.4）与图像工具内部模型的单价不同。
+	// 或 response.completed 的 tool_usage 字段。计费层会按本次对话模型价格
+	// 单独归集，便于 Core 配置固定图价时只覆盖生成图片输出部分。
 	ToolImageInputTokens  int
 	ToolImageOutputTokens int
 	// ImageGenCalls 捕获 Responses API 返回的 image_generation_call output items，
@@ -528,7 +528,7 @@ func extractUsageFromResponseMap(result *WSResult, resp map[string]any) {
 		}
 	}
 	// ChatGPT OAuth 响应把 image_generation tool 的用量放在 response.tool_usage.image_gen，
-	// 与主 usage 分开上报。这里提取出来让计费层按 gpt-image-1.5 单价额外计费。
+	// 与主 usage 分开上报。这里提取出来让计费层按对话模型价格额外归集。
 	if toolUsage, ok := resp["tool_usage"].(map[string]any); ok {
 		if img, ok := toolUsage["image_gen"].(map[string]any); ok {
 			result.ToolImageInputTokens = JsonInt(img, "input_tokens")

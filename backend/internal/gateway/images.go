@@ -14,6 +14,7 @@ import (
 	"image/png"
 	"io"
 	"log/slog"
+	"math"
 	"mime"
 	"mime/multipart"
 	"net/http"
@@ -87,7 +88,15 @@ func lookupImageGenOutputTokens(size, quality string) int {
 		}
 		return row["medium"]
 	}
-	return 1056
+	base := imageGenOutputTokenTable["1024x1024"][q]
+	if base <= 0 {
+		base = imageGenOutputTokenTable["1024x1024"]["medium"]
+	}
+	width, height, ok := parseImageSize(s)
+	if !ok {
+		return base
+	}
+	return int(math.Ceil(float64(base) * float64(width*height) / float64(1024*1024)))
 }
 
 // estimateImageGenOutputTokens 汇总所有 image_generation_call 的估算 token 数。
@@ -670,35 +679,6 @@ func imageActualSizeFromBase64(b64 string) (string, bool) {
 		return "", false
 	}
 	return fmt.Sprintf("%dx%d", cfg.Width, cfg.Height), true
-}
-
-// imagePriceForSize 把生成的 size 映射成 USD 单价（1K/2K/4K 三档）。
-// 阈值按最长边：≤1536=1K, ≤2048=2K, 否则 4K。当前固定档位价格：
-//
-//	1K  → $0.10/张  (1024×1024 / 1536×1024 / 1024×1536)
-//	2K  → $0.20/张  (2048×2048 / 2048×1152 / 1152×2048)
-//	4K  → $0.40/张  (3840×2160 / 2160×3840)
-//
-// size = "auto" 或为空（上游用默认 1024²）按 1K 计费。
-// 跟 plugin.yaml 里 ImagePrice 字段解耦——OAuth → image_generation tool 路径
-// 走这一档分档表，不读 spec.ImagePrice。
-func imagePriceForSize(size string) float64 {
-	width, height, ok := parseImageSize(size)
-	if !ok {
-		return 0.10
-	}
-	longest := width
-	if height > longest {
-		longest = height
-	}
-	switch {
-	case longest <= 1536:
-		return 0.10
-	case longest <= 2048:
-		return 0.20
-	default:
-		return 0.40
-	}
 }
 
 // validateImageSize 在 OAuth → image_generation tool 路径上预校验 size，
@@ -1562,7 +1542,7 @@ func (g *OpenAIGateway) forwardImagesViaResponsesToolWithURL(ctx context.Context
 		}
 	}
 	// 图片尺寸作为通用 UsageAttribute 入库，后台费用明细可用它解释 1K/2K/4K 分档。
-	fillUsageCostPerImageBySize(usage, numImages, billingSize)
+	fillUsageCostPerImageBySize(usage, numImages, billingSize, imgReq.Quality)
 	return outcome, nil
 }
 
@@ -1719,7 +1699,7 @@ func handleImagesResponseWithLogger(logger *slog.Logger, resp *http.Response, w 
 
 	elapsed := time.Since(start)
 	usage := newTokenUsage(modelName, "", parsed.inputTokens, parsed.outputTokens, parsed.cachedInputTokens, 0, elapsed.Milliseconds())
-	fillUsageCostPerImageBySize(usage, numImages, billSize)
+	fillUsageCostPerImageBySize(usage, numImages, billSize, "")
 
 	outcome := sdk.ForwardOutcome{
 		Kind:     sdk.OutcomeSuccess,

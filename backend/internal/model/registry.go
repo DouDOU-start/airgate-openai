@@ -25,13 +25,14 @@ type Spec struct {
 	ContextWindow   int
 	MaxOutputTokens int
 
-	// 按张计费（$/张）。> 0 时图像生成走固定单价，不按 token 估算。
-	ImagePrice float64
-
 	// 标准档单价（$/1M tokens）
 	InputPrice  float64
 	CachedPrice float64
 	OutputPrice float64
+
+	// ImageOnly 标记纯图像生成模型。Responses image_generation 产生的图像 token
+	// 默认按对话模型价格计费；纯图像接口没有对话模型时回退到 gpt-5.5 价格。
+	ImageOnly bool
 
 	// Priority 档单价（$/1M tokens）。零值表示未配置，由 SDK 以标准 × 2 兜底。
 	InputPricePriority  float64
@@ -81,13 +82,12 @@ func withPriorityMultiplier(s Spec, multiplier float64) Spec {
 	return s
 }
 
-// imgSpec 构造按张计费的图像模型 Spec。
-func imgSpec(name string, pricePerImage float64) Spec {
-	return Spec{
-		Name:          name,
-		ContextWindow: 32000,
-		ImagePrice:    pricePerImage,
-	}
+// imgSpec 构造纯图像模型 Spec。价格使用 gpt-5.5 默认口径，实际图像输出
+// 成本在 gateway 层会单独归入 image cost，便于 Core 配置固定图价时覆盖。
+func imgSpec(name string) Spec {
+	s := std(name, 32000, 0, 5.0, 0.5, 30.0)
+	s.ImageOnly = true
+	return s
 }
 
 // withLongCtx 在已构造的 Spec 基础上附加 gpt-5.4 家族的长上下文阶梯。
@@ -116,10 +116,10 @@ var registry = map[string]Spec{
 	// ── GPT 基础系列 ──
 	"gpt-5.2": std("GPT 5.2", 272000, 128000, 1.75, 0.175, 14.0),
 
-	// ── 图像生成（按张计费 $0.20/张）──
-	"gpt-image-1":   imgSpec("GPT Image 1", 0.20),
-	"gpt-image-1.5": imgSpec("GPT Image 1.5", 0.20),
-	"gpt-image-2":   imgSpec("GPT Image 2", 0.20),
+	// ── 图像生成（默认按对话模型 token 价格计费；固定价由 Core 配置覆盖）──
+	"gpt-image-1":   imgSpec("GPT Image 1"),
+	"gpt-image-1.5": imgSpec("GPT Image 1.5"),
+	"gpt-image-2":   imgSpec("GPT Image 2"),
 }
 
 // DefaultSpec 未注册模型的最终兜底值。按 gpt-5.4 标准档计价——宁可略高也不能 0。
@@ -164,9 +164,9 @@ func fallbackByKeyword(id string) (Spec, bool) {
 	return Spec{}, false
 }
 
-// IsImageOnly 判断给定 model 是否为纯图像生成模型（ImagePrice > 0）。
+// IsImageOnly 判断给定 model 是否为纯图像生成模型。
 func IsImageOnly(modelID string) bool {
-	return Lookup(modelID).ImagePrice > 0
+	return Lookup(modelID).ImageOnly
 }
 
 // IsKnown 判断给定 model ID 是否在注册表内（大小写不敏感、忽略首尾空白）。
@@ -186,7 +186,7 @@ func IsKnown(modelID string) bool {
 func AllSpecs(includeImages bool) []sdk.ModelInfo {
 	models := make([]sdk.ModelInfo, 0, len(registry))
 	for id, spec := range registry {
-		isImage := spec.ImagePrice > 0
+		isImage := spec.ImageOnly
 		if isImage && !includeImages {
 			continue
 		}
@@ -243,7 +243,7 @@ func toModelInfo(id string, spec Spec) sdk.ModelInfo {
 }
 
 func modelCapabilities(spec Spec) []string {
-	if spec.ImagePrice > 0 {
+	if spec.ImageOnly {
 		return []string{sdk.ModelCapImageGeneration}
 	}
 	return []string{sdk.ModelCapChat, sdk.ModelCapReasoning}

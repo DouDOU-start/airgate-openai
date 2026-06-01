@@ -207,7 +207,7 @@ func TestApplyWebReverseSizeHint(t *testing.T) {
 // TestHandleImagesResponse_TokenAttribution 覆盖官方响应格式：
 //   - usage.input_tokens / output_tokens 落入 Outcome.Usage
 //   - cached tokens 从 input 中扣减，避免重复计费
-//   - API Key Images 按请求 size 分档计费
+//   - API Key Images 的图像输出 token 单独归入 image cost
 func TestHandleImagesResponse_TokenAttribution(t *testing.T) {
 	body := `{
 		"created": 1713833628,
@@ -250,11 +250,12 @@ func TestHandleImagesResponse_TokenAttribution(t *testing.T) {
 		t.Errorf("cached_input_tokens = %d, want 10", got)
 	}
 
-	if got := usageCostByKey(u, usageCostInput); !almostEqual(got, 0, 1e-9) {
-		t.Errorf("input cost = %v, want 0 (per-image billing)", got)
+	if got := usageCostByKey(u, usageCostInput); !almostEqual(got, tokenCost(40, 5), 1e-9) {
+		t.Errorf("input cost = %v, want %v", got, tokenCost(40, 5))
 	}
-	if !almostEqual(u.AccountCost, 0.20, 1e-9) {
-		t.Errorf("AccountCost = %v, want 0.20 (1 image × 2K tier $0.20)", u.AccountCost)
+	wantCost := tokenCost(40, 5) + tokenCost(10, 0.5) + tokenCost(4160, 30)
+	if !almostEqual(u.AccountCost, wantCost, 1e-9) {
+		t.Errorf("AccountCost = %v, want %v", u.AccountCost, wantCost)
 	}
 
 	if w.Code != http.StatusOK {
@@ -339,11 +340,18 @@ func TestHandleImagesResponse_APIKeyBillingUsesRequestSize(t *testing.T) {
 	if err != nil {
 		t.Fatalf("handleImagesResponse returned err: %v", err)
 	}
-	if got, want := outcome.Usage.AccountCost, 0.80; !almostEqual(got, want, 1e-9) {
-		t.Fatalf("AccountCost = %v, want %v (2 images × 4K tier $0.40)", got, want)
+	wantCost := tokenCost(10, 5) + tokenCost(100, 30)
+	if got := outcome.Usage.AccountCost; !almostEqual(got, wantCost, 1e-9) {
+		t.Fatalf("AccountCost = %v, want %v", got, wantCost)
 	}
-	if got, want := usageImageUnitPrice(outcome.Usage), "0.4"; got != want {
+	if got, want := usageImageUnitPrice(outcome.Usage), "30"; got != want {
 		t.Fatalf("image unit_price = %q, want %q", got, want)
+	}
+	if got, want := usageCostMetadata(outcome.Usage, usageCostImage, "billing_model"), "gpt-5.5"; got != want {
+		t.Fatalf("image billing_model = %q, want %q", got, want)
+	}
+	if got, want := usageCostMetadata(outcome.Usage, usageCostImage, "image_tier"), "4k"; got != want {
+		t.Fatalf("image_tier = %q, want %q", got, want)
 	}
 }
 
@@ -396,13 +404,13 @@ func TestHandleImagesResponse_FallbackModelWhenBodyLacksModel(t *testing.T) {
 	}
 }
 
-// TestFillUsageCostPerImageBySize_1K 按尺寸分档计费 1K。
+// TestFillUsageCostPerImageBySize_1K 按默认 gpt-5.5 输出价格估算图像 token 成本。
 func TestFillUsageCostPerImageBySize_1K(t *testing.T) {
 	usage := &sdk.Usage{Model: "gpt-image-1"}
-	fillUsageCostPerImageBySize(usage, 3, "1024x1024")
-	// 3 张 × $0.10 = 0.30
-	if !almostEqual(usage.AccountCost, 0.30, 1e-9) {
-		t.Errorf("AccountCost = %v, want 0.30", usage.AccountCost)
+	fillUsageCostPerImageBySize(usage, 3, "1024x1024", "")
+	want := tokenCost(3*lookupImageGenOutputTokens("1024x1024", ""), 30)
+	if !almostEqual(usage.AccountCost, want, 1e-9) {
+		t.Errorf("AccountCost = %v, want %v", usage.AccountCost, want)
 	}
 }
 
@@ -430,59 +438,60 @@ func TestImageActualSizeFromBase64(t *testing.T) {
 	}
 }
 
-// TestImagePriceForSize 覆盖 1K/2K/4K 三档 + auto/空/异常 fallback。
-func TestImagePriceForSize(t *testing.T) {
+// TestImageTierForSize 覆盖 Core 固定图价需要的 1K/2K/4K 分档元数据。
+func TestImageTierForSize(t *testing.T) {
 	cases := []struct {
 		size string
-		want float64
+		want string
 	}{
-		// 1K (≤1536)
-		{"1024x1024", 0.10},
-		{"1536x1024", 0.10},
-		{"1024x1536", 0.10},
-		// 2K (1537-2048)
-		{"2048x2048", 0.20},
-		{"2048x1152", 0.20},
-		{"1152x2048", 0.20},
-		// 4K (>2048)
-		{"3840x2160", 0.40},
-		{"2160x3840", 0.40},
-		// fallback 1K
-		{"", 0.10},
-		{"auto", 0.10},
-		{"garbage", 0.10},
+		{"1024x1024", "1k"},
+		{"1536x1024", "1k"},
+		{"1024x1536", "1k"},
+		{"2048x2048", "2k"},
+		{"2048x1152", "2k"},
+		{"1152x2048", "2k"},
+		{"3840x2160", "4k"},
+		{"2160x3840", "4k"},
+		{"", "1k"},
+		{"auto", "1k"},
+		{"garbage", "1k"},
 	}
 	for _, tc := range cases {
-		if got := imagePriceForSize(tc.size); !almostEqual(got, tc.want, 1e-9) {
-			t.Errorf("imagePriceForSize(%q) = %v, want %v", tc.size, got, tc.want)
+		if got := imageTierForSize(tc.size); got != tc.want {
+			t.Errorf("imageTierForSize(%q) = %q, want %q", tc.size, got, tc.want)
 		}
 	}
 }
 
-// TestFillUsageCostPerImageBySize 验证按张 × 档位单价填到 OutputCost。
+// TestFillUsageCostPerImageBySize 验证图像输出 token 归入 image cost。
 func TestFillUsageCostPerImageBySize(t *testing.T) {
 	cases := []struct {
 		name      string
 		size      string
 		numImages int
-		want      float64
 	}{
-		{"1K single", "1024x1024", 1, 0.10},
-		{"1K triple", "1536x1024", 3, 0.30},
-		{"2K single", "2048x2048", 1, 0.20},
-		{"4K double", "3840x2160", 2, 0.80},
-		{"auto fallback to 1K", "auto", 4, 0.40},
-		{"zero images skipped", "1024x1024", 0, 0},
+		{"1K single", "1024x1024", 1},
+		{"1K triple", "1536x1024", 3},
+		{"2K single", "2048x2048", 1},
+		{"4K double", "3840x2160", 2},
+		{"auto fallback to 1K", "auto", 4},
+		{"zero images skipped", "1024x1024", 0},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			usage := &sdk.Usage{Model: "gpt-image-2"}
-			fillUsageCostPerImageBySize(usage, tc.numImages, tc.size)
-			if !almostEqual(usage.AccountCost, tc.want, 1e-9) {
-				t.Errorf("AccountCost = %v, want %v", usage.AccountCost, tc.want)
+			fillUsageCostPerImageBySize(usage, tc.numImages, tc.size, "")
+			want := tokenCost(tc.numImages*lookupImageGenOutputTokens(tc.size, ""), 30)
+			if !almostEqual(usage.AccountCost, want, 1e-9) {
+				t.Errorf("AccountCost = %v, want %v", usage.AccountCost, want)
 			}
 			if !almostEqual(usageCostByKey(usage, usageCostInput), 0, 1e-9) {
 				t.Errorf("input cost = %v, want 0", usageCostByKey(usage, usageCostInput))
+			}
+			if tc.numImages > 0 {
+				if got, want := usageCostMetadata(usage, usageCostImage, "billing_model"), "gpt-5.5"; got != want {
+					t.Errorf("billing_model = %q, want %q", got, want)
+				}
 			}
 		})
 	}
@@ -507,6 +516,18 @@ func usageImageUnitPrice(usage *sdk.Usage) string {
 	for _, detail := range usage.CostDetails {
 		if detail.Key == usageCostImage {
 			return detail.Metadata["unit_price"]
+		}
+	}
+	return ""
+}
+
+func usageCostMetadata(usage *sdk.Usage, key, metadataKey string) string {
+	if usage == nil {
+		return ""
+	}
+	for _, detail := range usage.CostDetails {
+		if detail.Key == key && detail.Metadata != nil {
+			return detail.Metadata[metadataKey]
 		}
 	}
 	return ""
@@ -609,30 +630,37 @@ func TestParseSSEUsage_ToolImageGen(t *testing.T) {
 	}
 }
 
-// TestFillUsageCostWithImageTool 叠加计费：主 model (gpt-5.4) 的 chat token 按
-// 其单价、image tool 按尺寸分档计费。
+// TestFillUsageCostWithImageTool 叠加计费：主 model (gpt-5.4) 的 chat token
+// 和 image tool token 都按同一个对话模型价格计费。
 func TestFillUsageCostWithImageTool(t *testing.T) {
 	usage := newTokenUsage("gpt-5.4", "", 1000, 500, 0, 0, 0)
-	fillUsageCostWithImageTool(usage, 1, "1024x1024")
+	fillUsageCostWithImageTool(usage, 1, "1024x1024", 0, 1056)
 
 	// 主 gpt-5.4 standard: input=$2.5/1M → 0.0025, output=$15/1M → 0.0075
-	// image tool: 1 张 × $0.10 (1K) = 0.10
-	// total account cost = 0.0025 + 0.0075 + 0.10 = 0.1100
+	// image tool output 1056 tokens also uses gpt-5.4 output=$15/1M → 0.01584
+	// total account cost = 0.0025 + 0.0075 + 0.01584 = 0.02584
 	if !almostEqual(usageCostByKey(usage, usageCostInput), 0.0025, 1e-9) {
 		t.Errorf("input cost = %v, want 0.0025", usageCostByKey(usage, usageCostInput))
 	}
-	if !almostEqual(usage.AccountCost, 0.1100, 1e-9) {
-		t.Errorf("AccountCost = %v, want 0.1100", usage.AccountCost)
+	wantCost := 0.0025 + 0.0075 + tokenCost(1056, 15)
+	if !almostEqual(usage.AccountCost, wantCost, 1e-9) {
+		t.Errorf("AccountCost = %v, want %v", usage.AccountCost, wantCost)
 	}
 	if got := usage.Metrics[0].Metadata["unit_price"]; got != "2.5" {
 		t.Errorf("input unit_price = %q, want 2.5", got)
+	}
+	if got, want := usageCostMetadata(usage, usageCostImageTool, "billing_model"), "gpt-5.4"; got != want {
+		t.Errorf("image billing_model = %q, want %q", got, want)
+	}
+	if got, want := usageCostMetadata(usage, usageCostImageTool, "unit_price"), "15"; got != want {
+		t.Errorf("image unit_price = %q, want %q", got, want)
 	}
 }
 
 func TestAddUsageCostForModel_CombinesResponsesContextAndImageCost(t *testing.T) {
 	usage := newTokenUsage("gpt-image-2", "", 12, 0, 0, 0, 0)
 	addUsageCostForModel(usage, "gpt-5.4", "", 1000, 500, 0, 0, "responses_context", "上下文")
-	fillUsageCostPerImageBySize(usage, 1, "1024x1024")
+	fillUsageCostPerImageBySize(usage, 1, "1024x1024", "")
 
 	if got := usageCostByKey(usage, "responses_context_"+usageCostInput); !almostEqual(got, 0.0025, 1e-9) {
 		t.Errorf("context input cost = %v, want 0.0025", got)
@@ -640,21 +668,26 @@ func TestAddUsageCostForModel_CombinesResponsesContextAndImageCost(t *testing.T)
 	if got := usageCostByKey(usage, "responses_context_"+usageCostOutput); !almostEqual(got, 0.0075, 1e-9) {
 		t.Errorf("context output cost = %v, want 0.0075", got)
 	}
-	if got := usageCostByKey(usage, usageCostImage); !almostEqual(got, 0.10, 1e-9) {
-		t.Errorf("image cost = %v, want 0.10", got)
+	wantImageCost := tokenCost(lookupImageGenOutputTokens("1024x1024", ""), 30)
+	if got := usageCostByKey(usage, usageCostImage); !almostEqual(got, wantImageCost, 1e-9) {
+		t.Errorf("image cost = %v, want %v", got, wantImageCost)
 	}
-	if !almostEqual(usage.AccountCost, 0.1100, 1e-9) {
-		t.Errorf("AccountCost = %v, want 0.1100", usage.AccountCost)
+	wantCost := tokenCost(12, 5) + 0.0025 + 0.0075 + wantImageCost
+	if !almostEqual(usage.AccountCost, wantCost, 1e-9) {
+		t.Errorf("AccountCost = %v, want %v", usage.AccountCost, wantCost)
 	}
 	if usage.Model != "gpt-image-2" {
 		t.Errorf("Usage.Model = %q, want gpt-image-2", usage.Model)
+	}
+	if got, want := usageCostMetadata(usage, usageCostImage, "billing_model"), "gpt-5.5"; got != want {
+		t.Errorf("image billing_model = %q, want %q", got, want)
 	}
 }
 
 // TestFillUsageCostWithImageTool_NoToolUsage 退化为 fillUsageCost 行为不变。
 func TestFillUsageCostWithImageTool_NoToolUsage(t *testing.T) {
 	usage := newTokenUsage("gpt-5.4", "", 1000, 500, 0, 0, 0)
-	fillUsageCostWithImageTool(usage, 0, "")
+	fillUsageCostWithImageTool(usage, 0, "", 0, 0)
 	if usageMetricInt(usage, usageMetricInputTokens) != 1000 || usageMetricInt(usage, usageMetricOutputTokens) != 500 {
 		t.Errorf("token counts mutated when no image tool usage")
 	}
@@ -1672,8 +1705,9 @@ func TestLookupImageGenOutputTokens(t *testing.T) {
 		// quality="auto" → medium
 		{"1024x1024", "auto", 1056},
 		{"1024x1024", "", 1056},
-		// 未知 size 保底 1024×1024 medium
-		{"9999x9999", "high", 1056},
+		// 未注册但可解析的 size 按像素面积缩放；无法解析才保底 1024×1024 medium。
+		{"9999x9999", "high", 396650},
+		{"garbage", "high", 4160},
 		{"1024x1024", "unknown", 1056}, // unknown quality → medium
 		// 大小写归一
 		{"1024X1024", "HIGH", 4160},
