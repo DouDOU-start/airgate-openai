@@ -298,6 +298,63 @@ func TestHandleStreamResponseTreatsResponsesImageContentAsOutput(t *testing.T) {
 	}
 }
 
+func TestHandleStreamResponseNormalizesImageGenerationCallStatus(t *testing.T) {
+	body := strings.Join([]string{
+		`data: {"type":"response.output_item.done","item":{"id":"ig_1","type":"image_generation_call","status":"generating","result":"aGVsbG8=","size":"1024x1024"}}`,
+		"",
+		`data: {"type":"response.completed","response":{"id":"resp_1","model":"gpt-5.4","status":"completed","usage":{"input_tokens":10,"output_tokens":2},"output":[{"id":"ig_1","type":"image_generation_call","status":"generating","result":"aGVsbG8=","size":"1024x1024"}]}}`,
+		"",
+	}, "\n")
+	resp := &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+		Body:       io.NopCloser(strings.NewReader(body)),
+	}
+	w := httptest.NewRecorder()
+
+	outcome, err := handleStreamResponse(resp, w, time.Now(), "")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if outcome.Kind != sdk.OutcomeSuccess {
+		t.Fatalf("expected OutcomeSuccess, got %v", outcome.Kind)
+	}
+	got := w.Body.String()
+	if strings.Contains(got, `"status":"generating"`) {
+		t.Fatalf("image_generation_call status should be normalized: %q", got)
+	}
+	if !strings.Contains(got, `"item":{"id":"ig_1","type":"image_generation_call","status":"completed"`) {
+		t.Fatalf("output_item.done should be normalized: %q", got)
+	}
+	if !strings.Contains(got, `"output":[{"id":"ig_1","type":"image_generation_call","status":"completed"`) {
+		t.Fatalf("response.completed output should be normalized: %q", got)
+	}
+}
+
+func TestHandleStreamResponseTreatsPartialImageB64AsOutput(t *testing.T) {
+	body := strings.Join([]string{
+		`data: {"type":"response.image_generation_call.partial_image","item_id":"ig_1","output_index":0,"partial_image_b64":"aGVsbG8=","partial_image_index":0}`,
+		"",
+	}, "\n")
+	resp := &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+		Body:       io.NopCloser(strings.NewReader(body)),
+	}
+	w := httptest.NewRecorder()
+
+	outcome, err := handleStreamResponse(resp, w, time.Now(), "")
+	if outcome.Kind != sdk.OutcomeStreamAborted {
+		t.Fatalf("expected OutcomeStreamAborted, got %v", outcome.Kind)
+	}
+	if err == nil {
+		t.Fatalf("expected missing completion event error")
+	}
+	if !strings.Contains(w.Body.String(), `"partial_image_b64":"aGVsbG8="`) {
+		t.Fatalf("partial image event should be forwarded: %q", w.Body.String())
+	}
+}
+
 func TestHandleStreamResponseRecordsDeliveredImagesWhenStreamAborts(t *testing.T) {
 	body := strings.Join([]string{
 		`data: {"type":"response.output_item.done","item":{"id":"ig_1","type":"image_generation_call","status":"completed","result":"aGVsbG8=","size":"1024x1024"}}`,

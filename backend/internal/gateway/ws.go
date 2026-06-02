@@ -595,7 +595,7 @@ func collectImageGenCallPartial(result *WSResult, ev map[string]any) {
 		OutputIndex:    jsonInt(ev["output_index"]),
 		HasOutputIndex: hasJSONKey(ev, "output_index"),
 		Status:         firstNonEmptyString(jsonString(ev["status"]), "in_progress"),
-		Result:         firstNonEmptyString(jsonString(ev["partial_image"]), jsonString(ev["result"])),
+		Result:         firstNonEmptyString(jsonString(ev["partial_image_b64"]), jsonString(ev["partial_image"]), jsonString(ev["result"])),
 		Size:           jsonString(ev["size"]),
 		Quality:        jsonString(ev["quality"]),
 		OutputFormat:   jsonString(ev["output_format"]),

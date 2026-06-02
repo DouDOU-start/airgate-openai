@@ -370,10 +370,10 @@ func TestFilterDisabledImageGenerationTool(t *testing.T) {
 			wantChoice: true,
 		},
 		{
-			name:       "airgate group without setting keeps image tool",
+			name:       "airgate group without setting removes image tool",
 			headers:    airgateGroup,
 			body:       []byte(`{"model":"gpt-5.4","input":"hi","tools":[{"type":"image_generation"}]}`),
-			wantTools:  []string{"image_generation"},
+			wantTools:  nil,
 			wantChoice: false,
 		},
 		{

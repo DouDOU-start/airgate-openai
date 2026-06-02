@@ -367,6 +367,47 @@ func TestBuildNonStreamResponses_PatchesEmptyOutputFromImageCalls(t *testing.T) 
 	}
 }
 
+func TestBuildNonStreamResponses_PatchesPlaceholderImageOutput(t *testing.T) {
+	completedEvent := []byte(`{"type":"response.completed","response":{"id":"resp_img","object":"response","status":"completed","output":[{"id":"rs_1","type":"reasoning"},{"id":"ig_1","type":"image_generation_call","status":"generating"}],"usage":{"input_tokens":12,"output_tokens":34,"total_tokens":46}}}`)
+	result := WSResult{
+		CompletedEventRaw: completedEvent,
+		ImageGenCalls: []ImageGenCall{{
+			ID:             "ig_1",
+			OutputIndex:    1,
+			HasOutputIndex: true,
+			Status:         "generating",
+			Result:         "iVBORw0KGgoAAA",
+			Size:           "1024x1024",
+			Quality:        "low",
+			OutputFormat:   "png",
+		}},
+	}
+
+	body := buildNonStreamResponses(result)
+	var got map[string]any
+	if err := json.Unmarshal(body, &got); err != nil {
+		t.Fatalf("body not valid JSON: %v", err)
+	}
+
+	output := got["output"].([]any)
+	if len(output) != 2 {
+		t.Fatalf("output len = %d, want 2", len(output))
+	}
+	item := output[1].(map[string]any)
+	if item["type"] != "image_generation_call" {
+		t.Fatalf("output[1].type = %v, want image_generation_call", item["type"])
+	}
+	if item["result"] != "iVBORw0KGgoAAA" {
+		t.Fatalf("output[1].result = %v, want image data", item["result"])
+	}
+	if item["status"] != "completed" {
+		t.Fatalf("output[1].status = %v, want completed", item["status"])
+	}
+	if item["quality"] != "low" || item["output_format"] != "png" {
+		t.Fatalf("image metadata not patched: %#v", item)
+	}
+}
+
 // 上游没给 response.completed 时用兜底占位
 func TestBuildNonStreamResponses_Fallback(t *testing.T) {
 	result := WSResult{ResponseID: "resp_xyz", Model: "gpt-5.4"}

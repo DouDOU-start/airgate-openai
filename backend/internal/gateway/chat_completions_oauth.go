@@ -608,14 +608,25 @@ func patchResponsesOutput(raw string, result WSResult) []byte {
 	}
 	output, _ := response["output"].([]any)
 	if len(output) > 0 {
-		return nil
+		if !patchResponsesImageGenOutputItems(output, result) {
+			if normalized := normalizeResponsesImageGenerationBody([]byte(raw)); string(normalized) != raw {
+				return normalized
+			}
+			return nil
+		}
+		response["output"] = output
+		b, err := json.Marshal(response)
+		if err != nil {
+			return nil
+		}
+		return normalizeResponsesImageGenerationBody(b)
 	}
 	response["output"] = synthesizeResponsesImageGenOutput(result)
 	b, err := json.Marshal(response)
 	if err != nil {
 		return nil
 	}
-	return b
+	return normalizeResponsesImageGenerationBody(b)
 }
 
 func synthesizeResponsesImageGenOutput(result WSResult) []map[string]any {
@@ -658,4 +669,75 @@ func synthesizeResponsesImageGenOutput(result WSResult) []map[string]any {
 		output = append(output, item)
 	}
 	return output
+}
+
+func patchResponsesImageGenOutputItems(output []any, result WSResult) bool {
+	if len(output) == 0 || len(result.ImageGenCalls) == 0 {
+		return false
+	}
+	changed := false
+	for idx, rawItem := range output {
+		item, ok := rawItem.(map[string]any)
+		if !ok || jsonString(item["type"]) != "image_generation_call" {
+			continue
+		}
+		if patchResponsesImageGenOutputItem(item, result) {
+			output[idx] = item
+			changed = true
+		}
+	}
+	return changed
+}
+
+func patchResponsesImageGenOutputItem(item map[string]any, result WSResult) bool {
+	call, ok := findImageGenCallForOutputItem(result, item)
+	if !ok {
+		return false
+	}
+	changed := false
+	setString := func(key, value string) {
+		if strings.TrimSpace(value) == "" || jsonString(item[key]) != "" {
+			return
+		}
+		item[key] = value
+		changed = true
+	}
+	setString("id", call.ID)
+	setString("result", call.Result)
+	setString("size", call.Size)
+	setString("quality", call.Quality)
+	setString("output_format", call.OutputFormat)
+	setString("background", call.Background)
+	setString("revised_prompt", call.RevisedPrompt)
+	setString("model", call.Model)
+	if call.HasOutputIndex && item["output_index"] == nil {
+		item["output_index"] = call.OutputIndex
+		changed = true
+	}
+	if jsonString(item["result"]) != "" {
+		status := strings.TrimSpace(jsonString(item["status"]))
+		if status == "" || status == "in_progress" || status == "generating" {
+			item["status"] = "completed"
+			changed = true
+		}
+	}
+	return changed
+}
+
+func findImageGenCallForOutputItem(result WSResult, item map[string]any) (ImageGenCall, bool) {
+	itemID := firstNonEmptyString(jsonString(item["id"]), jsonString(item["call_id"]))
+	itemOutputIndex := jsonInt(item["output_index"])
+	hasOutputIndex := hasJSONKey(item, "output_index")
+	for _, call := range result.ImageGenCalls {
+		if itemID != "" && call.ID == itemID {
+			return call, true
+		}
+		if hasOutputIndex && call.HasOutputIndex && call.OutputIndex == itemOutputIndex {
+			return call, true
+		}
+	}
+	if len(result.ImageGenCalls) == 1 {
+		return result.ImageGenCalls[0], true
+	}
+	return ImageGenCall{}, false
 }

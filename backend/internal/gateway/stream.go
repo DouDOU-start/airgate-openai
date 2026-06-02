@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/tidwall/gjson"
+	"github.com/tidwall/sjson"
 
 	sdk "github.com/DouDOU-start/airgate-sdk/sdkgo"
 )
@@ -102,8 +103,15 @@ func handleStreamResponseWithLogger(logger *slog.Logger, resp *http.Response, w 
 			}
 		}
 
+		lineForClient := line
+		if ok && data != "" && data != "[DONE]" {
+			if patched := normalizeResponsesImageGenerationSSEData(data); patched != data {
+				lineForClient = "data: " + patched
+			}
+		}
+
 		if !ok || data == "" || data == "[DONE]" {
-			if err := writeOrBufferSSELine(w, resp.StatusCode, line, &pending, &streamStarted, diagnostics.hasOutput()); err != nil {
+			if err := writeOrBufferSSELine(w, resp.StatusCode, lineForClient, &pending, &streamStarted, diagnostics.hasOutput()); err != nil {
 				streamErr = fmt.Errorf("写入客户端 SSE 失败: %w", err)
 				break
 			}
@@ -114,7 +122,7 @@ func handleStreamResponseWithLogger(logger *slog.Logger, resp *http.Response, w 
 			firstTokenRecorded = true
 		}
 		parseSSEUsage([]byte(data), usage, &toolImageIn, &toolImageOut)
-		if err := writeOrBufferSSELine(w, resp.StatusCode, line, &pending, &streamStarted, diagnostics.hasOutput()); err != nil {
+		if err := writeOrBufferSSELine(w, resp.StatusCode, lineForClient, &pending, &streamStarted, diagnostics.hasOutput()); err != nil {
 			streamErr = fmt.Errorf("写入客户端 SSE 失败: %w", err)
 			break
 		}
@@ -192,6 +200,71 @@ func imageCountForToolUsage(numImages, imageOutputTokens int) int {
 		return numImages
 	}
 	return estimateImageCountFromTokens(imageOutputTokens)
+}
+
+func normalizeResponsesImageGenerationSSEData(data string) string {
+	if strings.TrimSpace(data) == "" || !gjson.Valid(data) {
+		return data
+	}
+	eventType := gjson.Get(data, "type").String()
+	switch eventType {
+	case "response.output_item.done":
+		return normalizeImageGenerationCallStatus(data, "item")
+	case "response.completed", "response.done":
+		return string(normalizeResponsesImageGenerationBody([]byte(data)))
+	default:
+		return data
+	}
+}
+
+func normalizeResponsesImageGenerationBody(body []byte) []byte {
+	if len(body) == 0 || !gjson.ValidBytes(body) {
+		return body
+	}
+	result := body
+	for _, path := range []string{"output", "response.output"} {
+		output := gjson.GetBytes(result, path)
+		if !output.Exists() || !output.IsArray() {
+			continue
+		}
+		for i, item := range output.Array() {
+			if !isCompletedImageGenerationCall(item) {
+				continue
+			}
+			patched, err := sjson.SetBytes(result, fmt.Sprintf("%s.%d.status", path, i), "completed")
+			if err != nil {
+				continue
+			}
+			result = patched
+		}
+	}
+	return result
+}
+
+func normalizeImageGenerationCallStatus(data, itemPath string) string {
+	item := gjson.Get(data, itemPath)
+	if !isCompletedImageGenerationCall(item) {
+		return data
+	}
+	patched, err := sjson.Set(data, itemPath+".status", "completed")
+	if err != nil {
+		return data
+	}
+	return patched
+}
+
+func isCompletedImageGenerationCall(item gjson.Result) bool {
+	if !item.Exists() || !item.IsObject() {
+		return false
+	}
+	if item.Get("type").String() != "image_generation_call" {
+		return false
+	}
+	if strings.TrimSpace(item.Get("result").String()) == "" {
+		return false
+	}
+	status := strings.TrimSpace(item.Get("status").String())
+	return status == "" || status == "in_progress" || status == "generating"
 }
 
 func logUpstreamSSEDataDebug(logger *slog.Logger, diagnostics streamResponseDiagnostics, data string) {
@@ -391,6 +464,7 @@ func handleNonStreamResponse(resp *http.Response, w http.ResponseWriter, start t
 		reason := fmt.Sprintf("读取上游响应失败: %v", err)
 		return transientOutcome(reason), fmt.Errorf("%s", reason)
 	}
+	body = normalizeResponsesImageGenerationBody(body)
 
 	parsed := parseUsage(body)
 
@@ -629,6 +703,7 @@ func streamDataHasOutput(data string) bool {
 		))
 	case "response.image_generation_call.partial_image":
 		return strings.TrimSpace(firstNonEmptyString(
+			gjson.Get(data, "partial_image_b64").String(),
 			gjson.Get(data, "partial_image").String(),
 			gjson.Get(data, "result").String(),
 		)) != ""
@@ -731,6 +806,7 @@ func responseContentPartHasOutput(part gjson.Result) bool {
 		"data",
 		"url",
 		"result",
+		"partial_image_b64",
 		"partial_image",
 	} {
 		if strings.TrimSpace(part.Get(path).String()) != "" {
