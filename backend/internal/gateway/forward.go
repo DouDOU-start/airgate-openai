@@ -60,7 +60,7 @@ func (g *OpenAIGateway) forwardHTTP(ctx context.Context, req *sdk.ForwardRequest
 	var reqServiceTier string
 	if !strings.HasPrefix(req.Headers.Get("Content-Type"), "multipart/") {
 		req.Body = preprocessRequestBody(req.Body, req.Model, reqPath)
-		req.Body = applyForceInstructions(req.Body, req.Headers)
+		req.Body = applyForceInstructionsForRequest(req.Body, req.Headers, reqPath)
 		if !isImagesRequest(reqPath) {
 			req.Body = filterDisabledImageGenerationTool(req.Body, req.Headers)
 		}

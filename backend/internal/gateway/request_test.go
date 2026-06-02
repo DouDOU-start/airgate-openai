@@ -326,6 +326,44 @@ func TestPreprocessRequestBody_ForcesResponsesStoreFalse(t *testing.T) {
 	}
 }
 
+func TestApplyForceInstructionsForRequest_SkipsResponsesImageGeneration(t *testing.T) {
+	headers := http.Header{"X-Airgate-Force-Instructions": []string{"nsfw"}}
+	body := []byte(`{"model":"gpt-5.4","instructions":"keep me","input":"draw","tools":[{"type":"image_generation","size":"1024x1024"}]}`)
+
+	got := applyForceInstructionsForRequest(body, headers, "/v1/responses")
+
+	if instructions := gjson.GetBytes(got, "instructions").String(); instructions != "keep me" {
+		t.Fatalf("instructions = %.64q, want original; body=%s", instructions, got)
+	}
+	if !gjson.GetBytes(got, "tools.0.size").Exists() {
+		t.Fatalf("image_generation tool should stay intact; body=%s", got)
+	}
+}
+
+func TestApplyForceInstructionsForRequest_AppliesToNonImageResponses(t *testing.T) {
+	headers := http.Header{"X-Airgate-Force-Instructions": []string{"nsfw"}}
+	body := []byte(`{"model":"gpt-5.4","instructions":"keep me","input":"hi","tools":[{"type":"web_search"}]}`)
+
+	got := applyForceInstructionsForRequest(body, headers, "/v1/responses")
+
+	instructions := gjson.GetBytes(got, "instructions").String()
+	if instructions == "keep me" || !strings.Contains(instructions, "You are Codex") {
+		t.Fatalf("instructions were not force-applied; got %.128q", instructions)
+	}
+}
+
+func TestApplyForceInstructionsForRequest_AppliesToChatCompletionsImageTool(t *testing.T) {
+	headers := http.Header{"X-Airgate-Force-Instructions": []string{"nsfw"}}
+	body := []byte(`{"model":"gpt-5.4","instructions":"keep me","messages":[{"role":"user","content":"hi"}],"tools":[{"type":"image_generation"}]}`)
+
+	got := applyForceInstructionsForRequest(body, headers, "/v1/chat/completions")
+
+	instructions := gjson.GetBytes(got, "instructions").String()
+	if instructions == "keep me" || !strings.Contains(instructions, "You are Codex") {
+		t.Fatalf("instructions were not force-applied for non-Responses path; got %.128q", instructions)
+	}
+}
+
 func TestFilterDisabledImageGenerationTool(t *testing.T) {
 	t.Parallel()
 

@@ -479,6 +479,29 @@ func applyForceInstructions(body []byte, headers http.Header) []byte {
 	return body
 }
 
+func applyForceInstructionsForRequest(body []byte, headers http.Header, reqPath string) []byte {
+	if isResponsesRequestPath(reqPath) && hasImageGenerationTool(body) {
+		return body
+	}
+	return applyForceInstructions(body, headers)
+}
+
+func hasImageGenerationTool(body []byte) bool {
+	if len(body) == 0 {
+		return false
+	}
+	tools := gjson.GetBytes(body, "tools")
+	if !tools.Exists() || !tools.IsArray() {
+		return false
+	}
+	for _, tool := range tools.Array() {
+		if strings.EqualFold(strings.TrimSpace(tool.Get("type").String()), "image_generation") {
+			return true
+		}
+	}
+	return false
+}
+
 // buildCodexWSRequest Codex CLI 透传模式
 func buildCodexWSRequest(body []byte, model string, session openAISessionResolution) ([]byte, error) {
 	var reqData map[string]any
