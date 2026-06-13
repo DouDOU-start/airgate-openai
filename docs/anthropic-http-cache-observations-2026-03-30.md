@@ -1,5 +1,7 @@
 # Anthropic HTTP Cache Observations
 
+> **研究笔记（时点观测，2026-03-30）** · 记录对上游行为的一次性观测，非规范、非现状架构文档，结论可能随上游变化失效。开发依据见 `airgate-core/docs/architecture/current/`。
+
 ## Background
 
 This note summarizes the current behavior of the local `Claude Code -> /v1/messages -> gateway-openai -> sub2api /v1/responses` path as validated on March 30, 2026.
