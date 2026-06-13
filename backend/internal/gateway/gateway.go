@@ -907,15 +907,3 @@ func jsonMarshal(v interface{}) []byte {
 	b, _ := json.Marshal(v)
 	return b
 }
-
-// splitSSELines 从 SSE chunk 中提取 data: 行的内容
-func splitSSELines(chunk string) []string {
-	var results []string
-	for _, line := range strings.Split(chunk, "\n") {
-		line = strings.TrimSpace(line)
-		if strings.HasPrefix(line, "data: ") {
-			results = append(results, strings.TrimPrefix(line, "data: "))
-		}
-	}
-	return results
-}
